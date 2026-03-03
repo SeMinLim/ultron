@@ -3,7 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-static uint64_t fnv1a64(const uint8_t *bytes, size_t len)
+static uint64_t hash64(const uint8_t *bytes, size_t len)
 {
     uint64_t h = 0xcbf29ce484222325ULL;
     for (size_t i = 0; i < len; i++) {
@@ -187,7 +187,7 @@ int fpsm_init(fpsm *engine, const fpsm_rule *rules, size_t num_rules)
 
     for (size_t i = 0; i < num_rules; i++) {
         uint32_t len = (uint32_t)rules[i].len;
-        uint64_t key = fnv1a64(rules[i].pattern, rules[i].len);
+        uint64_t key = hash64(rules[i].pattern, rules[i].len);
 
         if (len_seen[len] > 0) {
             if (shiftOrBucketAddPattern(&(*engine).buckets[len], rules[i].pattern, rules[i].len) != 0) {
@@ -262,7 +262,7 @@ size_t fpsm_scan(fpsm *engine, const uint8_t *buf, size_t buf_len,
             }
 
             if (match + len <= buf_end) {
-                uint64_t key = fnv1a64(match, len);
+                uint64_t key = hash64(match, len);
                 uint32_t post = FPSM_POSTING_NONE;
 
                 if (stage_probe(&(*engine).stages[len], key, &post)) {
