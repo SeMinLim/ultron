@@ -7,11 +7,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define FILTER_STAGE1_MAX_CANDIDATES 8
+#define FILTER_STAGE2_MAX_CANDIDATES 2
+
 typedef struct {
     fpsm fpsm;
     header_matcher header;
-    uint32_t fpsm_candidates[HM_MAX_RULES];
-    uint32_t header_candidates[HM_MAX_RULES];
+    uint32_t fpsm_candidates[FILTER_STAGE1_MAX_CANDIDATES];
+    uint32_t header_candidates[FILTER_STAGE1_MAX_CANDIDATES];
     nfpsm nfpsm;
     int nfpsm_enabled;
     int initialized;

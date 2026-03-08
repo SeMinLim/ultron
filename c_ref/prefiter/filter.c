@@ -1,6 +1,11 @@
 #include "filter.h"
 #include <string.h>
 
+static size_t min_size(size_t a, size_t b)
+{
+    return (a < b) ? a : b;
+}
+
 int filter_init(filter *engine,
                 const fpsm_rule *fpsm_rules,
                 size_t num_fpsm_rules,
@@ -84,7 +89,7 @@ size_t filter_scan(filter *engine,
                                       payload,
                                       payload_len,
                                       (*engine).fpsm_candidates,
-                                      HM_MAX_RULES);
+                                      FILTER_STAGE1_MAX_CANDIDATES);
     if (num_candidates == 0) {
         return 0;
     }
@@ -94,13 +99,15 @@ size_t filter_scan(filter *engine,
                                               (*engine).fpsm_candidates,
                                               num_candidates,
                                               (*engine).header_candidates,
-                                              HM_MAX_RULES);
+                                              FILTER_STAGE1_MAX_CANDIDATES);
     if (num_header == 0) {
         return 0;
     }
 
+    size_t final_max = min_size(max_out, FILTER_STAGE2_MAX_CANDIDATES);
+
     if (!(*engine).nfpsm_enabled) {
-        size_t out_n = (num_header < max_out) ? num_header : max_out;
+        size_t out_n = min_size(num_header, final_max);
         memcpy(out_rule_ids, (*engine).header_candidates, out_n * sizeof(uint32_t));
         return out_n;
     }
@@ -111,5 +118,5 @@ size_t filter_scan(filter *engine,
                         (*engine).header_candidates,
                         num_header,
                         out_rule_ids,
-                        max_out);
+                        final_max);
 }
