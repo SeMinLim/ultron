@@ -25,6 +25,32 @@ static void apply_pattern_to_mask(u64a mask[SHIFT_OR_ALPHABET_SIZE],
     }
 }
 
+static void reset_bucket_masks(shift_or_bucket_t *b)
+{
+    for (u8 bucket = 0; bucket < SHIFT_OR_BUCKETS; bucket++) {
+        reset_mask((*b).mask[bucket]);
+    }
+}
+
+static u8 pick_bucket(const shift_or_bucket_t *b)
+{
+    u8 best = 0;
+    u16 best_load = 0xFFFF;
+
+    for (u8 bucket = 0; bucket < SHIFT_OR_BUCKETS; bucket++) {
+        u8 bit = (u8)(1U << bucket);
+        if (((*b).active_buckets & bit) == 0) {
+            return bucket;
+        }
+        if ((*b).bucket_load[bucket] < best_load) {
+            best = bucket;
+            best_load = (*b).bucket_load[bucket];
+        }
+    }
+
+    return best;
+}
+
 void shiftOrInit(shift_or_t *so, const u8 *pattern, size_t len)
 {
     if (len == 0 || len > SHIFT_OR_MAX_PATTERN_LEN) {
@@ -41,40 +67,51 @@ void shiftOrInit(shift_or_t *so, const u8 *pattern, size_t len)
 void shiftOrBucketInit(shift_or_bucket_t *b, const u8 *pattern, size_t len)
 {
     if (len == 0 || len > SHIFT_OR_MAX_PATTERN_LEN) {
-        (*b).pattern_len = 0;
-        (*b).pattern_count = 0;
+        memset(b, 0, sizeof(*b));
         return;
     }
 
+    memset(b, 0, sizeof(*b));
     (*b).pattern_len = (u32)len;
     (*b).pattern_count = 1;
-    reset_mask((*b).mask);
-    apply_pattern_to_mask((*b).mask, pattern, len);
-    build_pre_shifted((*b).pre_shifted, (*b).mask);
+    (*b).active_buckets = 0x1;
+    (*b).bucket_load[0] = 1;
+
+    reset_bucket_masks(b);
+    apply_pattern_to_mask((*b).mask[0], pattern, len);
 }
 
-int shiftOrBucketAddPattern(shift_or_bucket_t *b, const u8 *pattern, size_t len)
+int shiftOrBucketAddPatternWithBucket(shift_or_bucket_t *b,
+                                      const u8 *pattern,
+                                      size_t len,
+                                      u8 *out_bucket)
 {
     if ((*b).pattern_len == 0 || len != (*b).pattern_len) {
         return -1;
     }
 
-    u64a single_mask[SHIFT_OR_ALPHABET_SIZE];
-    reset_mask(single_mask);
-    apply_pattern_to_mask(single_mask, pattern, len);
+    u8 bucket = pick_bucket(b);
+    apply_pattern_to_mask((*b).mask[bucket], pattern, len);
+    (*b).active_buckets |= (u8)(1U << bucket);
+    (*b).bucket_load[bucket]++;
+    (*b).pattern_count++;
 
-    for (int c = 0; c < SHIFT_OR_ALPHABET_SIZE; c++) {
-        (*b).mask[c] &= single_mask[c];
+    if (out_bucket) {
+        *out_bucket = bucket;
     }
 
-    (*b).pattern_count++;
-    build_pre_shifted((*b).pre_shifted, (*b).mask);
     return 0;
 }
 
+int shiftOrBucketAddPattern(shift_or_bucket_t *b, const u8 *pattern, size_t len)
+{
+    return shiftOrBucketAddPatternWithBucket(b, pattern, len, NULL);
+}
+
 static really_inline const u8 *shiftOrFwdSlow(const shift_or_t *so,
-                                               const u8 *buf, const u8 *buf_end,
-                                               u64a state)
+                                              const u8 *buf,
+                                              const u8 *buf_end,
+                                              u64a state)
 {
     u32 pattern_len = (*so).pattern_len;
     if (pattern_len == 0 || (size_t)(buf_end - buf) < pattern_len) {
@@ -213,7 +250,6 @@ const u8 *shiftOrExec(const shift_or_t *so, const u8 *buf, const u8 *buf_end)
 
     const u64a match_bit = 1ULL << pattern_len;
     u64a state = ~1ULL;
-
     const u8 *cursor = buf;
 
     while (cursor + SHIFT_OR_PARALLEL <= buf_end) {
@@ -227,8 +263,87 @@ const u8 *shiftOrExec(const shift_or_t *so, const u8 *buf, const u8 *buf_end)
     return shiftOrFwdSlow(so, cursor, buf_end, state);
 }
 
+const u8 *shiftOrExecBucketWithBitmap(const shift_or_bucket_t *b,
+                                      const u8 *buf,
+                                      const u8 *buf_end,
+                                      u8 *out_bucket_bitmap)
+{
+    if (out_bucket_bitmap) {
+        *out_bucket_bitmap = 0;
+    }
+
+    if (!b || !buf || !buf_end || buf >= buf_end) {
+        return buf_end;
+    }
+
+    u32 pattern_len = (*b).pattern_len;
+    if (pattern_len == 0 || (*b).active_buckets == 0) {
+        return buf_end;
+    }
+
+    size_t span = (size_t)(buf_end - buf);
+    if (span < pattern_len) {
+        return buf_end;
+    }
+
+    u64a state[SHIFT_OR_BUCKETS];
+    for (u8 bucket = 0; bucket < SHIFT_OR_BUCKETS; bucket++) {
+        state[bucket] = (pattern_len == 64) ? ~0ULL : ~1ULL;
+    }
+
+    u8 active = (*b).active_buckets;
+
+    if (pattern_len == 64) {
+        const u64a match_bit = 1ULL << 63;
+        for (const u8 *cur = buf; cur < buf_end; cur++) {
+            u8 bitmap = 0;
+            for (u8 bucket = 0; bucket < SHIFT_OR_BUCKETS; bucket++) {
+                u8 bit = (u8)(1U << bucket);
+                if ((active & bit) == 0) {
+                    continue;
+                }
+                state[bucket] = (state[bucket] << 1) | (*b).mask[bucket][*cur];
+                if ((state[bucket] & match_bit) == 0) {
+                    bitmap |= bit;
+                }
+            }
+            if (bitmap != 0) {
+                if (out_bucket_bitmap) {
+                    *out_bucket_bitmap = bitmap;
+                }
+                return cur - 63;
+            }
+        }
+        return buf_end;
+    }
+
+    const u64a match_bit = 1ULL << pattern_len;
+    for (const u8 *cur = buf; cur < buf_end; cur++) {
+        u8 bitmap = 0;
+        for (u8 bucket = 0; bucket < SHIFT_OR_BUCKETS; bucket++) {
+            u8 bit = (u8)(1U << bucket);
+            if ((active & bit) == 0) {
+                continue;
+            }
+            state[bucket] |= (*b).mask[bucket][*cur];
+            state[bucket] <<= 1;
+            if ((state[bucket] & match_bit) == 0) {
+                bitmap |= bit;
+            }
+        }
+        if (bitmap != 0) {
+            if (out_bucket_bitmap) {
+                *out_bucket_bitmap = bitmap;
+            }
+            return cur - pattern_len + 1;
+        }
+    }
+
+    return buf_end;
+}
+
 const u8 *shiftOrExecBucket(const shift_or_bucket_t *b, const u8 *buf,
                             const u8 *buf_end)
 {
-    return shiftOrExec((const shift_or_t *)b, buf, buf_end);
+    return shiftOrExecBucketWithBitmap(b, buf, buf_end, NULL);
 }

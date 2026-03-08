@@ -8,10 +8,12 @@
 #define SHIFT_OR_MAX_PATTERN_LEN 64
 #define SHIFT_OR_PARALLEL 8
 #define SHIFT_OR_MIN_LEN 16
+#define SHIFT_OR_BUCKETS 8
 
 #define SHIFT_OR_BUCKET_WIDTH 16
 
 typedef uint8_t u8;
+typedef uint16_t u16;
 typedef uint32_t u32;
 typedef uint64_t u64a;
 
@@ -28,10 +30,11 @@ typedef struct {
 } shift_or_t;
 
 typedef struct {
-    u64a mask[SHIFT_OR_ALPHABET_SIZE];
-    u64a pre_shifted[SHIFT_OR_PARALLEL + 1][SHIFT_OR_ALPHABET_SIZE];
+    u64a mask[SHIFT_OR_BUCKETS][SHIFT_OR_ALPHABET_SIZE];
     u32 pattern_len;
     u32 pattern_count;
+    u8 active_buckets;
+    u16 bucket_load[SHIFT_OR_BUCKETS];
 } shift_or_bucket_t;
 
 void shiftOrInit(shift_or_t *so, const u8 *pattern, size_t len);
@@ -42,7 +45,17 @@ void shiftOrBucketInit(shift_or_bucket_t *b, const u8 *pattern, size_t len);
 
 int shiftOrBucketAddPattern(shift_or_bucket_t *b, const u8 *pattern, size_t len);
 
+int shiftOrBucketAddPatternWithBucket(shift_or_bucket_t *b,
+                                      const u8 *pattern,
+                                      size_t len,
+                                      u8 *out_bucket);
+
 const u8 *shiftOrExecBucket(const shift_or_bucket_t *b, const u8 *buf,
                             const u8 *buf_end);
+
+const u8 *shiftOrExecBucketWithBitmap(const shift_or_bucket_t *b,
+                                      const u8 *buf,
+                                      const u8 *buf_end,
+                                      u8 *out_bucket_bitmap);
 
 #endif
