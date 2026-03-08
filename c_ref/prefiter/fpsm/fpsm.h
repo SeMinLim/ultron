@@ -8,11 +8,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define FPSM_MAX_RULES 65536
+#define FPSM_MAX_RULES 64
 #define FPSM_MAX_PATTERN_LEN 64
-#define FPSM_MIN_HASH_CAP 16
-
-#define FPSM_POSTING_NONE UINT32_MAX
+#define FPSM_HASH_CAP 1024
+#define FPSM_FILTER_BITS 4096
+#define FPSM_PREFILTER_MAX_LEN SHIFT_OR_PARALLEL
 
 typedef struct {
     const uint8_t *pattern;
@@ -21,15 +21,19 @@ typedef struct {
 } fpsm_rule;
 
 typedef struct {
-    cuckoo_hash_t filter;
-    cuckoo_hash_t index;
-    int initialized;
-} fpsm_stage;
+    const uint8_t *pattern;
+    size_t len;
+    uint8_t prefilter_len;
+    uint8_t prefilter_bucket;
+    uint32_t rule_id;
+} fpsm_compiled_rule;
 
 typedef struct {
-    uint32_t rule_slot;
-    uint32_t next;
-} fpsm_posting;
+    uint8_t *filter_bitset;
+    cuckoo_hash_t bucket_tables[SHIFT_OR_BUCKETS];
+    uint8_t used_buckets;
+    int initialized;
+} fpsm_stage;
 
 typedef struct {
     shift_or_bucket_t buckets[FPSM_MAX_PATTERN_LEN + 1];
@@ -37,11 +41,9 @@ typedef struct {
     uint8_t used[FPSM_MAX_PATTERN_LEN + 1];
     uint8_t lens[FPSM_MAX_PATTERN_LEN];
     uint8_t lens_count;
-    fpsm_rule *rules;
-    fpsm_posting *postings;
+    fpsm_compiled_rule rules[FPSM_MAX_RULES];
     rule_reduction_t reducer;
     size_t num_rules;
-    size_t num_postings;
     int initialized;
 } fpsm;
 
