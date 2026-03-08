@@ -6,13 +6,12 @@
 #include <stdint.h>
 
 #define NFPSM_BUCKETS 8
-#define NFPSM_MIN_HASH_CAP 16
-#define NFPSM_FP_BITS 16
+#define NFPSM_HASH_CAP 256
 
-#define NFPSM_MAX_RULES 65536
+#define NFPSM_MAX_RULES 256
 #define NFPSM_MAX_STRINGS_PER_RULE 32
-#define NFPSM_MAX_PATTERNS 2097152
-#define NFPSM_PATTERN_NONE UINT32_MAX
+#define NFPSM_MAX_PATTERNS 2048
+#define NFPSM_FINGERPRINT_BITS 16
 
 typedef struct {
     uint32_t rule_id;
@@ -25,8 +24,8 @@ typedef struct {
     const uint8_t *bytes;
     uint16_t len;
     uint8_t bucket;
-    uint32_t owner_rule_slot;
-    uint32_t next_same_hash;
+    uint16_t owner_rule_slot;
+    uint16_t next_same_hash;
 } nfpsm_pattern;
 
 typedef struct {
@@ -36,14 +35,15 @@ typedef struct {
 
 typedef struct {
     uint32_t rule_id;
+    uint16_t pattern_indices[NFPSM_MAX_STRINGS_PER_RULE];
+    uint16_t num_pattern_indices;
     uint16_t fingerprint[NFPSM_BUCKETS];
 } nfpsm_rule_state;
 
 typedef struct {
     nfpsm_bucket buckets[NFPSM_BUCKETS];
-    cuckoo_hash_t rule_to_slot;
-    nfpsm_rule_state *rules;
-    nfpsm_pattern *patterns;
+    nfpsm_rule_state rules[NFPSM_MAX_RULES];
+    nfpsm_pattern patterns[NFPSM_MAX_PATTERNS];
     size_t num_rules;
     size_t num_patterns;
     int initialized;

@@ -5,7 +5,7 @@
 #include <stdint.h>
 
 #define HM_MAX_PORT_GROUPS 512
-#define HM_MAX_RULES 65536
+#define HM_MAX_RULES 1024
 #define HM_MAX_PORTS_PER_GROUP 32
 #define HM_NO_GROUP UINT16_MAX
 
