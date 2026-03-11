@@ -3,12 +3,13 @@ package FpsmStage;
 import Vector::*;
 
 import CuckooHashTable64::*;
+import PrefilterTypes::*;
 import PrefilterMatchUtils::*;
 import shift_or::*;
 
 interface FpsmStageIfc;
-  method Action loadRule(Bit#(6) slot, Bit#(64) pattern, Bit#(8) len);
-  method Bit#(64) runMatch(Bit#(64) payload64);
+  method Action loadRule(Bit#(PrefilterSlotIdxW) slot, Bit#(64) pattern, Bit#(8) len);
+  method PrefilterRuleMask runMatch(Bit#(64) payload64);
   method Bit#(8) bucketBitmap;
 endinterface
 
@@ -17,14 +18,14 @@ module mkFpsmStage(FpsmStageIfc);
   Vector#(9, CuckooTable64Ifc#(6)) hashByLen <- replicateM(mkCuckooHashTable64);
   Vector#(9, Reg#(Bool)) stageUsed <- replicateM(mkReg(False));
 
-  method Action loadRule(Bit#(6) slot, Bit#(64) pattern, Bit#(8) len);
+  method Action loadRule(Bit#(PrefilterSlotIdxW) slot, Bit#(64) pattern, Bit#(8) len);
     if (validPatternLen1to8(len)) begin
       Bit#(4) lenIdx = truncate(len);
       Bit#(64) patternNorm = normalizePatternByLen(pattern, len);
       Bit#(64) key = fnv1a64(patternNorm, len);
-      Bit#(64) oldMask = hashByLen[lenIdx].lookupValue(key);
-      Bit#(64) slotBit = 64'h1 << slot;
-      Bit#(64) newMask = oldMask | slotBit;
+      PrefilterRuleMask oldMask = hashByLen[lenIdx].lookupValue(key);
+      PrefilterRuleMask slotBit = (64'h1 << slot);
+      PrefilterRuleMask newMask = oldMask | slotBit;
 
       stageUsed[lenIdx] <= True;
       shiftOrByLen[lenIdx].insertPattern(patternNorm);
@@ -32,8 +33,8 @@ module mkFpsmStage(FpsmStageIfc);
     end
   endmethod
 
-  method Bit#(64) runMatch(Bit#(64) payload64);
-    Bit#(64) candidates = 0;
+  method PrefilterRuleMask runMatch(Bit#(64) payload64);
+    PrefilterRuleMask candidates = 0;
 
     for (Integer len = 1; len <= 8; len = len + 1) begin
       Bit#(4) lenIdx = fromInteger(len);
@@ -46,7 +47,7 @@ module mkFpsmStage(FpsmStageIfc);
             Bit#(64) windowKey = windowKeyByStartLen(payload64, startVal, lenVal);
             if (shiftOrByLen[lenIdx].bucketHit(windowKey)) begin
               Bit#(64) key = fnv1a64(windowKey, lenVal);
-              Bit#(64) slotMask = hashByLen[lenIdx].lookupValue(key);
+              PrefilterRuleMask slotMask = hashByLen[lenIdx].lookupValue(key);
               candidates = candidates | slotMask;
             end
           end
