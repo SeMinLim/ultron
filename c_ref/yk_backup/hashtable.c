@@ -4,8 +4,8 @@
 #include <stdlib.h>
 #include "hashtable.h"
 
-static int h1(int key, int cap) { return abs(key % cap); }
-static int h2(int key, int cap) { return abs((key / cap) % cap); }
+static int h1(int key, int cap) { return (int)((unsigned)key % (unsigned)cap); }
+static int h2(int key, int cap) { return (int)(((unsigned)key * 2654435761u) % (unsigned)cap); }
 
 static int slot(int tid, int key, int cap)
 {
@@ -77,7 +77,7 @@ bool ht_insert(HashTable *ht, int key, int val)
     HEntry cur = { key, val };
     int tid = 0;
 
-    for (int loop = 0; loop < CUCKOO_MAX_LOOP; loop++) {
+    for (int loop = 0; loop < HT_MAX_LOOP; loop++) {
         int pos = slot(tid, cur.key, ht->capacity);
         if (ht->table[tid][pos].key == CUCKOO_EMPTY) {
             ht->table[tid][pos] = cur;

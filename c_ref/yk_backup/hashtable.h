@@ -6,6 +6,8 @@
 #include <stdbool.h>
 #include "cuckoo_hash.h"
 
+#define HT_MAX_LOOP 64
+
 typedef struct {
     int key;
     int val;
