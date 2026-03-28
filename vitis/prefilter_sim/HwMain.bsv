@@ -6,16 +6,18 @@ import BRAM::*;
 import BRAMFIFO::*;
 
 import PcieCtrl::*;
-import PacketParser::*;
+import SimplePacketParser::*;
 import PacketParserTypes::*;
 import FPSM::*;
 import RuleReduction::*;
-import TrafficManager::*;
+import HeaderMatcher::*;
+	import TrafficManager::*;
+import NFPSM::*;
 
 interface HwMainIfc;
 endinterface
 
-module mkHwMain#(PcieUserIfc pcie) 
+module mkHwMain#(PcieUserIfc pcie)
 	(HwMainIfc);
 
 	Clock curClk <- exposeCurrentClock;
@@ -24,117 +26,78 @@ module mkHwMain#(PcieUserIfc pcie)
 	Clock pcieclk = pcie.user_clk;
 	Reset pcierst = pcie.user_rst;
 
-	FIFO#(DMAWord) inputQ <- mkSizedBRAMFIFO(512); // 8KBs
-	FIFO#(DMAWord) outputQ <- mkSizedBRAMFIFO(512); // 8KBs
+	FIFO#(DMAWord) inputQ  <- mkSizedBRAMFIFO(512);
+	FIFO#(DMAWord) outputQ <- mkSizedBRAMFIFO(512);
+	FIFO#(Tuple2#(Bit#(128), PacketMeta)) pendingNFPSMFPQ <- mkSizedBRAMFIFO(64);
 	Reg#(Bit#(16)) outputCntUp <- mkReg(0);
 	Reg#(Bit#(16)) outputCntDn <- mkReg(0);
 
-	Vector#(8, PacketParserIfc) pes <- replicateM(mkPacketParser);
+	Vector#(8, PacketParserIfc) pes <- replicateM(mkSimplePacketParser);
 	Vector#(8, Reg#(PacketMeta)) lastMeta <- replicateM(mkRegU);
-	Vector#(8, Reg#(Bit#(32))) metaCount <- replicateM(mkReg(0));
-	
-	// Track byte offset for payload extraction per parser
+	Vector#(8, Reg#(Bit#(32))) metaCount  <- replicateM(mkReg(0));
 	Vector#(8, Reg#(Bit#(16))) currentByteOffset <- replicateM(mkReg(0));
-	Vector#(8, Reg#(Bool)) metaReady <- replicateM(mkReg(False));
-	
-	// FPSM instance for pattern matching
-	SimpleFPSMIfc fpsm <- mkSimpleFPSM;
-	
-	// Store FPSM match results (256 bits for 32 lanes × 8 bytes)
-	Reg#(Bit#(256)) fpsmMatchResult <- mkReg(0);
-	Reg#(Bit#(32)) fpsmMatchCount <- mkReg(0);  // Chunks with at least one match
-	Reg#(Bit#(32)) fpsmTotalMatches <- mkReg(0);  // Total individual matches (before reduction)
-	
-	// Pigasus pipeline stages
-	Reg#(Bit#(32)) reducedMatchCount <- mkReg(0);  // Total matches after capping at 8 per chunk
-	Reg#(Bit#(32)) headerMatchCount <- mkReg(0);
-	Reg#(Bit#(32)) packetCount <- mkReg(0);
-	Reg#(Bit#(32)) cleanPacketCount <- mkReg(0);
-	Reg#(Bit#(32)) nfpsmPacketCount <- mkReg(0);
-	
-	TrafficManagerIfc trafficMgr <- mkTrafficManager;
-	
-	// Pattern loading state
-	Reg#(UInt#(6)) patternLoadLane <- mkReg(0);
-	Reg#(Bit#(256)) patternLoadData <- mkReg(0);
-	Reg#(Bit#(8)) patternLoadLen <- mkReg(0);
-	Reg#(Bit#(16)) patternLoadRuleId <- mkReg(0);
-	Reg#(Bit#(3)) patternLoadStage <- mkReg(0);  // 0-7 for loading 8 × 32-bit words
-	
-	// Buffer for accumulating 256 bits (2 × 128-bit DMAWords)
-	Reg#(Maybe#(Bit#(128))) fpsmBuf <- mkReg(tagged Invalid);
-	
-	// Process FPSM matches through pipeline
-	function Action processPipelineMatches(Vector#(OutputSize, Bool) fpsmMatches);
-		action
-			packetCount <= packetCount + 1;
-			
-			// Count total matches before reduction
-			Bit#(32) totalCount = countMatches(fpsmMatches);
-			fpsmTotalMatches <= fpsmTotalMatches + totalCount;
-			
-			// RULE REDUCTION: Cap at 8 matches
-			Bit#(32) reducedCount = reduceMatchCount(fpsmMatches);
-			reducedMatchCount <= reducedMatchCount + reducedCount;
-			
-			// HEADER MATCHING: Simulate checking packet headers
-			// In real implementation, would use RuleTable and PortGroup
-			// For now, simulate 50% pass rate
-			Bit#(32) headerMatched = reducedCount >> 1;
-			headerMatchCount <= headerMatchCount + headerMatched;
-			
-			// Build simulated header match results
-			Vector#(8, HeaderMatchResult) headerResults = replicate(
-				HeaderMatchResult {
-					valid: False,
-					laneIdx: 0,
-					matchLen: 0,
-					ruleId: 0
-				}
-			);
-			
-			for (Integer i = 0; i < 4; i = i + 1) begin
-				if (fromInteger(i) < headerMatched) begin
-					headerResults[i] = HeaderMatchResult {
-						valid: True,
-						laneIdx: fromInteger(i),
-						matchLen: 4,
-						ruleId: fromInteger(100 + i)
-					};
-				end
-			end
-			
-			// TRAFFIC MANAGER: Decide clean vs. NFPSM
-			trafficMgr.putHeaderResults(headerResults);
-		endaction
-	endfunction
+	Vector#(8, Reg#(Bool))     metaReady  <- replicateM(mkReg(False));
 
-	Reg#(Bit#(3)) inPe <- mkReg(0);
-	Reg#(Bit#(16)) inWordsLeft <- mkReg(0);
+	FPSMIfc fpsm <- mkFPSM;
+
+	Reg#(Bit#(256)) fpsmMatchResult  <- mkReg(0);
+	Reg#(Bit#(32))  fpsmMatchCount   <- mkReg(0);
+	Reg#(Bit#(32))  fpsmTotalMatches <- mkReg(0);
+
+	Reg#(Bit#(32)) reducedMatchCount <- mkReg(0);
+	Reg#(Bit#(32)) headerMatchCount  <- mkReg(0);
+	Reg#(Bit#(32)) packetCount       <- mkReg(0);
+	Reg#(Bit#(32)) noFpsmCleanCount  <- mkReg(0);
+
+	RuleReductionIfc ruleReduction <- mkRuleReduction;
+
+		HeaderMatcherIfc headerMatcher <- mkHeaderMatcher;
+
+		TrafficManagerIfc trafficMgr <- mkTrafficManager;
+
+		SimpleNFPSMIfc nfpsm_matcher <- mkSimpleNFPSM;
+		NFPSMIfc       nfpsm         <- mkNFPSM;
+
+	Vector#(8, Reg#(Maybe#(Bit#(128)))) fpsmBuf
+		<- replicateM(mkReg(tagged Invalid));
+	Vector#(8, Reg#(Bit#(256))) packetFpsmAcc
+		<- replicateM(mkReg(0));
+	Vector#(8, Reg#(Bit#(128))) packetNFPSMAcc
+		<- replicateM(mkReg(0));
+
+	Reg#(Bit#(3)) inPe  <- mkReg(0);
+	Reg#(Bit#(16)) inWordsLeft    <- mkReg(0);
 	Reg#(Bit#(3)) outPe <- mkReg(0);
-	Reg#(Bit#(3)) dispatchBufCount <- mkReg(0);
+	Reg#(Bit#(3)) dispatchBufCount  <- mkReg(0);
 	Reg#(Bit#(3)) dispatchBufOutIdx <- mkReg(4);
 	Vector#(4, Reg#(DMAWord)) dispatchBuf <- replicateM(mkRegU);
 
-	rule dispatchBuffer(inWordsLeft == 0 && dispatchBufCount < 4 && dispatchBufOutIdx == 4);
+	rule dispatchBuffer(inWordsLeft == 0 && dispatchBufCount < 4
+	                    && dispatchBufOutIdx == 4);
 		inputQ.deq;
 		dispatchBuf[dispatchBufCount] <= inputQ.first;
 		dispatchBufCount <= dispatchBufCount + 1;
 	endrule
 
-	rule dispatchNewPacket(inWordsLeft == 0 && dispatchBufCount == 4 && dispatchBufOutIdx == 4);
+	rule dispatchNewPacket(inWordsLeft == 0 && dispatchBufCount == 4
+	                       && dispatchBufOutIdx == 4);
 		Bit#(16) totalLength = dispatchBuf[1][127:112];
 		Bit#(32) frameLength = 14 + zeroExtend(totalLength);
 		Bit#(32) totalWords32 = (frameLength + 15) >> 4;
 		Bit#(16) totalWords = truncate(totalWords32);
 
 		dispatchBufCount <= 0;
-		dispatchBufOutIdx <= 0;
-		if (totalWords <= 4) begin
-			inWordsLeft <= 0;
-			inPe <= inPe + 1;
+
+		if (totalLength >= 20) begin
+			dispatchBufOutIdx <= 0;
+			if (totalWords <= 4) begin
+				inWordsLeft <= 0;
+				inPe <= inPe + 1;
+			end else begin
+				inWordsLeft <= totalWords - 4;
+			end
 		end else begin
-			inWordsLeft <= totalWords - 4;
+			dispatchBufOutIdx <= 4;
 		end
 	endrule
 
@@ -154,6 +117,7 @@ module mkHwMain#(PcieUserIfc pcie)
 		end
 	endrule
 
+	(* descending_urgency = "drainMeta0, drainMeta1, drainMeta2, drainMeta3, drainMeta4, drainMeta5, drainMeta6, drainMeta7, drainPayload" *)
 	rule drainPayload;
 		Bit#(3) idx0 = outPe;
 		Bit#(3) idx1 = outPe + 1;
@@ -164,578 +128,343 @@ module mkHwMain#(PcieUserIfc pcie)
 		Bit#(3) idx6 = outPe + 6;
 		Bit#(3) idx7 = outPe + 7;
 
+		Bit#(3) selIdx = idx0;
+		Bool selValid = False;
+		DMAWord selPayload = pes[idx0].payloadFirst;
+		Bit#(16) selByteStart = currentByteOffset[idx0];
+		Bit#(16) selPayloadEnd =
+			lastMeta[idx0].payloadOffset + lastMeta[idx0].payloadLength;
+
 		if (pes[idx0].payloadValid && metaReady[idx0]) begin
-			DMAWord payload = pes[idx0].payloadFirst;
-			outputQ.enq(payload);
-			pes[idx0].payloadDeq;
-			outPe <= idx0 + 1;
-			outputCntUp <= outputCntUp + 1;
-			
-			// Track byte offset and determine if this word is in payload region
-			Bit#(16) byteStart = currentByteOffset[idx0];
-			Bit#(16) byteEnd = byteStart + 16; // DMAWord is 128 bits = 16 bytes
-			Bit#(16) payloadStart = lastMeta[idx0].payloadOffset;
-			Bit#(16) payloadEnd = payloadStart + lastMeta[idx0].payloadLength;
-			
-			// Only send to FPSM if word starts at or after payload offset
-			// This avoids header bytes contaminating the pattern match
-			// Note: This means we skip partial words at the header/payload boundary
-			Bool inPayload = (byteEnd > payloadStart) && (byteStart < payloadEnd);
-			
-			if (inPayload) begin
-				// Buffer two 128-bit words to make 256 bits for FPSM
-				if (fpsmBuf matches tagged Invalid) begin
-					fpsmBuf <= tagged Valid payload;
-				end else begin
-					Bit#(256) fpsmInput = {payload, fromMaybe(0, fpsmBuf)};
-					Vector#(OutputSize, Bool) fpsmMatches = fpsm.process(fpsmInput);
-					Bit#(256) matchBits = 0;
-					for (Integer i = 0; i < valueOf(OutputSize); i = i + 1) begin
-						matchBits[i] = pack(fpsmMatches[i]);
-					end
-					if (matchBits != 0) begin
-						fpsmMatchResult <= matchBits;
-						fpsmMatchCount <= fpsmMatchCount + 1;
-						// Process through Pigasus pipeline
-						processPipelineMatches(fpsmMatches);
-					end
-					fpsmBuf <= tagged Invalid;
-				end
-			end
-			
-			// Update byte offset
-			currentByteOffset[idx0] <= byteEnd;
-			
-			// Reset at packet end (when we've processed all payload)
-			if (byteEnd >= payloadEnd) begin
-				metaReady[idx0] <= False;
-			end
+			selIdx = idx0; selValid = True;
+			selPayload    = pes[idx0].payloadFirst;
+			selByteStart  = currentByteOffset[idx0];
+			selPayloadEnd = lastMeta[idx0].payloadOffset + lastMeta[idx0].payloadLength;
 		end else if (pes[idx1].payloadValid && metaReady[idx1]) begin
-			DMAWord payload = pes[idx1].payloadFirst;
-			outputQ.enq(payload);
-			pes[idx1].payloadDeq;
-			outPe <= idx1 + 1;
-			outputCntUp <= outputCntUp + 1;
-			
-			Bit#(16) byteStart = currentByteOffset[idx1];
-			Bit#(16) byteEnd = byteStart + 16;
-			Bit#(16) payloadStart = lastMeta[idx1].payloadOffset;
-			Bit#(16) payloadEnd = payloadStart + lastMeta[idx1].payloadLength;
-			
-			Bool inPayload = (byteEnd > payloadStart) && (byteStart < payloadEnd);
-			
-			if (inPayload) begin
-				if (fpsmBuf matches tagged Invalid) begin
-					fpsmBuf <= tagged Valid payload;
-				end else begin
-					Bit#(256) fpsmInput = {payload, fromMaybe(0, fpsmBuf)};
-					Vector#(OutputSize, Bool) fpsmMatches = fpsm.process(fpsmInput);
-					Bit#(256) matchBits = 0;
-					for (Integer i = 0; i < valueOf(OutputSize); i = i + 1) begin
-						matchBits[i] = pack(fpsmMatches[i]);
-					end
-					if (matchBits != 0) begin
-						fpsmMatchResult <= matchBits;
-						fpsmMatchCount <= fpsmMatchCount + 1;
-						// Process through Pigasus pipeline
-						processPipelineMatches(fpsmMatches);
-					end
-					fpsmBuf <= tagged Invalid;
-				end
-			end
-			
-			currentByteOffset[idx1] <= byteEnd;
-			
-			if (byteEnd >= payloadEnd) begin
-				metaReady[idx1] <= False;
-			end
+			selIdx = idx1; selValid = True;
+			selPayload    = pes[idx1].payloadFirst;
+			selByteStart  = currentByteOffset[idx1];
+			selPayloadEnd = lastMeta[idx1].payloadOffset + lastMeta[idx1].payloadLength;
 		end else if (pes[idx2].payloadValid && metaReady[idx2]) begin
-			DMAWord payload = pes[idx2].payloadFirst;
-			outputQ.enq(payload);
-			pes[idx2].payloadDeq;
-			outPe <= idx2 + 1;
-			outputCntUp <= outputCntUp + 1;
-			
-			Bit#(16) byteStart = currentByteOffset[idx2];
-			Bit#(16) byteEnd = byteStart + 16;
-			Bit#(16) payloadStart = lastMeta[idx2].payloadOffset;
-			Bit#(16) payloadEnd = payloadStart + lastMeta[idx2].payloadLength;
-			
-			Bool inPayload = (byteEnd > payloadStart) && (byteStart < payloadEnd);
-			
-			if (inPayload) begin
-				if (fpsmBuf matches tagged Invalid) begin
-					fpsmBuf <= tagged Valid payload;
-				end else begin
-					Bit#(256) fpsmInput = {payload, fromMaybe(0, fpsmBuf)};
-					Vector#(OutputSize, Bool) fpsmMatches = fpsm.process(fpsmInput);
-					Bit#(256) matchBits = 0;
-					for (Integer i = 0; i < valueOf(OutputSize); i = i + 1) begin
-						matchBits[i] = pack(fpsmMatches[i]);
-					end
-					if (matchBits != 0) begin
-						fpsmMatchResult <= matchBits;
-						fpsmMatchCount <= fpsmMatchCount + 1;
-						// Process through Pigasus pipeline
-						processPipelineMatches(fpsmMatches);
-					end
-					fpsmBuf <= tagged Invalid;
-				end
-			end
-			
-			currentByteOffset[idx2] <= byteEnd;
-			
-			if (byteEnd >= payloadEnd) begin
-				metaReady[idx2] <= False;
-			end
+			selIdx = idx2; selValid = True;
+			selPayload    = pes[idx2].payloadFirst;
+			selByteStart  = currentByteOffset[idx2];
+			selPayloadEnd = lastMeta[idx2].payloadOffset + lastMeta[idx2].payloadLength;
 		end else if (pes[idx3].payloadValid && metaReady[idx3]) begin
-			DMAWord payload = pes[idx3].payloadFirst;
-			outputQ.enq(payload);
-			pes[idx3].payloadDeq;
-			outPe <= idx3 + 1;
-			outputCntUp <= outputCntUp + 1;
-			
-			Bit#(16) byteStart = currentByteOffset[idx3];
-			Bit#(16) byteEnd = byteStart + 16;
-			Bit#(16) payloadStart = lastMeta[idx3].payloadOffset;
-			Bit#(16) payloadEnd = payloadStart + lastMeta[idx3].payloadLength;
-			
-			Bool inPayload = (byteEnd > payloadStart) && (byteStart < payloadEnd);
-			
-			if (inPayload) begin
-				if (fpsmBuf matches tagged Invalid) begin
-					fpsmBuf <= tagged Valid payload;
-				end else begin
-					Bit#(256) fpsmInput = {payload, fromMaybe(0, fpsmBuf)};
-					Vector#(OutputSize, Bool) fpsmMatches = fpsm.process(fpsmInput);
-					Bit#(256) matchBits = 0;
-					for (Integer i = 0; i < valueOf(OutputSize); i = i + 1) begin
-						matchBits[i] = pack(fpsmMatches[i]);
-					end
-					if (matchBits != 0) begin
-						fpsmMatchResult <= matchBits;
-						fpsmMatchCount <= fpsmMatchCount + 1;
-						// Process through Pigasus pipeline
-						processPipelineMatches(fpsmMatches);
-					end
-					fpsmBuf <= tagged Invalid;
-				end
-			end
-			
-			currentByteOffset[idx3] <= byteEnd;
-			
-			if (byteEnd >= payloadEnd) begin
-				metaReady[idx3] <= False;
-			end
+			selIdx = idx3; selValid = True;
+			selPayload    = pes[idx3].payloadFirst;
+			selByteStart  = currentByteOffset[idx3];
+			selPayloadEnd = lastMeta[idx3].payloadOffset + lastMeta[idx3].payloadLength;
 		end else if (pes[idx4].payloadValid && metaReady[idx4]) begin
-			DMAWord payload = pes[idx4].payloadFirst;
-			outputQ.enq(payload);
-			pes[idx4].payloadDeq;
-			outPe <= idx4 + 1;
-			outputCntUp <= outputCntUp + 1;
-			
-			Bit#(16) byteStart = currentByteOffset[idx4];
-			Bit#(16) byteEnd = byteStart + 16;
-			Bit#(16) payloadStart = lastMeta[idx4].payloadOffset;
-			Bit#(16) payloadEnd = payloadStart + lastMeta[idx4].payloadLength;
-			
-			Bool inPayload = (byteEnd > payloadStart) && (byteStart < payloadEnd);
-			
-			if (inPayload) begin
-				if (fpsmBuf matches tagged Invalid) begin
-					fpsmBuf <= tagged Valid payload;
-				end else begin
-					Bit#(256) fpsmInput = {payload, fromMaybe(0, fpsmBuf)};
-					Vector#(OutputSize, Bool) fpsmMatches = fpsm.process(fpsmInput);
-					Bit#(256) matchBits = 0;
-					for (Integer i = 0; i < valueOf(OutputSize); i = i + 1) begin
-						matchBits[i] = pack(fpsmMatches[i]);
-					end
-					if (matchBits != 0) begin
-						fpsmMatchResult <= matchBits;
-						fpsmMatchCount <= fpsmMatchCount + 1;
-						// Process through Pigasus pipeline
-						processPipelineMatches(fpsmMatches);
-					end
-					fpsmBuf <= tagged Invalid;
-				end
-			end
-			
-			currentByteOffset[idx4] <= byteEnd;
-			
-			if (byteEnd >= payloadEnd) begin
-				metaReady[idx4] <= False;
-			end
+			selIdx = idx4; selValid = True;
+			selPayload    = pes[idx4].payloadFirst;
+			selByteStart  = currentByteOffset[idx4];
+			selPayloadEnd = lastMeta[idx4].payloadOffset + lastMeta[idx4].payloadLength;
 		end else if (pes[idx5].payloadValid && metaReady[idx5]) begin
-			DMAWord payload = pes[idx5].payloadFirst;
-			outputQ.enq(payload);
-			pes[idx5].payloadDeq;
-			outPe <= idx5 + 1;
-			outputCntUp <= outputCntUp + 1;
-			
-			Bit#(16) byteStart = currentByteOffset[idx5];
-			Bit#(16) byteEnd = byteStart + 16;
-			Bit#(16) payloadStart = lastMeta[idx5].payloadOffset;
-			Bit#(16) payloadEnd = payloadStart + lastMeta[idx5].payloadLength;
-			
-			Bool inPayload = (byteEnd > payloadStart) && (byteStart < payloadEnd);
-			
-			if (inPayload) begin
-				if (fpsmBuf matches tagged Invalid) begin
-					fpsmBuf <= tagged Valid payload;
-				end else begin
-					Bit#(256) fpsmInput = {payload, fromMaybe(0, fpsmBuf)};
-					Vector#(OutputSize, Bool) fpsmMatches = fpsm.process(fpsmInput);
-					Bit#(256) matchBits = 0;
-					for (Integer i = 0; i < valueOf(OutputSize); i = i + 1) begin
-						matchBits[i] = pack(fpsmMatches[i]);
-					end
-					if (matchBits != 0) begin
-						fpsmMatchResult <= matchBits;
-						fpsmMatchCount <= fpsmMatchCount + 1;
-						// Process through Pigasus pipeline
-						processPipelineMatches(fpsmMatches);
-					end
-					fpsmBuf <= tagged Invalid;
-				end
-			end
-			
-			currentByteOffset[idx5] <= byteEnd;
-			
-			if (byteEnd >= payloadEnd) begin
-				metaReady[idx5] <= False;
-			end
+			selIdx = idx5; selValid = True;
+			selPayload    = pes[idx5].payloadFirst;
+			selByteStart  = currentByteOffset[idx5];
+			selPayloadEnd = lastMeta[idx5].payloadOffset + lastMeta[idx5].payloadLength;
 		end else if (pes[idx6].payloadValid && metaReady[idx6]) begin
-			DMAWord payload = pes[idx6].payloadFirst;
-			outputQ.enq(payload);
-			pes[idx6].payloadDeq;
-			outPe <= idx6 + 1;
-			outputCntUp <= outputCntUp + 1;
-			
-			Bit#(16) byteStart = currentByteOffset[idx6];
-			Bit#(16) byteEnd = byteStart + 16;
-			Bit#(16) payloadStart = lastMeta[idx6].payloadOffset;
-			Bit#(16) payloadEnd = payloadStart + lastMeta[idx6].payloadLength;
-			
-			Bool inPayload = (byteEnd > payloadStart) && (byteStart < payloadEnd);
-			
-			if (inPayload) begin
-				if (fpsmBuf matches tagged Invalid) begin
-					fpsmBuf <= tagged Valid payload;
-				end else begin
-					Bit#(256) fpsmInput = {payload, fromMaybe(0, fpsmBuf)};
-					Vector#(OutputSize, Bool) fpsmMatches = fpsm.process(fpsmInput);
-					Bit#(256) matchBits = 0;
-					for (Integer i = 0; i < valueOf(OutputSize); i = i + 1) begin
-						matchBits[i] = pack(fpsmMatches[i]);
-					end
-					if (matchBits != 0) begin
-						fpsmMatchResult <= matchBits;
-						fpsmMatchCount <= fpsmMatchCount + 1;
-						// Process through Pigasus pipeline
-						processPipelineMatches(fpsmMatches);
-					end
-					fpsmBuf <= tagged Invalid;
-				end
-			end
-			
-			currentByteOffset[idx6] <= byteEnd;
-			
-			if (byteEnd >= payloadEnd) begin
-				metaReady[idx6] <= False;
-			end
+			selIdx = idx6; selValid = True;
+			selPayload    = pes[idx6].payloadFirst;
+			selByteStart  = currentByteOffset[idx6];
+			selPayloadEnd = lastMeta[idx6].payloadOffset + lastMeta[idx6].payloadLength;
 		end else if (pes[idx7].payloadValid && metaReady[idx7]) begin
-			DMAWord payload = pes[idx7].payloadFirst;
-			outputQ.enq(payload);
-			pes[idx7].payloadDeq;
-			outPe <= idx7 + 1;
+			selIdx = idx7; selValid = True;
+			selPayload    = pes[idx7].payloadFirst;
+			selByteStart  = currentByteOffset[idx7];
+			selPayloadEnd = lastMeta[idx7].payloadOffset + lastMeta[idx7].payloadLength;
+		end
+
+		if (selValid) begin
+			Bit#(16) byteEnd = selByteStart + 16;
+			PacketMeta activeMeta = lastMeta[selIdx];
+
+			Bool inPayload =
+				(byteEnd > activeMeta.payloadOffset)
+				&& (selByteStart < selPayloadEnd)
+				&& (activeMeta.payloadLength > 0);
+			Bool isLastPayloadWord = inPayload && (byteEnd >= selPayloadEnd);
+
+			outputQ.enq(selPayload);
+			pes[selIdx].payloadDeq;
+			outPe <= selIdx + 1;
 			outputCntUp <= outputCntUp + 1;
-			
-			Bit#(16) byteStart = currentByteOffset[idx7];
-			Bit#(16) byteEnd = byteStart + 16;
-			Bit#(16) payloadStart = lastMeta[idx7].payloadOffset;
-			Bit#(16) payloadEnd = payloadStart + lastMeta[idx7].payloadLength;
-			
-			Bool inPayload = (byteEnd > payloadStart) && (byteStart < payloadEnd);
-			
-			if (inPayload) begin
-				if (fpsmBuf matches tagged Invalid) begin
-					fpsmBuf <= tagged Valid payload;
+
+			Bool hasBuf = isValid(fpsmBuf[selIdx]);
+			Bit#(128) fpsm_lo = hasBuf ? fromMaybe(0, fpsmBuf[selIdx]) : selPayload;
+			Bit#(128) fpsm_hi = hasBuf ? selPayload                     : 128'h0;
+
+			Vector#(OutputSize, Bool) fpsmMatches = fpsm.process({fpsm_hi, fpsm_lo});
+			Bit#(256) chunkBits = pack(fpsmMatches);
+			Bit#(128) nfpsmChunkBits = nfpsm_matcher.process({fpsm_hi, fpsm_lo});
+
+			if (inPayload && !isLastPayloadWord) begin
+				if (!hasBuf) begin
+					fpsmBuf[selIdx] <= tagged Valid selPayload;
 				end else begin
-					Bit#(256) fpsmInput = {payload, fromMaybe(0, fpsmBuf)};
-					Vector#(OutputSize, Bool) fpsmMatches = fpsm.process(fpsmInput);
-					Bit#(256) matchBits = 0;
-					for (Integer i = 0; i < valueOf(OutputSize); i = i + 1) begin
-						matchBits[i] = pack(fpsmMatches[i]);
+
+					if (chunkBits != 0) begin
+						fpsmMatchCount   <= fpsmMatchCount + 1;
+						fpsmTotalMatches <= fpsmTotalMatches + countMatches(fpsmMatches);
+
+						ruleReduction.putWindow(chunkBits, {fpsm_hi, fpsm_lo},
+						                        activeMeta, False);
 					end
-					if (matchBits != 0) begin
-						fpsmMatchResult <= matchBits;
-						fpsmMatchCount <= fpsmMatchCount + 1;
-						// Process through Pigasus pipeline
-						processPipelineMatches(fpsmMatches);
-					end
-					fpsmBuf <= tagged Invalid;
+					packetFpsmAcc[selIdx]  <= packetFpsmAcc[selIdx]  | chunkBits;
+					packetNFPSMAcc[selIdx] <= packetNFPSMAcc[selIdx] | nfpsmChunkBits;
+					fpsmBuf[selIdx] <= tagged Valid selPayload;
 				end
 			end
-			
-			currentByteOffset[idx7] <= byteEnd;
-			
-			if (byteEnd >= payloadEnd) begin
-				metaReady[idx7] <= False;
+
+			currentByteOffset[selIdx] <= (byteEnd >= selPayloadEnd) ? 0 : byteEnd;
+
+			if (byteEnd >= selPayloadEnd) begin
+
+				Bit#(256) lastBits      = inPayload ? chunkBits      : 0;
+				Bit#(128) lastNFPSMBits = inPayload ? nfpsmChunkBits : 0;
+				Bit#(256) totalAcc      = packetFpsmAcc[selIdx]  | lastBits;
+				Bit#(128) totalNFPSMAcc = packetNFPSMAcc[selIdx] | lastNFPSMBits;
+
+				if (inPayload && chunkBits != 0) begin
+					fpsmMatchCount   <= fpsmMatchCount + 1;
+					fpsmTotalMatches <= fpsmTotalMatches + countMatches(fpsmMatches);
+				end
+
+				if (totalAcc != 0) fpsmMatchResult <= totalAcc;
+
+				Bit#(32) reducedCount = reduceMatchCount(unpack(totalAcc));
+				reducedMatchCount <= reducedMatchCount + reducedCount;
+
+			if (activeMeta.totalLength >= 20)
+				packetCount <= packetCount + 1;
+				if (activeMeta.totalLength >= 20) begin
+					if (totalAcc != 0) begin
+
+						ruleReduction.putWindow(lastBits, {fpsm_hi, fpsm_lo},
+						                        activeMeta, True);
+						pendingNFPSMFPQ.enq(tuple2(totalNFPSMAcc, activeMeta));
+					end else begin
+						noFpsmCleanCount <= noFpsmCleanCount + 1;
+					end
+				end
+
+				packetFpsmAcc[selIdx]  <= 0;
+				packetNFPSMAcc[selIdx] <= 0;
+				fpsmBuf[selIdx]        <= tagged Invalid;
+				metaReady[selIdx]         <= False;
 			end
-		end
-	endrule
-	
-	// Drain Traffic Manager decisions
-	rule drainTrafficDecision;
-		let decision <- trafficMgr.getDecision();
-		if (decision.needsNFPSM) begin
-			nfpsmPacketCount <= nfpsmPacketCount + 1;
-		end else begin
-			cleanPacketCount <= cleanPacketCount + 1;
 		end
 	endrule
 
-	rule drainMeta0(pes[0].metaValid);
-		let m = pes[0].metaFirst;
-		pes[0].metaDeq;
-		lastMeta[0] <= m;
-		metaCount[0] <= metaCount[0] + 1;
-		currentByteOffset[0] <= 0;
+	rule connectRuleReductionToHeaderMatcher(ruleReduction.outValid);
+		let ruleIds = ruleReduction.outRuleIds;
+		let meta    = ruleReduction.outMeta;
+		ruleReduction.outDeq;
+		headerMatcher.put(ruleIds, meta);
+	endrule
+
+	rule connectHeaderMatcherToTrafficMgr(headerMatcher.outValid);
+		let results = headerMatcher.outResults;
+		let meta    = headerMatcher.outMeta;
+		headerMatcher.outDeq;
+		Bool anyValid = False;
+		for (Integer i = 0; i < 8; i = i + 1)
+			if (results[i].valid) begin
+				anyValid = True;
+			end
+		if (anyValid) headerMatchCount <= headerMatchCount + 1;
+		trafficMgr.putHeaderResults(results, meta);
+	endrule
+
+	rule drainTrafficDecision;
+		match {.decision, .meta} <- trafficMgr.getDecision();
+		let pending = pendingNFPSMFPQ.first;
+		pendingNFPSMFPQ.deq;
+		let pktFP   = tpl_1(pending);
+		let pktMeta = tpl_2(pending);
+		Vector#(MaxCandidates, Maybe#(Bit#(16))) ruleIds = replicate(tagged Invalid);
+		Bit#(4) numRules = zeroExtend(decision.numRules);
+		for (Integer i = 0; i < 8; i = i + 1) begin
+			Bit#(4) idx = fromInteger(i);
+			if (idx < numRules)
+				ruleIds[i] = tagged Valid decision.ruleIds[i];
+		end
+		if (decision.needsNFPSM)
+			nfpsm.putSuspicious(pktFP, ruleIds, pktMeta);
+	endrule
+
+	rule drainNFPSM(nfpsm.outValid);
+		nfpsm.outDeq;
+	endrule
+
+	rule drainMeta0(pes[0].metaValid && !metaReady[0]);
+		let m = pes[0].metaFirst; pes[0].metaDeq;
+		lastMeta[0] <= m; metaCount[0] <= metaCount[0] + 1;
 		metaReady[0] <= True;
 	endrule
-	rule drainMeta1(pes[1].metaValid);
-		let m = pes[1].metaFirst;
-		pes[1].metaDeq;
-		lastMeta[1] <= m;
-		metaCount[1] <= metaCount[1] + 1;
-		currentByteOffset[1] <= 0;
+	rule drainMeta1(pes[1].metaValid && !metaReady[1]);
+		let m = pes[1].metaFirst; pes[1].metaDeq;
+		lastMeta[1] <= m; metaCount[1] <= metaCount[1] + 1;
 		metaReady[1] <= True;
 	endrule
-	rule drainMeta2(pes[2].metaValid);
-		let m = pes[2].metaFirst;
-		pes[2].metaDeq;
-		lastMeta[2] <= m;
-		metaCount[2] <= metaCount[2] + 1;
-		currentByteOffset[2] <= 0;
+	rule drainMeta2(pes[2].metaValid && !metaReady[2]);
+		let m = pes[2].metaFirst; pes[2].metaDeq;
+		lastMeta[2] <= m; metaCount[2] <= metaCount[2] + 1;
 		metaReady[2] <= True;
 	endrule
-	rule drainMeta3(pes[3].metaValid);
-		let m = pes[3].metaFirst;
-		pes[3].metaDeq;
-		lastMeta[3] <= m;
-		metaCount[3] <= metaCount[3] + 1;
-		currentByteOffset[3] <= 0;
+	rule drainMeta3(pes[3].metaValid && !metaReady[3]);
+		let m = pes[3].metaFirst; pes[3].metaDeq;
+		lastMeta[3] <= m; metaCount[3] <= metaCount[3] + 1;
 		metaReady[3] <= True;
 	endrule
-	rule drainMeta4(pes[4].metaValid);
-		let m = pes[4].metaFirst;
-		pes[4].metaDeq;
-		lastMeta[4] <= m;
-		metaCount[4] <= metaCount[4] + 1;
-		currentByteOffset[4] <= 0;
+	rule drainMeta4(pes[4].metaValid && !metaReady[4]);
+		let m = pes[4].metaFirst; pes[4].metaDeq;
+		lastMeta[4] <= m; metaCount[4] <= metaCount[4] + 1;
 		metaReady[4] <= True;
 	endrule
-	rule drainMeta5(pes[5].metaValid);
-		let m = pes[5].metaFirst;
-		pes[5].metaDeq;
-		lastMeta[5] <= m;
-		metaCount[5] <= metaCount[5] + 1;
-		currentByteOffset[5] <= 0;
+	rule drainMeta5(pes[5].metaValid && !metaReady[5]);
+		let m = pes[5].metaFirst; pes[5].metaDeq;
+		lastMeta[5] <= m; metaCount[5] <= metaCount[5] + 1;
 		metaReady[5] <= True;
 	endrule
-	rule drainMeta6(pes[6].metaValid);
-		let m = pes[6].metaFirst;
-		pes[6].metaDeq;
-		lastMeta[6] <= m;
-		metaCount[6] <= metaCount[6] + 1;
-		currentByteOffset[6] <= 0;
+	rule drainMeta6(pes[6].metaValid && !metaReady[6]);
+		let m = pes[6].metaFirst; pes[6].metaDeq;
+		lastMeta[6] <= m; metaCount[6] <= metaCount[6] + 1;
 		metaReady[6] <= True;
 	endrule
-	rule drainMeta7(pes[7].metaValid);
-		let m = pes[7].metaFirst;
-		pes[7].metaDeq;
-		lastMeta[7] <= m;
-		metaCount[7] <= metaCount[7] + 1;
-		currentByteOffset[7] <= 0;
+	rule drainMeta7(pes[7].metaValid && !metaReady[7]);
+		let m = pes[7].metaFirst; pes[7].metaDeq;
+		lastMeta[7] <= m; metaCount[7] <= metaCount[7] + 1;
 		metaReady[7] <= True;
 	endrule
 
-	BRAM2Port#(Bit#(6),DMAWord) page <- mkBRAM2Server(defaultValue); // tag, total words,words recv
-
-	FIFO#(Bit#(8)) streamReadQ <- mkSizedBRAMFIFO(1024); // streamid, page offset
-	FIFO#(Bit#(8)) streamWriteQ <- mkSizedBRAMFIFO(1024); // streamid, page offset
-
-	Reg#(Bit#(32)) streamReadCnt <- mkReg(0);
+	BRAM2Port#(Bit#(6),DMAWord) page <- mkBRAM2Server(defaultValue);
+	FIFO#(Bit#(8)) streamReadQ  <- mkSizedBRAMFIFO(1024);
+	FIFO#(Bit#(8)) streamWriteQ <- mkSizedBRAMFIFO(1024);
+	Reg#(Bit#(32)) streamReadCnt  <- mkReg(0);
 	Reg#(Bit#(32)) streamWriteCnt <- mkReg(0);
+
+	Reg#(Bit#(32)) soPatHi <- mkReg(0);
+	Reg#(Bit#(32)) soPatLo <- mkReg(0);
+
+	Reg#(Bit#(32)) ckPatHi <- mkReg(0);
+	Reg#(Bit#(32)) ckPatLo <- mkReg(0);
+
+
 	rule getCmd;
 		let w <- pcie.dataReceive;
 		let a = w.addr;
 		let d = w.data;
-		// PCIe IO is done at 4 byte granularities
-		// lower 2 bits are always zero
-		let off = (a>>2);
-		// off == (in|out)<<8, d == page offset
-		if ( off == 0 ) begin
-			streamReadQ.enq(truncate(d));
-		end else if ( off == 1 ) begin
-			streamWriteQ.enq(truncate(d));
-		end 
-		// Pattern loading registers (offsets 16-31)
-		else if ( off == 16 ) begin
-			// Set lane index for pattern loading
-			patternLoadLane <= unpack(truncate(d));
-			patternLoadStage <= 0;
-		end else if ( off == 17 ) begin
-			// Set pattern length
-			patternLoadLen <= truncate(d);
-		end else if ( off == 18 ) begin
-			// Set rule ID
-			patternLoadRuleId <= truncate(d);
-		end else if ( off == 19 ) begin
-			Bit#(256) newData = patternLoadData;
-			newData[31:0] = d;
-			patternLoadData <= newData;
-		end else if ( off == 20 ) begin
-			Bit#(256) newData = patternLoadData;
-			newData[63:32] = d;
-			patternLoadData <= newData;
-		end else if ( off == 21 ) begin
-			Bit#(256) newData = patternLoadData;
-			newData[95:64] = d;
-			patternLoadData <= newData;
-		end else if ( off == 22 ) begin
-			Bit#(256) newData = patternLoadData;
-			newData[127:96] = d;
-			patternLoadData <= newData;
-		end else if ( off == 23 ) begin
-			Bit#(256) newData = patternLoadData;
-			newData[159:128] = d;
-			patternLoadData <= newData;
-		end else if ( off == 24 ) begin
-			Bit#(256) newData = patternLoadData;
-			newData[191:160] = d;
-			patternLoadData <= newData;
-		end else if ( off == 25 ) begin
-			Bit#(256) newData = patternLoadData;
-			newData[223:192] = d;
-			patternLoadData <= newData;
-		end else if ( off == 26 ) begin
-			// Last word - also commit the pattern
-			Bit#(256) newData = patternLoadData;
-			newData[255:224] = d;
-			patternLoadData <= newData;
-			
-			LanePattern pat = LanePattern {
-				pattern: newData,
-				patternLen: patternLoadLen,
-				ruleId: patternLoadRuleId,
-				valid: True
-			};
-			fpsm.setPattern(patternLoadLane, pat);
-		end
+		let off = (a >> 2);
+		if      (off == 0)  streamReadQ.enq(truncate(d));
+		else if (off == 1)  streamWriteQ.enq(truncate(d));
+		else if (off == 31) fpsm.loadHTBit(d[11:9], d[8:0]);
+		else if (off == 39) soPatHi <= d;
+		else if (off == 40) soPatLo <= d;
+		else if (off == 41) fpsm.loadSOPattern({soPatHi, soPatLo}, d[5:3], d[2:0]);
+
+		else if (off == 42) ckPatHi <= d;
+		else if (off == 43) ckPatLo <= d;
+		else if (off == 32) ruleReduction.loadCuckooEntry(d[28], d[27:25], d[24:16],
+		                                                   {ckPatHi, ckPatLo}, d[15:0]);
+
+		else if (off == 33) headerMatcher.stageRulePg(d[31:16], d[15:8], d[7:0]);
+		else if (off == 34) headerMatcher.stageSrcPorts(d[31:16], d[15:0]);
+		else if (off == 35) headerMatcher.commitDstPorts(d[31:16], d[15:0]);
+
+		else if (off == 36) nfpsm.loadRuleFP(d[24:16], d[10:8], d[15:0]);
+
+		else if (off == 37) nfpsm_matcher.loadBTableEntry(d[15:8], d[7:0]);
+		else if (off == 38) nfpsm_matcher.loadHTBit(d[11:9], d[8:0]);
 	endrule
 
 	FIFO#(IOReadReq) reqQ <- mkFIFO;
 	rule readStat;
 		let r <- pcie.dataReq;
-		let a = r.addr;
-		// PCIe IO is done at 4 byte granularities
-		// lower 2 bits are always zero
-		let offset = (a>>2);
+		let offset = (r.addr >> 2);
+		if      (offset == 0)  pcie.dataSend(r, streamReadCnt);
+		else if (offset == 1)  pcie.dataSend(r, streamWriteCnt);
+		else if (offset == 2)  pcie.dataSend(r, truncate(fpsmMatchResult));
+		else if (offset == 3)  pcie.dataSend(r, truncate(fpsmMatchResult >> 32));
+		else if (offset == 4)  pcie.dataSend(r, truncate(fpsmMatchResult >> 64));
+		else if (offset == 5)  pcie.dataSend(r, truncate(fpsmMatchResult >> 96));
+		else if (offset == 6)  pcie.dataSend(r, truncate(fpsmMatchResult >> 128));
+		else if (offset == 7)  pcie.dataSend(r, truncate(fpsmMatchResult >> 160));
+		else if (offset == 8)  pcie.dataSend(r, truncate(fpsmMatchResult >> 192));
+		else if (offset == 9)  pcie.dataSend(r, truncate(fpsmMatchResult >> 224));
+		else if (offset == 10) pcie.dataSend(r, fpsmMatchCount);
+		else if (offset == 11) pcie.dataSend(r, fpsmTotalMatches);
+		else if (offset == 12) pcie.dataSend(r, reducedMatchCount);
+		else if (offset == 13) pcie.dataSend(r, trafficMgr.getNFPSMPackets());
+		else if (offset == 14) pcie.dataSend(r, nfpsm.getCleanCount());
+		else if (offset == 15) pcie.dataSend(r, nfpsm.getCPUCount());
+		else if (offset == 16) pcie.dataSend(r, packetCount);
+		else if (offset == 17) pcie.dataSend(r, noFpsmCleanCount);
+		else if (offset == 18) pcie.dataSend(r, trafficMgr.getCleanPackets());
 
-		if ( offset == 0 ) begin
-			pcie.dataSend(r, streamReadCnt);
-		end else if ( offset == 1 ) begin
-			pcie.dataSend(r, streamWriteCnt);
-		end else if ( offset == 2 ) begin
-			// FPSM match result bits [31:0] (lanes 0-3)
-			pcie.dataSend(r, truncate(fpsmMatchResult));
-		end else if ( offset == 3 ) begin
-			// FPSM match result bits [63:32] (lanes 4-7)
-			pcie.dataSend(r, truncate(fpsmMatchResult >> 32));
-		end else if ( offset == 4 ) begin
-			// FPSM match result bits [95:64] (lanes 8-11)
-			pcie.dataSend(r, truncate(fpsmMatchResult >> 64));
-		end else if ( offset == 5 ) begin
-			// FPSM match result bits [127:96] (lanes 12-15)
-			pcie.dataSend(r, truncate(fpsmMatchResult >> 96));
-		end else if ( offset == 6 ) begin
-			// FPSM match result bits [159:128] (lanes 16-19)
-			pcie.dataSend(r, truncate(fpsmMatchResult >> 128));
-		end else if ( offset == 7 ) begin
-			// FPSM match result bits [191:160] (lanes 20-23)
-			pcie.dataSend(r, truncate(fpsmMatchResult >> 160));
-		end else if ( offset == 8 ) begin
-			// FPSM match result bits [223:192] (lanes 24-27)
-			pcie.dataSend(r, truncate(fpsmMatchResult >> 192));
-		end else if ( offset == 9 ) begin
-			// FPSM match result bits [255:224] (lanes 28-31)
-			pcie.dataSend(r, truncate(fpsmMatchResult >> 224));
-		end else if ( offset == 10 ) begin
-			// FPSM chunks with matches (number of 256-bit chunks that had at least one match)
-			pcie.dataSend(r, fpsmMatchCount);
-		end else if ( offset == 11 ) begin
-			// FPSM total individual matches (before reduction)
-			pcie.dataSend(r, fpsmTotalMatches);
-		end else if ( offset == 12 ) begin
-			// Rule-reduced match count (after capping at 8 per chunk)
-			pcie.dataSend(r, reducedMatchCount);
-		end else if ( offset == 13 ) begin
-			// Header-matched count
-			pcie.dataSend(r, headerMatchCount);
-		end else if ( offset == 14 ) begin
-			// Clean packet count
-			pcie.dataSend(r, cleanPacketCount);
-		end else if ( offset == 15 ) begin
-			// NFPSM packet count
-			pcie.dataSend(r, nfpsmPacketCount);
-		end else if ( offset == 16 ) begin
-			// Total FPSM chunks processed
-			pcie.dataSend(r, packetCount);
-		end else if ( offset >= 17 ) begin
-			page.portB.request.put(BRAMRequest{write:False,responseOnWrite:False,address:truncate(offset),datain:?});
+		else if (offset == 20) pcie.dataSend(r, metaCount[0]);
+		else if (offset == 21) pcie.dataSend(r, metaCount[1]);
+		else if (offset == 22) pcie.dataSend(r, metaCount[2]);
+		else if (offset == 23) pcie.dataSend(r, metaCount[3]);
+		else if (offset == 24) pcie.dataSend(r, metaCount[4]);
+		else if (offset == 25) pcie.dataSend(r, metaCount[5]);
+		else if (offset == 26) pcie.dataSend(r, metaCount[6]);
+		else if (offset == 27) pcie.dataSend(r, metaCount[7]);
+		else if (offset == 28) pcie.dataSend(r, zeroExtend(fpsm.soBitmap));
+		else if (offset >= 18) begin
+			page.portB.request.put(BRAMRequest{
+				write: False, responseOnWrite: False,
+				address: truncate(offset), datain: ?});
 			reqQ.enq(r);
 		end else begin
 			pcie.dataSend(r, 32'hcccccccc);
 		end
 	endrule
+
 	rule relayPageRead;
 		let r <- page.portB.response.get();
-		let req = reqQ.first;
-		reqQ.deq;
-		pcie.dataSend(req,truncate(r));
+		let req = reqQ.first; reqQ.deq;
+		pcie.dataSend(req, truncate(r));
 	endrule
 
 	rule dmaReadReq;
 		streamReadQ.deq;
 		let poff = streamReadQ.first;
-		pcie.dmaReadReq( (zeroExtend(poff)<<10), 64); // offset, words
+		pcie.dmaReadReq((zeroExtend(poff) << 10), 64);
 		streamReadCnt <= streamReadCnt + 1;
 	endrule
+
 	Reg#(Bit#(32)) dmaReadWords <- mkReg(0);
 	rule dmaReadDatal;
 		DMAWord rd <- pcie.dmaReadWord;
-		page.portA.request.put(BRAMRequest{write:True,responseOnWrite:False,address:truncate(dmaReadWords),datain:rd});
+		page.portA.request.put(BRAMRequest{
+			write: True, responseOnWrite: False,
+			address: truncate(dmaReadWords), datain: rd});
 		dmaReadWords <= dmaReadWords + 1;
-		
 		inputQ.enq(rd);
 	endrule
 
 	Reg#(Bit#(16)) curOutLeftUp <- mkReg(0);
 	Reg#(Bit#(16)) curOutLeftDn <- mkReg(0);
-	rule dmaWriteReq (outputCntUp - outputCntDn >= 64 && curOutLeftUp-curOutLeftDn < 128);
+	rule dmaWriteReq(outputCntUp - outputCntDn >= 64
+	                 && curOutLeftUp - curOutLeftDn < 128);
 		streamWriteQ.deq;
 		let woff = streamWriteQ.first;
-		pcie.dmaWriteReq((zeroExtend(woff)<<10), 64);
-
+		pcie.dmaWriteReq((zeroExtend(woff) << 10), 64);
 		curOutLeftUp <= curOutLeftUp + 64;
-		outputCntDn <= outputCntDn + 64;
+		outputCntDn  <= outputCntDn  + 64;
 		streamWriteCnt <= streamWriteCnt + 1;
 	endrule
+
 	rule dmaWriteData(curOutLeftUp != curOutLeftDn);
 		curOutLeftDn <= curOutLeftDn + 1;
 		outputQ.deq;
 		pcie.dmaWriteData(outputQ.first);
 	endrule
+
+	Reg#(Bool) heartbeat <- mkReg(False);
+	rule tick; heartbeat <= !heartbeat; endrule
+
 endmodule

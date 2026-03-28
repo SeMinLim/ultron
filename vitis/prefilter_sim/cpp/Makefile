@@ -1,10 +1,8 @@
 LIBPATH=../../../
-#LIBOBJ=$(LIBPATH)/cpp/obj/
 
 BDBMPCIEINCLUDE= -I$(LIBPATH)/cpp/
 BDBMPCIECPP= $(LIBPATH)/cpp/bdbmpcie.cpp $(LIBPATH)/cpp/ShmFifo.cpp 
 LIB= -lrt -lpthread 
-
 
 all:
 	echo "building for pcie"

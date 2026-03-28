@@ -25,7 +25,6 @@ module mkProjectTop #(
 	) 
 		(TopIfc);
 
-
 	PcieImportIfc pcie <- mkPcieImport(pcie_clk_p, pcie_clk_n, pcie_rst_n, emcclk);
 	Clock pcie_clk_buf = pcie.sys_clk_o;
 	Reset pcie_rst_n_buf = pcie.sys_rst_n_o;
@@ -39,7 +38,6 @@ module mkProjectTop #(
 	PcieCtrlIfc pcieCtrl <- mkPcieCtrl(pcie.user, clocked_by pcie.user_clk, reset_by pcie.user_reset);
 	HwMainIfc hwmain <- mkHwMain(pcieCtrl.user, clocked_by pcieCtrl.user.user_clk, reset_by pcieCtrl.user.user_rst);
 
-	// Interfaces ////
 	interface PcieImportPins pcie_pins = pcie.pins;
 
 	method Bit#(4) led;

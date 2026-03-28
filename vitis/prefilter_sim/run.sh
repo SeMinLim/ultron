@@ -12,7 +12,7 @@ if [ "$1" == "gdb" ]
 then
 	gdb "$HOST"
 else
-	"$HOST" "$@" | tee res.txt
+	"$HOST" "$@"
 fi
 kill $BDBM_BSIM_PID 2>/dev/null
 sleep 0.5
