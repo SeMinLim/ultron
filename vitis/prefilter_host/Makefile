@@ -1,13 +1,4 @@
-.PHONY: all clean
-
-XRT_DIR ?= $(XILINX_XRT)
-ifeq ($(XRT_DIR),)
-XRT_DIR := /opt/xilinx/xrt
-endif
-
+.PHONY: all
 all:
 	mkdir -p obj/
-	g++ -g -std=c++17 -Wall -O0 main.cpp rule_loader.cpp -o ./obj/main -I$(XRT_DIR)/include/ -L$(XRT_DIR)/lib -lxrt_coreutil -pthread
-
-clean:
-	rm -rf obj
+	g++ -g -std=c++17 -Wall -O0 main.cpp -o ./obj/main -I$(XILINX_XRT)/include/ -L$(XILINX_XRT)/lib -lxrt_coreutil -pthread

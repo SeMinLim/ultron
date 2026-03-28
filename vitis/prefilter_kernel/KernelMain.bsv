@@ -102,8 +102,8 @@ module mkKernelMain(KernelMainIfc);
     Reg#(Bit#(4))              cfgCmdCount   <- mkReg(0);
     Reg#(Bit#(3))              cfgCmdNext    <- mkReg(0);
 
-    Reg#(Bit#(32)) soPatHi <- mkReg(0);
-    Reg#(Bit#(32)) soPatLo <- mkReg(0);
+    Reg#(Bit#(32)) shMaskHi <- mkReg(0);
+    Reg#(Bit#(32)) shMaskLo <- mkReg(0);
     Reg#(Bit#(32)) ckPatHi <- mkReg(0);
     Reg#(Bit#(32)) ckPatLo <- mkReg(0);
 
@@ -168,9 +168,10 @@ module mkKernelMain(KernelMainIfc);
         else if (off == 36) nfpsm.loadRuleFP(d[24:16], d[10:8], d[15:0]);
         else if (off == 37) nfpsm_matcher.loadBTableEntry(d[15:8], d[7:0]);
         else if (off == 38) nfpsm_matcher.loadHTBit(d[11:9], d[8:0]);
-        else if (off == 39) soPatHi <= d;
-        else if (off == 40) soPatLo <= d;
-        else if (off == 41) fpsm.loadSOPattern({soPatHi, soPatLo}, d[5:3], d[2:0]);
+        else if (off == 39) shMaskHi <= d;
+        else if (off == 40) shMaskLo <= d;
+        else if (off == 41) fpsm.loadShMaskEntry(d[10:8], d[7:0], {shMaskHi, shMaskLo});
+        else if (off == 47) fpsm.loadHasPatterns(d[10:8], d[7:0]);
         else if (off == 42) ckPatHi <= d;
         else if (off == 43) ckPatLo <= d;
 

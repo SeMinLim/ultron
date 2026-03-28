@@ -1,3 +1,5 @@
+package KernelTop;
+
 import Axi4LiteControllerXrt::*;
 import Axi4MemoryMaster::*;
 
@@ -92,3 +94,5 @@ module kernel (KernelTopIfc);
 	interface s_axi_control = axi4control.pins;
 	interface interrupt = axi4control.interrupt;
 endmodule
+
+endpackage: KernelTop
