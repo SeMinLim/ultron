@@ -2,7 +2,6 @@
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include "cuckoo_hash.h"
 
 static int h1(int key, int cap) { return abs(key % cap); }
