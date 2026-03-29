@@ -61,7 +61,7 @@ module mkKernelMain(KernelMainIfc);
     FIFO#(DMAWord) outputQ <- mkSizedBRAMFIFO(512);
     FIFO#(Tuple2#(Bit#(128), PacketMeta)) pendingNFPSMFPQ <- mkSizedBRAMFIFO(64);
 
-    Vector#(8, PacketParserIfc)  pes               <- replicateM(mkPacketParser);
+Vector#(8, PacketParserIfc)  pes               <- replicateM(mkPacketParser);
     Vector#(8, Reg#(PacketMeta)) lastMeta          <- replicateM(mkRegU);
     Vector#(8, Reg#(Bit#(32)))   metaCount         <- replicateM(mkReg(0));
     Vector#(8, Reg#(Bit#(16)))   currentByteOffset <- replicateM(mkReg(0));
@@ -371,6 +371,8 @@ module mkKernelMain(KernelMainIfc);
             Bit#(128) fpsm_lo = hasBuf ? fromMaybe(0, fpsmBuf[selIdx]) : selPayload;
             Bit#(128) fpsm_hi = hasBuf ? selPayload                     : 128'h0;
 
+            // Shift-OR (NFA, pre-computed shMask) AND hash run in parallel for all
+            // 32 lanes simultaneously; result is the 256-bit match vector.
             Vector#(OutputSize, Bool) fpsmMatches = fpsm.process({fpsm_hi, fpsm_lo});
             Bit#(256) chunkBits    = pack(fpsmMatches);
             Bit#(128) nfpsmChunk   = nfpsm_matcher.process({fpsm_hi, fpsm_lo});
