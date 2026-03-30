@@ -4,9 +4,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define PROTO_TCP  6
-#define PROTO_UDP  17
-#define PROTO_ICMP 1
+#define PROTO_TCP   6
+#define PROTO_UDP   17
+#define PROTO_ICMP  1
+#define PROTO_ICMP6 58
 
 typedef struct {
     uint8_t  proto;
