@@ -139,7 +139,7 @@ int main(int argc, char *argv[])
             printf("pcap           : %s\n", pcap_file);
             PcapFrame frame;
             int n_frames = 0, n_parsed = 0, n_matched_pkts = 0;
-            int total_bm = 0, total_exact = 0;
+            int n_bm_pkts = 0, total_exact = 0;
 
             while (pcap_next(pr, &frame)) {
                 n_frames++;
@@ -153,7 +153,7 @@ int main(int argc, char *argv[])
 
                 int nc = match_scan(&mctx, pkt.payload, (int)pkt.payload_len,
                                     bm, candidates, 1024);
-                total_bm += nc;
+                if (nc > 0) n_bm_pkts++;
 
                 int nm = exact_match(pkt.payload, (int)pkt.payload_len,
                                      candidates, nc < 1024 ? nc : 1024,
@@ -170,7 +170,9 @@ int main(int argc, char *argv[])
 
             printf("frames total   : %d\n", n_frames);
             printf("frames parsed  : %d  (IPv4/IPv6 TCP/UDP/ICMP with payload)\n", n_parsed);
-            printf("bitmap hits    : %d  (potential match candidates)\n", total_bm);
+            printf("bitmap hit pkts: %d / %d  (%.1f%%)\n",
+                   n_bm_pkts, n_parsed,
+                   n_parsed ? 100.0 * n_bm_pkts / n_parsed : 0.0);
             printf("matched packets: %d\n", n_matched_pkts);
             printf("exact matches  : %d  (total rule-packet events)\n", total_exact);
             pcap_close(pr);
