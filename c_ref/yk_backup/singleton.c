@@ -110,7 +110,6 @@ SingletonResult *singleton_build(const RuleSet *rs)
     int    *rule_cov   = calloc(nr, sizeof(int));
     memset(rule_sel, -1, nr * sizeof(int));
 
-    /* step 1: build bipartite graph */
     for (int rid = 0; rid < nr; rid++) {
         const Rule *r = &rs->rules[rid];
         if (r->pat_len < 3) continue;
@@ -126,7 +125,6 @@ SingletonResult *singleton_build(const RuleSet *rs)
     for (int i = 0; i < nr; i++)
         if (rs->rules[i].pat_len >= 3) n_uncov++;
 
-    /* step 2: greedy degree-peeling */
     int       qcap  = est * 2 + ht->size + 1;
     uint32_t *queue = malloc(qcap * sizeof(uint32_t));
     int       qhead = 0, qtail = 0;
@@ -178,7 +176,6 @@ SingletonResult *singleton_build(const RuleSet *rs)
         }
     }
 
-    /* build output */
     int n_covered = 0, n_skipped = 0;
     for (int i = 0; i < nr; i++) {
         if (rule_cov[i]) n_covered++;

@@ -61,7 +61,6 @@ int packet_parse(const uint8_t *raw, size_t len, Packet *out)
 
     uint16_t ethertype = be16(raw + 12);
 
-    /* skip 802.1Q VLAN tag */
     const uint8_t *l3 = raw + ETH_HDR_LEN;
     size_t         l3_len = len - ETH_HDR_LEN;
     if (ethertype == 0x8100 && l3_len >= 4) {
@@ -98,16 +97,14 @@ int packet_parse(const uint8_t *raw, size_t len, Packet *out)
         const uint8_t *trans  = l3 + IPV6_HDR_LEN;
         size_t  trans_len     = payload_len;
 
-        /* walk extension headers */
         while (next_header != PROTO_TCP  &&
                next_header != PROTO_UDP  &&
                next_header != PROTO_ICMP6) {
-            /* known skippable extension headers */
-            if (next_header == 0   ||  /* Hop-by-Hop */
-                next_header == 43  ||  /* Routing    */
-                next_header == 60  ||  /* Destination Options */
-                next_header == 51  ||  /* AH         */
-                next_header == 135) {  /* MH         */
+            if (next_header == 0   ||
+                next_header == 43  ||
+                next_header == 60  ||
+                next_header == 51  ||
+                next_header == 135) {
                 if (trans_len < 2) return -1;
                 size_t ext_len = ((size_t)trans[1] + 1) * 8;
                 if (trans_len < ext_len) return -1;
