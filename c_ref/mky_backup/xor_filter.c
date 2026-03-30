@@ -147,6 +147,9 @@ bool xor8_build(XorFilter8 *f, uint64_t *keys, uint32_t n)
             f->fp[s] = xor_fingerprint(xor_mix(k, f->seed))
                        ^ f->fp[h0] ^ f->fp[h1] ^ f->fp[h2];
         }
+    } else {
+        free(f->fp);
+        f->fp = NULL;
     }
 
     free(slots);
