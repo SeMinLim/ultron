@@ -4,8 +4,8 @@
 #include <stdlib.h>
 #include "cuckoo_hash.h"
 
-static int h1(int key, int cap) { return abs(key % cap); }
-static int h2(int key, int cap) { return abs((key / cap) % cap); }
+static int h1(int key, int cap) { return (int)((unsigned)key % (unsigned)cap); }
+static int h2(int key, int cap) { return (int)(((unsigned)key * 2654435761u) % (unsigned)cap); }
 
 static int hash_fn(int table_id, int key, int cap)
 {
@@ -34,6 +34,7 @@ void cuckoo_destroy(CuckooHash *ht)
 
 bool cuckoo_lookup(const CuckooHash *ht, int key)
 {
+    if (key == CUCKOO_EMPTY) return false;  
     int p1 = h1(key, ht->capacity);
     int p2 = h2(key, ht->capacity);
     return ht->table[0][p1] == key || ht->table[1][p2] == key;
@@ -41,6 +42,7 @@ bool cuckoo_lookup(const CuckooHash *ht, int key)
 
 bool cuckoo_delete(CuckooHash *ht, int key)
 {
+    if (key == CUCKOO_EMPTY) return false;
     int p1 = h1(key, ht->capacity);
     if (ht->table[0][p1] == key) {
         ht->table[0][p1] = CUCKOO_EMPTY;
@@ -58,6 +60,7 @@ bool cuckoo_delete(CuckooHash *ht, int key)
 
 bool cuckoo_insert(CuckooHash *ht, int key)
 {
+    if (key == CUCKOO_EMPTY) return false;  
     if (cuckoo_lookup(ht, key))
         return true;
 

@@ -85,7 +85,8 @@ static void gnode_add_rule(GNode *n, int rid)
 static void ght_free(GHT *ht)
 {
     for (int i = 0; i < ht->size; i++)
-        free(ht->slots[i].rule_ids);
+        if (ht->slots[i].gram_idx != HT_EMPTY)
+            free(ht->slots[i].rule_ids);
     free(ht->slots);
     free(ht);
 }

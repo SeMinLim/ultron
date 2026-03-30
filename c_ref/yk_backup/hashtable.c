@@ -34,6 +34,7 @@ void ht_destroy(HashTable *ht)
 
 bool ht_lookup(const HashTable *ht, int key, int *val_out)
 {
+    if (key == CUCKOO_EMPTY) return false;  
     int p0 = h1(key, ht->capacity);
     if (ht->table[0][p0].key == key) {
         if (val_out) *val_out = ht->table[0][p0].val;
@@ -49,6 +50,7 @@ bool ht_lookup(const HashTable *ht, int key, int *val_out)
 
 bool ht_delete(HashTable *ht, int key)
 {
+    if (key == CUCKOO_EMPTY) return false;   
     int p0 = h1(key, ht->capacity);
     if (ht->table[0][p0].key == key) {
         ht->table[0][p0].key = CUCKOO_EMPTY;
@@ -66,6 +68,7 @@ bool ht_delete(HashTable *ht, int key)
 
 bool ht_insert(HashTable *ht, int key, int val)
 {
+    if (key == CUCKOO_EMPTY) return false;   
     int existing_val;
     if (ht_lookup(ht, key, &existing_val)) {
         int p0 = h1(key, ht->capacity);
