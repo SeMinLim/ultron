@@ -24,14 +24,11 @@ module kernel (KernelTopIfc);
 	Clock defaultClock <- exposeCurrentClock;
 	Reset defaultReset <- exposeCurrentReset;
 
-	// AXI
 	Axi4LiteControllerXrtIfc#(12,32) axi4control <- mkAxi4LiteControllerXrt(defaultClock, defaultReset);
 	Vector#(2, Axi4MemoryMasterIfc#(64,512)) axi4mem <- replicateM(mkAxi4MemoryMaster_64_512);
 	
-	// KernelMain
 	KernelMainIfc kernelMain <- mkKernelMain;
 
-	// Cycle Counter
 	Reg#(Bit#(32)) cycleCounter <- mkReg(0);
 	rule incCycle;
 		cycleCounter <= cycleCounter + 1;
@@ -44,7 +41,6 @@ module kernel (KernelTopIfc);
 		end
 	endrule
 
-	// Check Started if AXI controller is ready
 	FIFO#(Bit#(32)) startQ <- mkFIFO;
 	Reg#(Bool) last_ap_start <- mkReg(False);
 	rule checkStart; 
@@ -59,7 +55,6 @@ module kernel (KernelTopIfc);
 		started <= True;
 	endrule
 
-	// Check KernelMain operation is finished
 	rule checkDone ( started );
 		Bool done <- kernelMain.done;
 		if ( done ) begin

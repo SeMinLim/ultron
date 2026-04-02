@@ -23,7 +23,6 @@ endinterface
 
 module mkHashTable(HashTableIfc);
     FIFOF#(HashSeed) inQ <- mkSizedFIFOF(1024);
-    FIFOF#(VerifyRequest) outQ <- mkSizedFIFOF(2048);
 
     Reg#(Bool) active <- mkReg(False);
     Reg#(Bit#(32)) curAnchor <- mkReg(0);
@@ -43,31 +42,27 @@ module mkHashTable(HashTableIfc);
         end
     endrule
 
-    rule emitRequest(active && outQ.notFull);
-        outQ.enq(VerifyRequest {
+    method Action putSeed(HashSeed s) if (inQ.notFull);
+        inQ.enq(s);
+    endmethod
+
+    method ActionValue#(VerifyRequest) getRequest if (active);
+        let r = VerifyRequest {
             anchor: curAnchor,
             base: curBase,
             candIdx: curIdx
-        });
+        };
 
         if (curIdx + 1 >= curN) begin
             active <= False;
         end else begin
             curIdx <= curIdx + 1;
         end
-    endrule
 
-    method Action putSeed(HashSeed s) if (inQ.notFull);
-        inQ.enq(s);
-    endmethod
-
-    method ActionValue#(VerifyRequest) getRequest if (outQ.notEmpty);
-        let r = outQ.first;
-        outQ.deq;
         return r;
     endmethod
 
     method Bool seedReady = inQ.notFull;
-    method Bool reqValid = outQ.notEmpty;
-    method Bool busy = inQ.notEmpty || outQ.notEmpty || active;
+    method Bool reqValid = active;
+    method Bool busy = inQ.notEmpty || active;
 endmodule

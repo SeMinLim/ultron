@@ -44,6 +44,11 @@ typedef enum {
     KDrain,
     KWriteReq,
     KWriteData,
+    KWriteData2,
+    KWriteFlagsReadReq,
+    KWriteFlagsReadRsp,
+    KWriteFlagsMemReq,
+    KWriteFlagsMemData,
     KDone
 } KPhase deriving (Bits, Eq, FShow);
 
@@ -88,6 +93,13 @@ function Bit#(32) getLineU32(Bit#(512) w, Bit#(6) byteOff);
     return truncate(w >> sh);
 endfunction
 
+function Bit#(512) putWordU8(Bit#(512) w, Bit#(6) idx, Bit#(8) b);
+    Bit#(9) sh = zeroExtend(idx) << 3;
+    Bit#(512) clrMask = ~(zeroExtend(8'hFF) << sh);
+    Bit#(512) ins = zeroExtend(b) << sh;
+    return (w & clrMask) | ins;
+endfunction
+
 module mkKernelMain(KernelMainIfc);
     FIFO#(Bit#(32)) startQ <- mkFIFO;
     FIFO#(Bool) doneQ <- mkFIFO;
@@ -104,9 +116,14 @@ module mkKernelMain(KernelMainIfc);
     BitmapLookupIfc bitmapLookup <- mkBitmapLookup;
 
     BRAM_Configure gramdbCfg = defaultValue;
-    gramdbCfg.memorySize = 65536;
+    gramdbCfg.memorySize = staticGramdbLinesInt;
     gramdbCfg.loadFormat = tagged Hex "generated/gramdb_512.hex";
-    BRAM2Port#(Bit#(16), Bit#(512)) gramdbBram <- mkBRAM2Server(gramdbCfg);
+    BRAM2Port#(Bit#(17), Bit#(512)) gramdbBram <- mkBRAM2Server(gramdbCfg);
+
+    BRAM_Configure pktFlagCfg = defaultValue;
+    pktFlagCfg.memorySize = 65536;
+    pktFlagCfg.outFIFODepth = 64;
+    BRAM2Port#(Bit#(16), Bit#(8)) pktFlagBram <- mkBRAM2Server(pktFlagCfg);
 
     FIFOF#(BitmapReq) bitmapReqQ <- mkSizedFIFOF(1024);
     FIFOF#(GramHit) cuckooReqQ <- mkSizedFIFOF(1024);
@@ -163,7 +180,16 @@ module mkKernelMain(KernelMainIfc);
     Reg#(Bit#(32)) hashSeeds <- mkReg(0);
     Reg#(Bit#(32)) verifyReqs <- mkReg(0);
     Reg#(Bit#(32)) verifyHits <- mkReg(0);
+    Reg#(Bit#(32)) matchedPackets <- mkReg(0);
+    Reg#(Bool) pktMatchedCur <- mkReg(False);
     Reg#(Bit#(32)) pktPayloadBase <- mkReg(0);
+
+    Reg#(Bit#(32)) flagLineCount <- mkReg(0);
+    Reg#(Bit#(32)) flagLineIdx <- mkReg(0);
+    Reg#(Bit#(6)) flagReqIdx <- mkReg(0);
+    Reg#(Bit#(6)) flagRspIdx <- mkReg(0);
+    Reg#(Bit#(512)) flagLineWord <- mkReg(0);
+    Reg#(Bit#(512)) summaryWord2 <- mkReg(0);
 
     Reg#(Bool) mem1Pending <- mkReg(False);
     Reg#(Mem1Kind) mem1Kind <- mkReg(M1None);
@@ -180,6 +206,44 @@ module mkKernelMain(KernelMainIfc);
     Reg#(Bit#(32)) ckNCands <- mkReg(0);
 
     Reg#(Bit#(32)) errorFlags <- mkReg(0);
+
+    Reg#(KPhase) dbgLastPhase <- mkReg(KIdle);
+    Reg#(Bit#(32)) dbgSamePhaseCycles <- mkReg(0);
+
+    // Per-pipeline-stage busy cycle counters (overlap is expected — stages are pipelined)
+    Reg#(Bit#(32)) cycParsing <- mkReg(0); // cycles parser is being fed bytes
+    Reg#(Bit#(32)) cycBitmap  <- mkReg(0); // cycles bitmap pipeline has work in flight
+    Reg#(Bit#(32)) cycCuckoo  <- mkReg(0); // cycles cuckoo/gramdb pipeline has work
+    Reg#(Bit#(32)) cycExact   <- mkReg(0); // cycles exact-match has work in flight
+
+    rule countStageCycles(started && phase != KWriteData);
+        if (phase == KPktReq || phase == KPktResp || phase == KPktFeed)
+            cycParsing <= cycParsing + 1;
+        if (bitmapReqQ.notEmpty || bitmapLookup.busy)
+            cycBitmap <= cycBitmap + 1;
+        if (cuckooReqQ.notEmpty || ckState != CkIdle || mem1Pending || hashTable.busy)
+            cycCuckoo <= cycCuckoo + 1;
+        if (exactMatch.inputPending || exactMatch.notEmpty)
+            cycExact <= cycExact + 1;
+    endrule
+
+    rule trackPhaseProgress(
+        started
+        && phase != KWriteData
+        && phase != KWriteData2
+        && phase != KWriteFlagsReadReq
+        && phase != KWriteFlagsReadRsp
+        && phase != KWriteFlagsMemReq
+        && phase != KWriteFlagsMemData
+        && phase != KDone
+    );
+        if (phase == dbgLastPhase) begin
+            dbgSamePhaseCycles <= dbgSamePhaseCycles + 1;
+        end else begin
+            dbgLastPhase <= phase;
+            dbgSamePhaseCycles <= 0;
+        end
+    endrule
 
     rule systemStart(!started);
         startQ.deq;
@@ -233,7 +297,16 @@ module mkKernelMain(KernelMainIfc);
         hashSeeds <= 0;
         verifyReqs <= 0;
         verifyHits <= 0;
+        matchedPackets <= 0;
+        pktMatchedCur <= False;
         pktPayloadBase <= 0;
+
+        flagLineCount <= 0;
+        flagLineIdx <= 0;
+        flagReqIdx <= 0;
+        flagRspIdx <= 0;
+        flagLineWord <= 0;
+        summaryWord2 <= 0;
 
         mem1Pending <= False;
         mem1Kind <= M1None;
@@ -250,6 +323,14 @@ module mkKernelMain(KernelMainIfc);
         ckNCands <= 0;
 
         errorFlags <= 0;
+
+        dbgLastPhase <= KIdle;
+        dbgSamePhaseCycles <= 0;
+
+        cycParsing <= 0;
+        cycBitmap  <= 0;
+        cycCuckoo  <= 0;
+        cycExact   <= 0;
     endrule
 
     rule issueHeaderReq(started && phase == KReadHeaderReq);
@@ -294,7 +375,7 @@ module mkKernelMain(KernelMainIfc);
         if (bmLines > 32'd32768) begin
             hdrErr = hdrErr | 32'h00000100;
         end
-        if (gdLines > 32'd65536) begin
+        if (gdLines > 32'd131072) begin
             hdrErr = hdrErr | 32'h00000200;
         end
         if (staticGramdbHtCapacity == 0) begin
@@ -305,6 +386,9 @@ module mkKernelMain(KernelMainIfc);
         end
         if (gramdbBytesHost != staticGramdbBytes) begin
             hdrErr = hdrErr | 32'h00008000;
+        end
+        if (pktCount > 32'd65536) begin
+            hdrErr = hdrErr | 32'h00010000;
         end
 
         bitmapLineCount <= bmLines;
@@ -350,6 +434,16 @@ module mkKernelMain(KernelMainIfc);
         curRawLen <= rawLen;
 
         if (rawLen == 0) begin
+            if (pktIdx < 32'd65536) begin
+                pktFlagBram.portA.request.put(BRAMRequest {
+                    write: True,
+                    responseOnWrite: False,
+                    address: truncate(pktIdx),
+                    datain: 0
+                });
+            end else begin
+                errorFlags <= errorFlags | 32'h00020000;
+            end
             pktIdx <= pktIdx + 1;
             phase <= (pktIdx + 1 >= hdrPktCount) ? KDrain : KDescReq;
         end else begin
@@ -357,6 +451,7 @@ module mkKernelMain(KernelMainIfc);
             feedAddr <= {absAddr[63:6], 6'b0};
             feedByteIdx <= zeroExtend(absAddr[5:0]);
             pktBytesRemaining <= rawLen;
+            pktMatchedCur <= False;
             phase <= KPktReq;
         end
     endrule
@@ -394,7 +489,7 @@ module mkKernelMain(KernelMainIfc);
                 let nextPkt = pktIdx + 1;
                 pktIdx <= nextPkt;
                 feedByteIdx <= nextIdx;
-                phase <= (nextPkt >= hdrPktCount) ? KDrain : KDescReq;
+                phase <= KPktDrain;
             end else begin
                 feedAddr <= feedAddr + 64;
                 feedByteIdx <= 0;
@@ -480,7 +575,7 @@ module mkKernelMain(KernelMainIfc);
     rule issueCuckooT0(started && ckState == CkNeedT0 && !mem1Pending);
         Bit#(32) entryAddr = gramdbTable0Off + (ckH0 << 3);
         Bit#(32) lineIdx = entryAddr >> 6;
-        if (lineIdx < gramdbLineCount && lineIdx < 32'd65536) begin
+        if (lineIdx < gramdbLineCount && lineIdx < 32'd131072) begin
             gramdbBram.portA.request.put(BRAMRequest {
                 write: False,
                 responseOnWrite: False,
@@ -500,7 +595,7 @@ module mkKernelMain(KernelMainIfc);
     rule issueCuckooT1(started && ckState == CkNeedT1 && !mem1Pending);
         Bit#(32) entryAddr = gramdbTable1Off + (ckH1 << 3);
         Bit#(32) lineIdx = entryAddr >> 6;
-        if (lineIdx < gramdbLineCount && lineIdx < 32'd65536) begin
+        if (lineIdx < gramdbLineCount && lineIdx < 32'd131072) begin
             gramdbBram.portA.request.put(BRAMRequest {
                 write: False,
                 responseOnWrite: False,
@@ -520,9 +615,9 @@ module mkKernelMain(KernelMainIfc);
     rule issueCandRead(started && ckState == CkNeedCount && !mem1Pending);
         Bit#(32) idx = ckBase + ckCandIdx;
         if (idx < gramdbAssignCount) begin
-            Bit#(32) recAddr = 32'd8 + idx * 32'd272;
+            Bit#(32) recAddr = 32'd8 + idx * staticGramdbAssignBytes;
             Bit#(32) lineIdx = recAddr >> 6;
-            if (lineIdx < gramdbLineCount && lineIdx < 32'd65536) begin
+            if (lineIdx < gramdbLineCount && lineIdx < 32'd131072) begin
                 gramdbBram.portA.request.put(BRAMRequest {
                     write: False,
                     responseOnWrite: False,
@@ -550,7 +645,11 @@ module mkKernelMain(KernelMainIfc);
         end
     endrule
 
-    rule recvBitmapRsp(started && bitmapLookup.rspValid);
+    rule recvBitmapRsp(
+        started
+        && (phase == KPktFeed || phase == KPktDrain || phase == KDrain)
+        && bitmapLookup.rspValid
+    );
         let r <- bitmapLookup.getRsp;
         if (r.hit) begin
             bitmapHitGrams <= bitmapHitGrams + 1;
@@ -566,7 +665,12 @@ module mkKernelMain(KernelMainIfc);
         end
     endrule
 
-    rule recvMem1Gramdb(started && mem1Pending && mem1Kind != M1None);
+    rule recvMem1Gramdb(
+        started
+        && (phase == KPktFeed || phase == KPktDrain || phase == KDrain)
+        && mem1Pending
+        && mem1Kind != M1None
+    );
         let w <- gramdbBram.portA.response.get();
 
         case (mem1Kind)
@@ -574,10 +678,25 @@ module mkKernelMain(KernelMainIfc);
                 Bit#(32) key = getLineU32(w, mem1ByteInLine);
                 Bit#(32) val = getLineU32(w, mem1ByteInLine + 4);
                 if (key == mem1Gram && val[31] == 0) begin
-                    ckBase <= val;
-                    ckCandIdx <= 0;
-                    ckNCands <= 0;
-                    ckState <= CkNeedCount;
+                    Bit#(16) base16 = truncate(val);
+                    Bit#(16) n16 = truncate(val >> 16);
+                    Bit#(32) basePacked = zeroExtend(base16);
+                    Bit#(32) nPacked = zeroExtend(n16);
+
+                    if (nPacked != 0) begin
+                        if (hashTable.seedReady) begin
+                            hashTable.putSeed(HashSeed { anchor: ckAnchor, base: basePacked, nCands: nPacked });
+                            hashSeeds <= hashSeeds + 1;
+                        end else begin
+                            errorFlags <= errorFlags | 32'h00000020;
+                        end
+                        ckState <= CkIdle;
+                    end else begin
+                        ckBase <= val;
+                        ckCandIdx <= 0;
+                        ckNCands <= 0;
+                        ckState <= CkNeedCount;
+                    end
                     cuckooHits <= cuckooHits + 1;
                 end else begin
                     ckState <= CkNeedT1;
@@ -588,10 +707,25 @@ module mkKernelMain(KernelMainIfc);
                 Bit#(32) key = getLineU32(w, mem1ByteInLine);
                 Bit#(32) val = getLineU32(w, mem1ByteInLine + 4);
                 if (key == mem1Gram && val[31] == 0) begin
-                    ckBase <= val;
-                    ckCandIdx <= 0;
-                    ckNCands <= 0;
-                    ckState <= CkNeedCount;
+                    Bit#(16) base16 = truncate(val);
+                    Bit#(16) n16 = truncate(val >> 16);
+                    Bit#(32) basePacked = zeroExtend(base16);
+                    Bit#(32) nPacked = zeroExtend(n16);
+
+                    if (nPacked != 0) begin
+                        if (hashTable.seedReady) begin
+                            hashTable.putSeed(HashSeed { anchor: ckAnchor, base: basePacked, nCands: nPacked });
+                            hashSeeds <= hashSeeds + 1;
+                        end else begin
+                            errorFlags <= errorFlags | 32'h00000020;
+                        end
+                        ckState <= CkIdle;
+                    end else begin
+                        ckBase <= val;
+                        ckCandIdx <= 0;
+                        ckNCands <= 0;
+                        ckState <= CkNeedCount;
+                    end
                     cuckooHits <= cuckooHits + 1;
                 end else begin
                     ckState <= CkIdle;
@@ -625,25 +759,73 @@ module mkKernelMain(KernelMainIfc);
         mem1Kind <= M1None;
     endrule
 
-    rule emitVerifyReq(started && hashTable.reqValid);
-        let _req <- hashTable.getRequest;
+    rule emitVerifyReq(started && phase == KPktDrain && !parser.payloadNotEmpty && hashTable.reqValid);
+        let req <- hashTable.getRequest;
+        Bit#(32) pktLen = payloadBytesSeen - pktPayloadBase;
+        exactMatch.putRequest(req, pktLen);
         verifyReqs <= verifyReqs + 1;
     endrule
 
-    rule waitDrain(started && phase == KDrain);
-        if (!parser.payloadNotEmpty
-            && !bitmapReqQ.notEmpty
-            && !bitmapLookup.busy
-            && !cuckooReqQ.notEmpty
-            && !hashTable.busy
-            && !mem1Pending
-            && ckState == CkIdle) begin
-            phase <= KWriteReq;
+    rule recvExactMatchResult(started && (phase == KPktDrain || phase == KDrain) && exactMatch.notEmpty);
+        let hit <- exactMatch.getResult;
+        if (hit) begin
+            verifyHits <= verifyHits + 1;
+            pktMatchedCur <= True;
         end
     endrule
 
+    rule waitPktDrain(
+        started && phase == KPktDrain
+        && !parser.payloadNotEmpty
+        && !bitmapReqQ.notEmpty
+        && !bitmapLookup.busy
+        && !cuckooReqQ.notEmpty
+        && !hashTable.busy
+        && !mem1Pending
+        && ckState == CkIdle
+        && !exactMatch.inputPending
+        && !exactMatch.notEmpty
+    );
+        let donePkt = pktIdx - 1;
+        if (donePkt < 32'd65536) begin
+            pktFlagBram.portA.request.put(BRAMRequest {
+                write: True,
+                responseOnWrite: False,
+                address: truncate(donePkt),
+                datain: pktMatchedCur ? 8'd1 : 8'd0
+            });
+        end else begin
+            errorFlags <= errorFlags | 32'h00020000;
+        end
+
+        if (pktMatchedCur) begin
+            matchedPackets <= matchedPackets + 1;
+        end
+        pktMatchedCur <= False;
+        pktPayloadBase <= payloadBytesSeen;
+        phase <= (pktIdx >= hdrPktCount) ? KDrain : KDescReq;
+    endrule
+
+    rule waitDrain(
+        started && phase == KDrain
+        && !parser.payloadNotEmpty
+        && !bitmapReqQ.notEmpty
+        && !bitmapLookup.busy
+        && !cuckooReqQ.notEmpty
+        && !hashTable.busy
+        && !mem1Pending
+        && ckState == CkIdle
+        && !exactMatch.inputPending
+        && !exactMatch.notEmpty
+    );
+        phase <= KWriteReq;
+    endrule
+
     rule issueWriteReq(started && phase == KWriteReq);
-        writeReqQs[1].enq(MemPortReq { addr: 0, bytes: 64 });
+        // word 0: main stats at byte 0
+        // word 1: phase counters at byte 64
+        // flags start at byte 128
+        writeReqQs[1].enq(MemPortReq { addr: 0, bytes: 128 });
         phase <= KWriteData;
     endrule
 
@@ -651,11 +833,12 @@ module mkKernelMain(KernelMainIfc);
         cycleCounter.markDone;
         let cycStart = cycleCounter.getStart;
         let cycDone = cycleCounter.value;
+        let nFlagLines = (hdrPktCount + 32'd63) >> 6;
 
         Bit#(512) out = 0;
-        out[31:0] = hdrPktCount;
-        out[63:32] = cuckooHits;
-        out[95:64] = totalGrams;
+        out[31:0]   = hdrPktCount;
+        out[63:32]  = matchedPackets;
+        out[95:64]  = totalGrams;
         out[127:96] = bitmapHitGrams;
         out[159:128] = cuckooLookups;
         out[191:160] = verifyReqs;
@@ -664,14 +847,105 @@ module mkKernelMain(KernelMainIfc);
         out[287:256] = payloadHash;
         out[319:288] = payloadPktEnds;
         out[351:320] = errorFlags;
-        out[383:352] = hdrVersion;
+        out[383:352] = verifyHits;
         out[415:384] = cycStart;
         out[447:416] = cycDone;
         out[479:448] = cycDone - cycStart;
         out[511:480] = hdrMagic;
-
         writeWordQs[1].enq(out);
-        phase <= KDone;
+
+        Bit#(512) out2 = 0;
+        out2[31:0]   = cycParsing;
+        out2[63:32]  = cycBitmap;
+        out2[95:64]  = cycCuckoo;
+        out2[127:96] = cycExact;
+        out2[159:128] = zeroExtend(pack(phase));
+        out2[191:160] = dbgSamePhaseCycles;
+        summaryWord2 <= out2;
+        flagLineCount <= nFlagLines;
+        phase <= KWriteData2;
+    endrule
+
+    rule issueWriteData2(started && phase == KWriteData2);
+        writeWordQs[1].enq(summaryWord2);
+
+        if (flagLineCount == 0) begin
+            phase <= KDone;
+        end else begin
+            flagLineIdx <= 0;
+            flagReqIdx <= 0;
+            flagRspIdx <= 0;
+            flagLineWord <= 0;
+            phase <= KWriteFlagsReadReq;
+        end
+    endrule
+
+    rule issueFlagReadReq(started && phase == KWriteFlagsReadReq);
+        Bit#(32) absIdx = (flagLineIdx << 6) + zeroExtend(flagReqIdx);
+        if (absIdx < 32'd65536) begin
+            pktFlagBram.portB.request.put(BRAMRequest {
+                write: False,
+                responseOnWrite: False,
+                address: truncate(absIdx),
+                datain: ?
+            });
+        end else begin
+            errorFlags <= errorFlags | 32'h00020000;
+            pktFlagBram.portB.request.put(BRAMRequest {
+                write: False,
+                responseOnWrite: False,
+                address: 0,
+                datain: ?
+            });
+        end
+
+        if (flagReqIdx == 6'd63) begin
+            flagReqIdx <= 0;
+            flagRspIdx <= 0;
+            flagLineWord <= 0;
+            phase <= KWriteFlagsReadRsp;
+        end else begin
+            flagReqIdx <= flagReqIdx + 1;
+        end
+    endrule
+
+    rule collectFlagReadRsp(started && phase == KWriteFlagsReadRsp);
+        let b <- pktFlagBram.portB.response.get();
+        Bit#(32) absIdx = (flagLineIdx << 6) + zeroExtend(flagRspIdx);
+        Bit#(512) nextWord = flagLineWord;
+
+        if (absIdx < hdrPktCount) begin
+            nextWord = putWordU8(flagLineWord, flagRspIdx, b);
+        end
+
+        flagLineWord <= nextWord;
+
+        if (flagRspIdx == 6'd63) begin
+            phase <= KWriteFlagsMemReq;
+        end else begin
+            flagRspIdx <= flagRspIdx + 1;
+        end
+    endrule
+
+    rule issueFlagMemReq(started && phase == KWriteFlagsMemReq);
+        Bit#(64) addr = 128 + (zeroExtend(flagLineIdx) << 6);
+        writeReqQs[1].enq(MemPortReq { addr: addr, bytes: 64 });
+        phase <= KWriteFlagsMemData;
+    endrule
+
+    rule issueFlagMemData(started && phase == KWriteFlagsMemData);
+        writeWordQs[1].enq(flagLineWord);
+        let nextLine = flagLineIdx + 1;
+
+        if (nextLine < flagLineCount) begin
+            flagLineIdx <= nextLine;
+            flagReqIdx <= 0;
+            flagRspIdx <= 0;
+            flagLineWord <= 0;
+            phase <= KWriteFlagsReadReq;
+        end else begin
+            phase <= KDone;
+        end
     endrule
 
     rule finish(started && phase == KDone);

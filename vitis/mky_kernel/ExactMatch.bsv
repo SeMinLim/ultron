@@ -2,6 +2,7 @@ import FIFO::*;
 import FIFOF::*;
 import BRAM::*;
 import HashTable::*;
+import StaticDbMeta::*;
 
 typedef struct {
     VerifyRequest req;
@@ -27,40 +28,40 @@ interface ExactMatchIfc;
 endinterface
 
 module mkExactMatch(ExactMatchIfc);
-    Integer assignCapacity = 4096;
-    Integer patternBytes   = 1048576;
+    Integer assignCapacity = staticGramdbAssignCountInt;
+    Integer patternBytes   = staticExactPatternBytesInt;
     Integer payloadBytes   = 16384;
 
     BRAM_Configure cfgMeta = defaultValue;
     cfgMeta.memorySize = 1;
     cfgMeta.latency    = 2;
-    cfgMeta.loadFormat = tagged Hex "generated/gramdb_meta.hex";
+    cfgMeta.loadFormat = tagged Hex "generated/ruledb_meta.hex";
 
     BRAM_Configure cfgAssign = defaultValue;
     cfgAssign.memorySize = assignCapacity;
     cfgAssign.latency    = 2;
 
     BRAM_Configure cfgPre = cfgAssign;
-    cfgPre.loadFormat = tagged Hex "generated/gramdb_pre.hex";
+    cfgPre.loadFormat = tagged Hex "generated/ruledb_pre.hex";
     BRAM_Configure cfgPost = cfgAssign;
-    cfgPost.loadFormat = tagged Hex "generated/gramdb_post.hex";
+    cfgPost.loadFormat = tagged Hex "generated/ruledb_post.hex";
     BRAM_Configure cfgLen = cfgAssign;
-    cfgLen.loadFormat = tagged Hex "generated/gramdb_len.hex";
+    cfgLen.loadFormat = tagged Hex "generated/ruledb_len.hex";
 
     BRAM_Configure cfgPat = defaultValue;
     cfgPat.memorySize = patternBytes;
     cfgPat.latency    = 2;
-    cfgPat.loadFormat = tagged Hex "generated/gramdb_pat.hex";
+    cfgPat.loadFormat = tagged Hex "generated/ruledb_pat.hex";
 
     BRAM_Configure cfgPayload = defaultValue;
     cfgPayload.memorySize = payloadBytes;
     cfgPayload.latency    = 2;
 
     BRAM1Port#(Bit#(1),  Bit#(32)) nAssignTbl <- mkBRAM1Server(cfgMeta);
-    BRAM1Port#(Bit#(12), Bit#(32)) preTbl     <- mkBRAM1Server(cfgPre);
-    BRAM1Port#(Bit#(12), Bit#(32)) postTbl    <- mkBRAM1Server(cfgPost);
-    BRAM1Port#(Bit#(12), Bit#(32)) lenTbl     <- mkBRAM1Server(cfgLen);
-    BRAM1Port#(Bit#(20), Bit#(8))  patTbl     <- mkBRAM1Server(cfgPat);
+    BRAM1Port#(Bit#(16), Bit#(32)) preTbl     <- mkBRAM1Server(cfgPre);
+    BRAM1Port#(Bit#(16), Bit#(32)) postTbl    <- mkBRAM1Server(cfgPost);
+    BRAM1Port#(Bit#(16), Bit#(32)) lenTbl     <- mkBRAM1Server(cfgLen);
+    BRAM1Port#(Bit#(22), Bit#(8))  patTbl     <- mkBRAM1Server(cfgPat);
     BRAM2Port#(Bit#(14), Bit#(8))  payloadTbl <- mkBRAM2Server(cfgPayload);
 
     FIFOF#(ExactRequest) inQ  <- mkSizedFIFOF(1024);
@@ -72,7 +73,7 @@ module mkExactMatch(ExactMatchIfc);
     Reg#(Bit#(14)) payWrIdx <- mkReg(0);
 
     Reg#(ExactRequest) curReq    <- mkRegU;
-    Reg#(Bit#(12))     curAssign <- mkReg(0);
+    Reg#(Bit#(16))     curAssign <- mkReg(0);
     Reg#(Int#(32))     curStart  <- mkReg(0);
     Reg#(Bit#(32))     curPatLen <- mkReg(0);
     Reg#(Bit#(32))     cmpPos    <- mkReg(0);
@@ -104,7 +105,7 @@ module mkExactMatch(ExactMatchIfc);
         if (idx32 >= nAssigns || idx32 >= maxN) begin
             outQ.enq(False);
         end else begin
-            Bit#(12) idx = truncate(idx32);
+            Bit#(16) idx = truncate(idx32);
 
             preTbl.portA.request.put(BRAMRequest {
                 write           : False,
@@ -160,8 +161,8 @@ module mkExactMatch(ExactMatchIfc);
     endrule
 
     rule doCmpReq (st == EXCmpReq);
-        Bit#(32) patAddr32 = (zeroExtend(curAssign) << 8) + cmpPos;
-        Bit#(20) patAddr   = truncate(patAddr32);
+        Bit#(32) patAddr32 = (zeroExtend(curAssign) << 6) + cmpPos;
+        Bit#(22) patAddr   = truncate(patAddr32);
 
         Int#(32) payPosI   = curStart + unpack(cmpPos);
         Bit#(14) payAddr   = truncate(pack(payPosI));

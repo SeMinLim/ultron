@@ -5,8 +5,8 @@ use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 
 const N_GRAM: usize = 3;
-const MAX_RULES: usize = 4096;
-const MAX_PATTERN_LEN: usize = 256;
+const MAX_RULES: usize = 64000;
+const MAX_PATTERN_LEN: usize = 64;
 
 const BITMAP_BITS: usize = 1 << 24;
 const BITMAP_BYTES: usize = BITMAP_BITS >> 3;
@@ -16,9 +16,8 @@ const HT_MAX_LOOP: usize = 4096;
 const HT_EMPTY_KEY: i32 = i32::MIN;
 const HT_BRAM_CAPACITY: usize = MAX_RULES * 2;
 const ASSIGN_BRAM_CAPACITY: usize = MAX_RULES;
-const PATTERN_BRAM_BYTES: usize = ASSIGN_BRAM_CAPACITY * MAX_PATTERN_LEN;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Rule {
     id: i32,
     pattern: Vec<u8>,
@@ -30,16 +29,12 @@ struct GramAssign {
     rule_id: i32,
     pre_offset: i32,
     post_offset: i32,
-    #[allow(dead_code)]
-    degree: i32,
 }
 
 #[derive(Debug)]
 struct SingletonResult {
     assigns: Vec<GramAssign>,
     uncovered: usize,
-    n_deg1: usize,   // rules covered by a gram unique to that rule (orig degree=1)
-    n_shared: usize, // rules covered by a gram shared across rules (orig degree>1)
 }
 
 #[derive(Debug, Default)]
@@ -145,6 +140,23 @@ fn load_rules(path: &Path) -> io::Result<Vec<Rule>> {
     }
 
     Ok(rules)
+}
+
+fn dedup_rules(rules: &[Rule]) -> (Vec<Rule>, usize) {
+    let mut seen: HashMap<Vec<u8>, i32> = HashMap::new();
+    let mut deduped = Vec::with_capacity(rules.len());
+    let mut dup_count = 0usize;
+
+    for rule in rules {
+        if seen.contains_key(&rule.pattern) {
+            dup_count += 1;
+        } else {
+            seen.insert(rule.pattern.clone(), rule.id);
+            deduped.push(rule.clone());
+        }
+    }
+
+    (deduped, dup_count)
 }
 
 fn pack3(p: &[u8]) -> u32 {
@@ -290,28 +302,17 @@ fn singleton_build(rules: &[Rule]) -> SingletonResult {
             }
         }
 
-        let degree = gram_map
-            .get(&gi)
-            .map(|n| n.rule_ids.len() as i32)
-            .unwrap_or(1);
-
         assigns.push(GramAssign {
             gram_idx: gi,
             rule_id: rule.id,
             pre_offset: -(gram_pos as i32),
             post_offset: (rule.pattern.len() - gram_pos - N_GRAM) as i32,
-            degree,
         });
     }
-
-    let n_deg1   = assigns.iter().filter(|a| a.degree == 1).count();
-    let n_shared = assigns.iter().filter(|a| a.degree >  1).count();
 
     SingletonResult {
         assigns,
         uncovered: nr - n_covered,
-        n_deg1,
-        n_shared,
     }
 }
 
@@ -466,6 +467,7 @@ fn ht_insert(
 fn build_hash_tables(
     assigns: &[GramDbAssign],
 ) -> Result<(Vec<HEntry>, Vec<HEntry>, usize, usize), String> {
+    let ranges = collect_gram_ranges(assigns);
     let cap = assigns.len().max(1) * 2;
     let mut t0 = vec![
         HEntry {
@@ -482,32 +484,24 @@ fn build_hash_tables(
         cap
     ];
 
-    let mut unique_grams = 0usize;
-    let mut prev: Option<u32> = None;
-    for (i, a) in assigns.iter().enumerate() {
-        if prev != Some(a.gram_idx) {
-            ht_insert(&mut t0, &mut t1, cap, a.gram_idx, i as i32)?;
-            unique_grams += 1;
-            prev = Some(a.gram_idx);
+    for (gram, base, n_cands) in &ranges {
+        let packed = pack_base_n(*base, *n_cands)?;
+        ht_insert(&mut t0, &mut t1, cap, *gram, packed)?;
+    }
+
+    for (gram, base, n_cands) in &ranges {
+        let expected = pack_base_n(*base, *n_cands)?;
+        let got = ht_lookup(&t0, &t1, cap, *gram)
+            .ok_or_else(|| format!("lookup miss for gram_idx {}", gram))?;
+        if got != expected {
+            return Err(format!(
+                "lookup mismatch for gram_idx {}: expected packed {} got {}",
+                gram, expected, got
+            ));
         }
     }
 
-    prev = None;
-    for (i, a) in assigns.iter().enumerate() {
-        if prev != Some(a.gram_idx) {
-            let got = ht_lookup(&t0, &t1, cap, a.gram_idx)
-                .ok_or_else(|| format!("lookup miss for gram_idx {}", a.gram_idx))?;
-            if got != i as i32 {
-                return Err(format!(
-                    "lookup mismatch for gram_idx {}: expected base {} got {}",
-                    a.gram_idx, i, got
-                ));
-            }
-            prev = Some(a.gram_idx);
-        }
-    }
-
-    Ok((t0, t1, cap, unique_grams))
+    Ok((t0, t1, cap, ranges.len()))
 }
 
 fn collect_gram_ranges(assigns: &[GramDbAssign]) -> Vec<(u32, u32, u32)> {
@@ -686,10 +680,13 @@ fn write_exact_bram_hex(assigns: &[GramDbAssign], out_dir: &Path) -> Result<(), 
         ));
     }
 
-    let mut pre = vec![0i32; ASSIGN_BRAM_CAPACITY];
-    let mut post = vec![0i32; ASSIGN_BRAM_CAPACITY];
-    let mut lens = vec![0u32; ASSIGN_BRAM_CAPACITY];
-    let mut pats = vec![0u8; PATTERN_BRAM_BYTES];
+    let exact_assign_capacity = assigns.len().max(1);
+    let pattern_bytes = exact_assign_capacity * MAX_PATTERN_LEN;
+
+    let mut pre = vec![0i32; exact_assign_capacity];
+    let mut post = vec![0i32; exact_assign_capacity];
+    let mut lens = vec![0u32; exact_assign_capacity];
+    let mut pats = vec![0u8; pattern_bytes];
 
     for (i, a) in assigns.iter().enumerate() {
         pre[i] = a.pre_offset;
@@ -700,11 +697,11 @@ fn write_exact_bram_hex(assigns: &[GramDbAssign], out_dir: &Path) -> Result<(), 
         pats[pbase..(pbase + MAX_PATTERN_LEN)].copy_from_slice(&a.pattern);
     }
 
-    let meta_path = out_dir.join("gramdb_meta.hex");
-    let pre_path = out_dir.join("gramdb_pre.hex");
-    let post_path = out_dir.join("gramdb_post.hex");
-    let len_path = out_dir.join("gramdb_len.hex");
-    let pat_path = out_dir.join("gramdb_pat.hex");
+    let meta_path = out_dir.join("ruledb_meta.hex");
+    let pre_path = out_dir.join("ruledb_pre.hex");
+    let post_path = out_dir.join("ruledb_post.hex");
+    let len_path = out_dir.join("ruledb_len.hex");
+    let pat_path = out_dir.join("ruledb_pat.hex");
 
     write_hex_u32_words(&meta_path, &[assigns.len() as u32])?;
     write_hex_i32_lines(&pre_path, &pre)?;
@@ -773,11 +770,22 @@ fn write_gramdb(
     Ok(())
 }
 
-fn build_outputs(rule_file: &Path, bitmap_file: &Path, gramdb_file: &Path) -> Result<(), String> {
-    let rules = load_rules(rule_file).map_err(|e| format!("failed to load rules: {e}"))?;
-    if rules.is_empty() {
+fn build_outputs(
+    rule_file: &Path,
+    bitmap_file: &Path,
+    gramdb_file: &Path,
+    dedup: bool,
+) -> Result<(), String> {
+    let loaded_rules = load_rules(rule_file).map_err(|e| format!("failed to load rules: {e}"))?;
+    if loaded_rules.is_empty() {
         return Err(format!("no rules loaded from {}", rule_file.display()));
     }
+
+    let (rules, dup_count) = if dedup {
+        dedup_rules(&loaded_rules)
+    } else {
+        (loaded_rules, 0)
+    };
 
     let singleton = singleton_build(&rules);
 
@@ -796,6 +804,21 @@ fn build_outputs(rule_file: &Path, bitmap_file: &Path, gramdb_file: &Path) -> Re
     }
 
     let gramdb_assigns = build_gramdb_assigns(&rules, &singleton)?;
+    let gram_ranges = collect_gram_ranges(&gramdb_assigns);
+    let singleton_rules = gram_ranges
+        .iter()
+        .filter(|(_, _, n_cands)| *n_cands == 1)
+        .count();
+    let shared_grams = gram_ranges
+        .iter()
+        .filter(|(_, _, n_cands)| *n_cands > 1)
+        .count();
+    let shared_rules = gram_ranges
+        .iter()
+        .filter(|(_, _, n_cands)| *n_cands > 1)
+        .map(|(_, _, n_cands)| *n_cands as usize)
+        .sum::<usize>();
+
     let (table0, table1, _ht_capacity, _unique_grams) = build_hash_tables(&gramdb_assigns)?;
 
     let (bram_t0, bram_t1, bram_ht_cap, bram_unique_grams) =
@@ -811,11 +834,11 @@ fn build_outputs(rule_file: &Path, bitmap_file: &Path, gramdb_file: &Path) -> Re
     let t0_val_hex_path = out_dir.join("gramht_t0_val.hex");
     let t1_key_hex_path = out_dir.join("gramht_t1_key.hex");
     let t1_val_hex_path = out_dir.join("gramht_t1_val.hex");
-    let gramdb_meta_path = out_dir.join("gramdb_meta.hex");
-    let gramdb_pre_path = out_dir.join("gramdb_pre.hex");
-    let gramdb_post_path = out_dir.join("gramdb_post.hex");
-    let gramdb_len_path = out_dir.join("gramdb_len.hex");
-    let gramdb_pat_path = out_dir.join("gramdb_pat.hex");
+    let ruledb_meta_path = out_dir.join("ruledb_meta.hex");
+    let ruledb_pre_path = out_dir.join("ruledb_pre.hex");
+    let ruledb_post_path = out_dir.join("ruledb_post.hex");
+    let ruledb_len_path = out_dir.join("ruledb_len.hex");
+    let ruledb_pat_path = out_dir.join("ruledb_pat.hex");
 
     write_bitmap(bitmap_file, &bitmap)?;
     write_gramdb(gramdb_file, &gramdb_assigns, &table0, &table1)?;
@@ -836,17 +859,32 @@ fn build_outputs(rule_file: &Path, bitmap_file: &Path, gramdb_file: &Path) -> Re
     let bits_set: u32 = bitmap.iter().map(|b| b.count_ones()).sum();
 
     println!("file           : {}", rule_file.display());
+    println!("dedup          : {}", if dedup { "on" } else { "off" });
+    if dedup {
+        println!("dedup removed  : {}", dup_count);
+    }
     println!("rules          : {}", rules.len());
     println!();
     println!("=== singleton build ===");
     println!("covered        : {}", singleton.assigns.len());
-    println!("uncovered      : {}  (pat_len < {})", singleton.uncovered, N_GRAM);
-    println!("singletons     : {}  (degree=1, unique gram)", singleton.n_deg1);
-    println!("shared         : {}  (degree>1, gram in multiple rules)", singleton.n_shared);
+    println!(
+        "uncovered      : {}  (pat_len < {})",
+        singleton.uncovered, N_GRAM
+    );
+    println!("singleton rules: {}  (n_cands == 1)", singleton_rules);
+    println!("shared rules   : {}  (n_cands > 1)", shared_rules);
+    println!(
+        "shared grams   : {}  (hash entries with n_cands > 1)",
+        shared_grams
+    );
     println!();
     println!("=== bitmap ===");
     println!("grams in bitmap: {}", bits_set);
-    println!("bitmap bytes   : {}  ({} MB)", BITMAP_BYTES, BITMAP_BYTES >> 20);
+    println!(
+        "bitmap bytes   : {}  ({} MB)",
+        BITMAP_BYTES,
+        BITMAP_BYTES >> 20
+    );
     println!("bitmap verify  : OK");
     println!();
     println!("=== gram hash table (BRAM) ===");
@@ -862,11 +900,11 @@ fn build_outputs(rule_file: &Path, bitmap_file: &Path, gramdb_file: &Path) -> Re
     println!("gramht t0 val  : {}", t0_val_hex_path.display());
     println!("gramht t1 key  : {}", t1_key_hex_path.display());
     println!("gramht t1 val  : {}", t1_val_hex_path.display());
-    println!("gramdb meta    : {}", gramdb_meta_path.display());
-    println!("gramdb pre     : {}", gramdb_pre_path.display());
-    println!("gramdb post    : {}", gramdb_post_path.display());
-    println!("gramdb len     : {}", gramdb_len_path.display());
-    println!("gramdb pat     : {}", gramdb_pat_path.display());
+    println!("ruledb meta    : {}", ruledb_meta_path.display());
+    println!("ruledb pre     : {}", ruledb_pre_path.display());
+    println!("ruledb post    : {}", ruledb_post_path.display());
+    println!("ruledb len     : {}", ruledb_len_path.display());
+    println!("ruledb pat     : {}", ruledb_pat_path.display());
 
     Ok(())
 }
@@ -874,8 +912,16 @@ fn build_outputs(rule_file: &Path, bitmap_file: &Path, gramdb_file: &Path) -> Re
 fn main() {
     let args: Vec<String> = env::args().collect();
 
-    // Usage: bitmap_gen [rule.txt [bitmap.bin [gramdb.bin]]]
-    let positional: Vec<&str> = args.iter().skip(1).map(String::as_str).collect();
+    // Usage: bitmap_gen [rule.txt [bitmap.bin [gramdb.bin]]] [--dedup]
+    let mut positional: Vec<&str> = Vec::new();
+    let mut dedup = false;
+    for arg in args.iter().skip(1) {
+        if arg == "--dedup" {
+            dedup = true;
+        } else {
+            positional.push(arg.as_str());
+        }
+    }
 
     let rule_file = positional.first().copied().unwrap_or("rule.txt");
     let bitmap_file = positional.get(1).copied().unwrap_or("bitmap.bin");
@@ -885,6 +931,7 @@ fn main() {
         Path::new(rule_file),
         Path::new(bitmap_file),
         Path::new(gramdb_file),
+        dedup,
     ) {
         eprintln!("{e}");
         std::process::exit(1);

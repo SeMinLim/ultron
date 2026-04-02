@@ -4,7 +4,6 @@ import FIFO::*;
 import FIFOF::*;
 
 interface Axi4MemoryMasterPinsIfc#(numeric type addrSz, numeric type dataSz);
-	// write address to axi
 	(* always_ready, result="awvalid" *)
 	method Bool awvalid;
 	(* always_ready, always_enabled, prefix = "" *)
@@ -15,7 +14,6 @@ interface Axi4MemoryMasterPinsIfc#(numeric type addrSz, numeric type dataSz);
 	method Bit#(8) awlen;
 
 
-	// write data to axi
 	(* always_ready, result="wvalid" *)
 	method Bool wvalid;
 	(* always_ready, always_enabled, prefix = "" *)
@@ -28,13 +26,11 @@ interface Axi4MemoryMasterPinsIfc#(numeric type addrSz, numeric type dataSz);
 	method Bool wlast;
 
 
-	// write response from axi
 	(* always_ready, always_enabled, prefix = "" *)
 	method Action write_resp_valid ((* port="bvalid" *)  Bool bvalid);
 	(* always_ready, result="bready" *)
 	method Bool bready;
 	
-	// write read addr to axi
 	(* always_ready, result="arvalid" *)
 	method Bool arvalid;
 	(* always_ready, always_enabled, prefix = "" *)
@@ -45,7 +41,6 @@ interface Axi4MemoryMasterPinsIfc#(numeric type addrSz, numeric type dataSz);
 	method Bit#(8) arlen;
 
 
-	// read response from axi
 	(* always_ready, always_enabled, prefix = "" *)
 	method Action read_data_valid ((* port="rvalid" *)  Bool rvalid);
 	(* always_ready, result="rready" *)
@@ -61,25 +56,10 @@ interface Axi4MemoryMasterIfc#(numeric type addrSz, numeric type dataSz);
 	interface Axi4MemoryMasterPinsIfc#(addrSz,dataSz) pins;
   
 	method Action readReq(Bit#(addrSz) addr, Bit#(addrSz) size);
-	// ignoring tlast for simplicity
 	method ActionValue#(Bit#(dataSz)) read;
 
 	method Action writeReq(Bit#(addrSz) addr, Bit#(addrSz) size);
 	method Action write(Bit#(dataSz) data);
-  /*
-  // read user interface
-  output wire                          m_axis_tvalid,
-  input  wire                          m_axis_tready,
-  output wire [C_M_AXI_DATA_WIDTH-1:0] m_axis_tdata,
-  output wire                          m_axis_tlast
-  */
-
-  /* 
-  // write user interface
-  input  wire                            s_axis_tvalid,
-  output wire                            s_axis_tready,
-  input  wire  [C_M_AXI_DATA_WIDTH-1:0]  s_axis_tdata
-  */
 endinterface
 
 (* synthesize *)
@@ -99,10 +79,9 @@ module mkAxi4MemoryMaster (Axi4MemoryMasterIfc#(addrSz,dataSz))
 	FIFOF#(Bit#(dataSz)) writeWordQ <- mkFIFOF;
 
 
-	// max burst length = 64 for 512 bit words
 	Integer maxBurstWords = min(256, (4096/(valueOf(dataSz)/8)));
 	Integer maxBurstBytes = maxBurstWords*(valueOf(dataSz)/8);
-	Integer wordByteSzBits = valueOf(TLog#(dataSz))-3; // -3 for bytes
+	Integer wordByteSzBits = valueOf(TLog#(dataSz))-3;
 
 	Reg#(Bit#(addrSz)) writeBurstCurAddr <- mkReg(0);
 	Reg#(Bit#(addrSz)) writeBurstBytesLeft <- mkReg(0);
@@ -114,9 +93,9 @@ module mkAxi4MemoryMaster (Axi4MemoryMasterIfc#(addrSz,dataSz))
 			if ( writeBurstBytesLeft > fromInteger(maxBurstBytes) ) begin
 				writeBurstBytesLeft <= writeBurstBytesLeft - fromInteger(maxBurstBytes);
 
-				writeBurstSubQ.enq(tuple2(writeBurstCurAddr, fromInteger(maxBurstWords-1))); // because 0 is one beat
+				writeBurstSubQ.enq(tuple2(writeBurstCurAddr, fromInteger(maxBurstWords-1)));
 			end else begin
-				writeBurstSubQ.enq(tuple2(writeBurstCurAddr, truncate((writeBurstBytesLeft>>wordByteSzBits)-1))); // because 0 is one beat
+				writeBurstSubQ.enq(tuple2(writeBurstCurAddr, truncate((writeBurstBytesLeft>>wordByteSzBits)-1)));
 				writeBurstBytesLeft <= 0;
 			end
 		end else begin
@@ -125,11 +104,11 @@ module mkAxi4MemoryMaster (Axi4MemoryMasterIfc#(addrSz,dataSz))
 			let raddr = tpl_1(r);
 			let rsz = tpl_2(r);
 			if ( rsz > fromInteger(maxBurstBytes) ) begin
-				writeBurstSubQ.enq(tuple2(raddr,fromInteger(maxBurstWords-1))); // because 0 is one beat
+				writeBurstSubQ.enq(tuple2(raddr,fromInteger(maxBurstWords-1)));
 				writeBurstBytesLeft <= rsz - fromInteger(maxBurstBytes); 
 				writeBurstCurAddr <= raddr + fromInteger(maxBurstBytes); 
 			end else begin
-				writeBurstSubQ.enq(tuple2(raddr,truncate((rsz>>wordByteSzBits)-1))); // because 0 is one beat
+				writeBurstSubQ.enq(tuple2(raddr,truncate((rsz>>wordByteSzBits)-1)));
 			end
 		end
 	endrule
@@ -175,9 +154,9 @@ module mkAxi4MemoryMaster (Axi4MemoryMasterIfc#(addrSz,dataSz))
 			if ( readBurstBytesLeft > fromInteger(maxBurstBytes) ) begin
 				readBurstBytesLeft <= readBurstBytesLeft - fromInteger(maxBurstBytes);
 
-				readBurstSubQ.enq(tuple2(readBurstCurAddr, fromInteger(maxBurstWords-1))); // because 0 is one beat
+				readBurstSubQ.enq(tuple2(readBurstCurAddr, fromInteger(maxBurstWords-1)));
 			end else begin
-				readBurstSubQ.enq(tuple2(readBurstCurAddr, truncate((readBurstBytesLeft>>wordByteSzBits)-1))); // because 0 is one beat
+				readBurstSubQ.enq(tuple2(readBurstCurAddr, truncate((readBurstBytesLeft>>wordByteSzBits)-1)));
 				readBurstBytesLeft <= 0;
 			end
 		end else begin
@@ -186,11 +165,11 @@ module mkAxi4MemoryMaster (Axi4MemoryMasterIfc#(addrSz,dataSz))
 			let raddr = tpl_1(r);
 			let rsz = tpl_2(r);
 			if ( rsz > fromInteger(maxBurstBytes) ) begin
-				readBurstSubQ.enq(tuple2(raddr,fromInteger(maxBurstWords-1))); // because 0 is one beat
+				readBurstSubQ.enq(tuple2(raddr,fromInteger(maxBurstWords-1)));
 				readBurstBytesLeft <= rsz - fromInteger(maxBurstBytes); 
 				readBurstCurAddr <= raddr + fromInteger(maxBurstBytes); 
 			end else begin
-				readBurstSubQ.enq(tuple2(raddr,truncate((rsz>>wordByteSzBits)-1))); // because 0 is one beat
+				readBurstSubQ.enq(tuple2(raddr,truncate((rsz>>wordByteSzBits)-1)));
 			end
 		end
 	endrule
@@ -213,7 +192,6 @@ module mkAxi4MemoryMaster (Axi4MemoryMasterIfc#(addrSz,dataSz))
 			readDataReadyW.send;
 
 			if ( readDataValidW ) begin
-			//if ( isValid(readDataWordW.wget) ) begin
 				readWordQ.enq(fromMaybe(?,readDataWordW.wget));
 			end
 		end
@@ -260,7 +238,6 @@ module mkAxi4MemoryMaster (Axi4MemoryMasterIfc#(addrSz,dataSz))
 			return True;
 		endmethod
 	
-		// write read addr to axi
 		method Bool arvalid;
 			return isValid(readAddressW.wget);
 		endmethod
@@ -277,7 +254,6 @@ module mkAxi4MemoryMaster (Axi4MemoryMasterIfc#(addrSz,dataSz))
 		endmethod
 
 
-		// read response from axi
 		method Action read_data_valid ( Bool rvalid);
 			if ( rvalid ) readDataValidW.send;
 		endmethod

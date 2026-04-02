@@ -1,6 +1,7 @@
 import FIFO::*;
 import FIFOF::*;
 import BRAM::*;
+import StaticDbMeta::*;
 
 typedef struct {
     Bit#(32) byteIdx;
@@ -38,7 +39,7 @@ endfunction
 
 module mkBitmapLookup(BitmapLookupIfc);
     BRAM_Configure cfg = defaultValue;
-    cfg.memorySize = 32768;
+    cfg.memorySize = staticBitmapLinesInt;
     cfg.loadFormat = tagged Hex "generated/bitmap_512.hex";
     BRAM2Port#(Bit#(15), Bit#(512)) bram <- mkBRAM2Server(cfg);
 
