@@ -10,8 +10,6 @@ typedef struct {
 } ExactRequest deriving (Bits, Eq, FShow);
 
 typedef enum {
-    EXInitReq,
-    EXInitRsp,
     EXReady,
     EXMetaRsp,
     EXCmpReq,
@@ -31,11 +29,6 @@ module mkExactMatch(ExactMatchIfc);
     Integer assignCapacity = staticGramdbAssignCountInt;
     Integer patternBytes   = staticExactPatternBytesInt;
     Integer payloadBytes   = 16384;
-
-    BRAM_Configure cfgMeta = defaultValue;
-    cfgMeta.memorySize = 1;
-    cfgMeta.latency    = 2;
-    cfgMeta.loadFormat = tagged Hex "generated/ruledb_meta.hex";
 
     BRAM_Configure cfgAssign = defaultValue;
     cfgAssign.memorySize = assignCapacity;
@@ -57,7 +50,6 @@ module mkExactMatch(ExactMatchIfc);
     cfgPayload.memorySize = payloadBytes;
     cfgPayload.latency    = 2;
 
-    BRAM1Port#(Bit#(1),  Bit#(32)) nAssignTbl <- mkBRAM1Server(cfgMeta);
     BRAM1Port#(Bit#(16), Bit#(32)) preTbl     <- mkBRAM1Server(cfgPre);
     BRAM1Port#(Bit#(16), Bit#(32)) postTbl    <- mkBRAM1Server(cfgPost);
     BRAM1Port#(Bit#(16), Bit#(32)) lenTbl     <- mkBRAM1Server(cfgLen);
@@ -67,9 +59,9 @@ module mkExactMatch(ExactMatchIfc);
     FIFOF#(ExactRequest) inQ  <- mkSizedFIFOF(1024);
     FIFOF#(Bool)         outQ <- mkSizedFIFOF(1024);
 
-    Reg#(EXState) st <- mkReg(EXInitReq);
+    Reg#(EXState) st <- mkReg(EXReady);
 
-    Reg#(Bit#(32)) nAssigns <- mkReg(0);
+    Bit#(32) nAssigns = fromInteger(assignCapacity);
     Reg#(Bit#(14)) payWrIdx <- mkReg(0);
 
     Reg#(ExactRequest) curReq    <- mkRegU;
@@ -77,23 +69,6 @@ module mkExactMatch(ExactMatchIfc);
     Reg#(Int#(32))     curStart  <- mkReg(0);
     Reg#(Bit#(32))     curPatLen <- mkReg(0);
     Reg#(Bit#(32))     cmpPos    <- mkReg(0);
-
-    rule doInitReq (st == EXInitReq);
-        nAssignTbl.portA.request.put(BRAMRequest {
-            write           : False,
-            responseOnWrite : False,
-            address         : 0,
-            datain          : ?
-        });
-        st <= EXInitRsp;
-    endrule
-
-    rule doInitRsp (st == EXInitRsp);
-        let n <- nAssignTbl.portA.response.get;
-        let maxN = fromInteger(assignCapacity);
-        nAssigns <= (n > maxN) ? maxN : n;
-        st <= EXReady;
-    endrule
 
     rule doMetaReq (st == EXReady && inQ.notEmpty);
         let r = inQ.first;
@@ -200,8 +175,7 @@ module mkExactMatch(ExactMatchIfc);
         end
     endrule
 
-    method Action putPayloadByte(Bit#(8) b, Bool last)
-            if (st != EXInitReq && st != EXInitRsp);
+    method Action putPayloadByte(Bit#(8) b, Bool last);
         payloadTbl.portA.request.put(BRAMRequest {
             write           : True,
             responseOnWrite : False,
@@ -217,7 +191,7 @@ module mkExactMatch(ExactMatchIfc);
     endmethod
 
     method Action putRequest(VerifyRequest r, Bit#(32) payload_len)
-            if (st != EXInitReq && st != EXInitRsp && inQ.notFull);
+            if (inQ.notFull);
         inQ.enq(ExactRequest { req: r, payload_len: payload_len });
     endmethod
 

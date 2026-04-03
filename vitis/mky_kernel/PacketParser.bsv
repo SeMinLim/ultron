@@ -6,6 +6,7 @@ typedef enum {
     Eth,
     Ipv4,
     Ipv6,
+    Ipv6Ext,
     Tcp,
     Udp,
     Icmp,
@@ -29,6 +30,18 @@ module mkPacketParser(PacketParserIfc);
     Reg#(Bit#(8)) hdrEnd <- mkReg(0);
     Reg#(Bit#(8)) proto <- mkReg(0);
     Reg#(Bit#(8)) ethHi <- mkReg(0);
+    Reg#(Bit#(8)) extNext <- mkReg(0);
+
+    function Bool isIpv6ExtHdr(Bit#(8) p);
+        case (p)
+            8'd0: return True;  // Hop-by-Hop Options
+            8'd43: return True; // Routing
+            8'd44: return True; // Fragment
+            8'd60: return True; // Destination Options
+            8'd51: return True; // Authentication Header
+            default: return False;
+        endcase
+    endfunction
 
     function ParseState nextL4(Bit#(8) p);
         case (p)
@@ -36,7 +49,7 @@ module mkPacketParser(PacketParserIfc);
             8'd17: return Udp;
             8'd1: return Icmp;
             8'd58: return Icmp;
-            default: return Payload;
+            default: return Drop;
         endcase
     endfunction
 
@@ -85,10 +98,64 @@ module mkPacketParser(PacketParserIfc);
                 Ipv6: begin
                     if (cnt == 6) proto <= b;
                     if (cnt == 39) begin
-                        state <= nextL4(proto);
+                        if (isIpv6ExtHdr(proto)) begin
+                            state <= Ipv6Ext;
+                        end else begin
+                            state <= nextL4(proto);
+                        end
                         cnt <= 0;
                     end else begin
                         cnt <= cnt + 1;
+                    end
+                end
+
+                Ipv6Ext: begin
+                    if (cnt == 0) begin
+                        extNext <= b;
+                        cnt <= 1;
+                    end else if (cnt == 1) begin
+                        Bool ok = True;
+                        Bit#(8) endPos = 0;
+
+                        if (proto == 8'd44) begin
+                            endPos = 8'd7;
+                        end else if (proto == 8'd0 || proto == 8'd43 || proto == 8'd60) begin
+                            Bit#(9) total = (zeroExtend(b) + 1) << 3;
+                            if (total < 9'd8 || total > 9'd255) begin
+                                ok = False;
+                            end else begin
+                                endPos = truncate(total - 1);
+                            end
+                        end else if (proto == 8'd51) begin
+                            Bit#(10) total = (zeroExtend(b) + 2) << 2;
+                            if (total < 10'd8 || total > 10'd255) begin
+                                ok = False;
+                            end else begin
+                                endPos = truncate(total - 1);
+                            end
+                        end else begin
+                            ok = False;
+                        end
+
+                        if (ok) begin
+                            hdrEnd <= endPos;
+                            cnt <= 2;
+                        end else begin
+                            state <= Drop;
+                            cnt <= 0;
+                        end
+                    end else begin
+                        if (cnt == hdrEnd) begin
+                            proto <= extNext;
+                            if (isIpv6ExtHdr(extNext)) begin
+                                state <= Ipv6Ext;
+                            end else begin
+                                state <= nextL4(extNext);
+                            end
+                            cnt <= 0;
+                        end else begin
+                            cnt <= cnt + 1;
+                        end
                     end
                 end
 

@@ -182,6 +182,10 @@ module mkKernelMain(KernelMainIfc);
     Reg#(Bit#(32)) verifyHits <- mkReg(0);
     Reg#(Bit#(32)) matchedPackets <- mkReg(0);
     Reg#(Bool) pktMatchedCur <- mkReg(False);
+    Reg#(Bool) pktBitmapHitCur <- mkReg(False);
+    Reg#(Bool) pktVerifyReqCur <- mkReg(False);
+    Reg#(Bit#(32)) bitmapHitPackets <- mkReg(0);
+    Reg#(Bit#(32)) verifyReqPackets <- mkReg(0);
     Reg#(Bit#(32)) pktPayloadBase <- mkReg(0);
 
     Reg#(Bit#(32)) flagLineCount <- mkReg(0);
@@ -299,6 +303,10 @@ module mkKernelMain(KernelMainIfc);
         verifyHits <= 0;
         matchedPackets <= 0;
         pktMatchedCur <= False;
+        pktBitmapHitCur <= False;
+        pktVerifyReqCur <= False;
+        bitmapHitPackets <= 0;
+        verifyReqPackets <= 0;
         pktPayloadBase <= 0;
 
         flagLineCount <= 0;
@@ -381,10 +389,10 @@ module mkKernelMain(KernelMainIfc);
         if (staticGramdbHtCapacity == 0) begin
             hdrErr = hdrErr | 32'h00000004;
         end
-        if (bitmapBytesHost != staticBitmapBytes) begin
+        if (bitmapBytesHost != 0 && bitmapBytesHost != staticBitmapBytes) begin
             hdrErr = hdrErr | 32'h00004000;
         end
-        if (gramdbBytesHost != staticGramdbBytes) begin
+        if (gramdbBytesHost != 0 && gramdbBytesHost != staticGramdbBytes) begin
             hdrErr = hdrErr | 32'h00008000;
         end
         if (pktCount > 32'd65536) begin
@@ -434,6 +442,8 @@ module mkKernelMain(KernelMainIfc);
         curRawLen <= rawLen;
 
         if (rawLen == 0) begin
+            pktBitmapHitCur <= False;
+            pktVerifyReqCur <= False;
             if (pktIdx < 32'd65536) begin
                 pktFlagBram.portA.request.put(BRAMRequest {
                     write: True,
@@ -452,6 +462,8 @@ module mkKernelMain(KernelMainIfc);
             feedByteIdx <= zeroExtend(absAddr[5:0]);
             pktBytesRemaining <= rawLen;
             pktMatchedCur <= False;
+            pktBitmapHitCur <= False;
+            pktVerifyReqCur <= False;
             phase <= KPktReq;
         end
     endrule
@@ -653,6 +665,7 @@ module mkKernelMain(KernelMainIfc);
         let r <- bitmapLookup.getRsp;
         if (r.hit) begin
             bitmapHitGrams <= bitmapHitGrams + 1;
+            pktBitmapHitCur <= True;
             if (gramdbHtCapacity != 0) begin
                 if (cuckooReqQ.notFull) begin
                     cuckooReqQ.enq(GramHit { gram: r.gram, anchor: r.anchor });
@@ -677,7 +690,7 @@ module mkKernelMain(KernelMainIfc);
             M1CkT0: begin
                 Bit#(32) key = getLineU32(w, mem1ByteInLine);
                 Bit#(32) val = getLineU32(w, mem1ByteInLine + 4);
-                if (key == mem1Gram && val[31] == 0) begin
+                if (key == mem1Gram) begin
                     Bit#(16) base16 = truncate(val);
                     Bit#(16) n16 = truncate(val >> 16);
                     Bit#(32) basePacked = zeroExtend(base16);
@@ -706,7 +719,7 @@ module mkKernelMain(KernelMainIfc);
             M1CkT1: begin
                 Bit#(32) key = getLineU32(w, mem1ByteInLine);
                 Bit#(32) val = getLineU32(w, mem1ByteInLine + 4);
-                if (key == mem1Gram && val[31] == 0) begin
+                if (key == mem1Gram) begin
                     Bit#(16) base16 = truncate(val);
                     Bit#(16) n16 = truncate(val >> 16);
                     Bit#(32) basePacked = zeroExtend(base16);
@@ -764,6 +777,7 @@ module mkKernelMain(KernelMainIfc);
         Bit#(32) pktLen = payloadBytesSeen - pktPayloadBase;
         exactMatch.putRequest(req, pktLen);
         verifyReqs <= verifyReqs + 1;
+        pktVerifyReqCur <= True;
     endrule
 
     rule recvExactMatchResult(started && (phase == KPktDrain || phase == KDrain) && exactMatch.notEmpty);
@@ -801,7 +815,15 @@ module mkKernelMain(KernelMainIfc);
         if (pktMatchedCur) begin
             matchedPackets <= matchedPackets + 1;
         end
+        if (pktBitmapHitCur) begin
+            bitmapHitPackets <= bitmapHitPackets + 1;
+        end
+        if (pktVerifyReqCur) begin
+            verifyReqPackets <= verifyReqPackets + 1;
+        end
         pktMatchedCur <= False;
+        pktBitmapHitCur <= False;
+        pktVerifyReqCur <= False;
         pktPayloadBase <= payloadBytesSeen;
         phase <= (pktIdx >= hdrPktCount) ? KDrain : KDescReq;
     endrule
@@ -861,6 +883,8 @@ module mkKernelMain(KernelMainIfc);
         out2[127:96] = cycExact;
         out2[159:128] = zeroExtend(pack(phase));
         out2[191:160] = dbgSamePhaseCycles;
+        out2[223:192] = bitmapHitPackets;
+        out2[255:224] = verifyReqPackets;
         summaryWord2 <= out2;
         flagLineCount <= nFlagLines;
         phase <= KWriteData2;
