@@ -16,6 +16,15 @@ const HT_MAX_LOOP: usize = 4096;
 const HT_EMPTY_KEY: i32 = i32::MIN;
 const HT_BRAM_CAPACITY: usize = MAX_RULES * 2;
 const ASSIGN_BRAM_CAPACITY: usize = MAX_RULES;
+const GRAMDB_HEADER_BYTES: usize = 8;
+const GRAMDB_ASSIGN_BYTES: usize = 84;
+
+fn align_up(value: usize, align: usize) -> usize {
+    if align == 0 {
+        return value;
+    }
+    (value + align - 1) & !(align - 1)
+}
 
 #[derive(Debug, Clone)]
 struct Rule {
@@ -163,10 +172,6 @@ fn pack3(p: &[u8]) -> u32 {
     ((p[0] as u32) << 16) | ((p[1] as u32) << 8) | (p[2] as u32)
 }
 
-fn c_slot_key(gram: u32, mask: u32) -> u32 {
-    gram & mask
-}
-
 fn singleton_build(rules: &[Rule]) -> SingletonResult {
     let nr = rules.len();
 
@@ -183,12 +188,16 @@ fn singleton_build(rules: &[Rule]) -> SingletonResult {
     while table_size < min_size {
         table_size <<= 1;
     }
-    let slot_mask = (table_size - 1) as u32;
-
     let mut gram_map: HashMap<u32, GNode> = HashMap::new();
     let mut rule_grams: Vec<Vec<u32>> = vec![Vec::new(); nr];
     let mut rule_sel: Vec<Option<u32>> = vec![None; nr];
     let mut rule_cov: Vec<bool> = vec![false; nr];
+
+    // Simulate C's linear-probing hash table to determine each gram's actual slot
+    // position in C's ght array. C iterates slots 0..size-1 for initial queue ordering,
+    // so grams placed at later slots (due to probing) must sort after earlier ones.
+    let mut c_slot_arr: Vec<u32> = vec![u32::MAX; table_size];
+    let mut gram_to_cslot: HashMap<u32, usize> = HashMap::new();
 
     for (rid, rule) in rules.iter().enumerate() {
         if rule.pattern.len() < N_GRAM {
@@ -203,17 +212,32 @@ fn singleton_build(rules: &[Rule]) -> SingletonResult {
             let node = gram_map.entry(idx).or_default();
             node.rule_ids.push(rid);
             node.degree += 1;
+            // First time this gram appears across all rules: assign its C slot
+            if node.rule_ids.len() == 1 {
+                let mut pos = (idx as usize) & (table_size - 1);
+                loop {
+                    if c_slot_arr[pos] == u32::MAX {
+                        c_slot_arr[pos] = idx;
+                        gram_to_cslot.insert(idx, pos);
+                        break;
+                    } else if c_slot_arr[pos] == idx {
+                        gram_to_cslot.insert(idx, pos);
+                        break;
+                    }
+                    pos = (pos + 1) & (table_size - 1);
+                }
+            }
         }
     }
 
     let mut n_uncov = rules.iter().filter(|r| r.pattern.len() >= N_GRAM).count();
 
-    // Populate initial queue with degree-1 grams sorted by C slot order.
+    // Populate initial queue with degree-1 grams in C slot order (actual array positions).
     let mut deg1: Vec<u32> = gram_map
         .iter()
         .filter_map(|(idx, node)| (node.degree == 1).then_some(*idx))
         .collect();
-    deg1.sort_unstable_by_key(|&g| c_slot_key(g, slot_mask));
+    deg1.sort_unstable_by_key(|&g| gram_to_cslot.get(&g).copied().unwrap_or(usize::MAX));
     let mut queue: VecDeque<u32> = deg1.into_iter().collect();
 
     while n_uncov > 0 {
@@ -229,14 +253,14 @@ fn singleton_build(rules: &[Rule]) -> SingletonResult {
         }
 
         if sel_idx.is_none() {
-            // Fallback: pick minimum-degree gram in C slot order.
+            // Fallback: pick minimum-degree gram in C slot order (actual position).
             let mut best = i32::MAX;
-            let mut best_slot = u32::MAX;
+            let mut best_slot = usize::MAX;
             for (gi, node) in &gram_map {
                 if node.gone || node.degree == 0 {
                     continue;
                 }
-                let slot = c_slot_key(*gi, slot_mask);
+                let slot = gram_to_cslot.get(gi).copied().unwrap_or(usize::MAX);
                 if node.degree < best || (node.degree == best && slot < best_slot) {
                     best = node.degree;
                     best_slot = slot;
@@ -755,6 +779,15 @@ fn write_gramdb(
             .map_err(|e| format!("failed to write assign pattern: {e}"))?;
     }
 
+    let cur_off = GRAMDB_HEADER_BYTES + assigns.len() * GRAMDB_ASSIGN_BYTES;
+    let table0_off = align_up(cur_off, 8);
+    let pad = table0_off.saturating_sub(cur_off);
+    if pad > 0 {
+        const PAD: [u8; 8] = [0; 8];
+        fp.write_all(&PAD[..pad])
+            .map_err(|e| format!("failed to write gramdb pad: {e}"))?;
+    }
+
     for e in t0 {
         write_i32_le(&mut fp, e.key)?;
         write_i32_le(&mut fp, e.val)?;
@@ -781,11 +814,20 @@ fn build_outputs(
         return Err(format!("no rules loaded from {}", rule_file.display()));
     }
 
-    let (rules, dup_count) = if dedup {
+    let (rules_deduped, dup_count) = if dedup {
         dedup_rules(&loaded_rules)
     } else {
         (loaded_rules, 0)
     };
+
+    let long_count = rules_deduped
+        .iter()
+        .filter(|r| r.pattern.len() > MAX_PATTERN_LEN)
+        .count();
+    let rules: Vec<Rule> = rules_deduped
+        .into_iter()
+        .filter(|r| r.pattern.len() <= MAX_PATTERN_LEN)
+        .collect();
 
     let singleton = singleton_build(&rules);
 
@@ -862,6 +904,9 @@ fn build_outputs(
     println!("dedup          : {}", if dedup { "on" } else { "off" });
     if dedup {
         println!("dedup removed  : {}", dup_count);
+    }
+    if long_count > 0 {
+        println!("long filtered  : {}  (pattern > {} bytes)", long_count, MAX_PATTERN_LEN);
     }
     println!("rules          : {}", rules.len());
     println!();
