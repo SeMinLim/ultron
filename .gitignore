@@ -1,2 +1,6 @@
 # macOS system file 
 .DS_Store
+**/*/obj
+**/*.log
+**/*/hw_emu
+**/*/hw
