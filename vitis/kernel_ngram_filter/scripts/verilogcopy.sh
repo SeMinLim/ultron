@@ -1,6 +1,7 @@
 #!/bin/bash
 
 VFILES="
+	RegFile.v
 	SyncResetA.v
 	SyncRegister.v
 	SyncHandshake.v

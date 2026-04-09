@@ -36,8 +36,9 @@ foreach up [ipx::get_user_parameters] {
 set_property sdx_kernel true $core
 set_property sdx_kernel_type rtl $core
 ipx::create_xgui_files $core
-ipx::associate_bus_interfaces -busif in -clock ap_clk $core
-ipx::associate_bus_interfaces -busif out -clock ap_clk $core
+ipx::associate_bus_interfaces -busif db -clock ap_clk $core
+ipx::associate_bus_interfaces -busif pkt -clock ap_clk $core
+ipx::associate_bus_interfaces -busif result -clock ap_clk $core
 ipx::associate_bus_interfaces -busif s_axi_control -clock ap_clk $core
 set_property xpm_libraries {XPM_CDC XPM_MEMORY XPM_FIFO} $core
 set_property supported_families { } $core
