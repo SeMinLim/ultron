@@ -3,7 +3,7 @@
 
 void bitmap_clear(Bitmap *b)
 {
-    memset(b->data, 0, BITMAP_BYTES);
+    memset(b->data, 0, BITMAP_BYTES + BITMAP_GUARD);
 }
 
 void bitmap_set_gram(Bitmap *b, const uint8_t *gram)
