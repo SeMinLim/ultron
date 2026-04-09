@@ -73,6 +73,8 @@ module mkDataLoader#(
         patCount   <= w[159:128];
         ruledbOff  <= w[191:160];
         portlocOff <= w[223:192];
+        $display("DL header ght=%0d pat=%0d ruledbOff=%0d portlocOff=%0d",
+                 w[127:96], w[159:128], w[191:160], w[223:192]);
         readReqQ.enq(tuple2(baseAddr + 64, 256 * 1024));
         wordIdx <= 0;
         state   <= DLBitmap;
@@ -82,6 +84,7 @@ module mkDataLoader#(
         let w = wordQ.first; wordQ.deq;
         bitmap.writeWord(truncate(wordIdx), w);
         if (wordIdx == 4095) begin
+            $display("DL bitmap done");
             Bit#(64) ghtBytes = zeroExtend((ghtCount + 3) / 4) * 64;
             readReqQ.enq(tuple2(baseAddr + 64 + 256*1024, ghtBytes));
             wordIdx <= 0;
@@ -123,6 +126,7 @@ module mkDataLoader#(
             if (ghtDone + 1 < ghtCount)
                 state <= DLGhtFetch;
             else begin
+                $display("DL GHT done");
                 Bit#(64) patOff = zeroExtend(ruledbOff);
                 readReqQ.enq(tuple2(baseAddr + patOff, zeroExtend(patCount) * 64));
                 wordIdx <= 0;
@@ -138,6 +142,7 @@ module mkDataLoader#(
         patTable.writePattern(truncate(wordIdx), w);
         wordIdx <= wordIdx + 1;
         if (wordIdx + 1 >= patCount) begin
+            $display("DL patterns done");
             Bit#(64) plOff = zeroExtend(portlocOff);
             readReqQ.enq(tuple2(baseAddr + plOff, 512 * 64));
             portWord <= 0;
@@ -151,6 +156,7 @@ module mkDataLoader#(
         Bit#(7) addr = truncate(portWord);
         portMatcher.writeBitmap(tbl, addr, w);
         if (portWord == 511) begin
+            $display("DL port bitmap done");
             Bit#(64) plOff = zeroExtend(portlocOff) + 512 * 64;
             readReqQ.enq(tuple2(baseAddr + plOff, 256 * 64));
             portWord    <= 0;
@@ -177,6 +183,7 @@ module mkDataLoader#(
         if (portSubIdx == 15) begin
             portSubIdx <= 0;
             if (portWord == 255) begin
+                $display("DL port windows done");
                 Bit#(64) plOff = zeroExtend(portlocOff) + 512*64 + 256*64;
                 readReqQ.enq(tuple2(baseAddr + plOff, 32 * 64));
                 portWord   <= 0;
@@ -209,6 +216,7 @@ module mkDataLoader#(
             portWord   <= portWord + 1;
             portSubIdx <= 0;
             if (portWord == 31) begin
+                $display("DL done");
                 done  <= True;
                 state <= DLDone;
             end else begin
