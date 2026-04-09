@@ -3,6 +3,7 @@ package GramMatcher;
 // gram -> Ruleid, pre, post, len
 
 import FIFO::*;
+import FIFOF::*;
 import GramIdTable::*;
 
 typedef struct {
@@ -23,8 +24,8 @@ endinterface
 
 (* synthesize *)
 module mkGramMatcher(GramMatcherIfc);
-    GramIdTableIfc tbl     <- mkGramIdTable;
-    FIFO#(Bit#(32)) anchorQ <- mkFIFO;
+    GramIdTableIfc tbl      <- mkGramIdTable;
+    FIFOF#(Bit#(32)) anchorQ <- mkSizedFIFOF(128);
 
     method Action insert(Bit#(32) gram, RuleInfo info) = tbl.insert(gram, info);
     method ActionValue#(Bool) insertAck = tbl.insertAck;
