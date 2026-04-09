@@ -23,7 +23,7 @@ static std::vector<PcapPkt> load_pcap(const char *path)
 
     uint32_t magic; fread(&magic, 4, 1, f);
     bool swapped = (magic == 0xD4C3B2A1);
-    fseek(f, 24, SEEK_SET); 
+    fseek(f, 24, SEEK_SET);  
 
     auto rd32 = [&]() -> uint32_t {
         uint32_t v; fread(&v, 4, 1, f);
@@ -46,10 +46,10 @@ static std::vector<PcapPkt> load_pcap(const char *path)
     return pkts;
 }
 
-// packet 
-//   [0..64)              64B header
-//   [64..64+N*16)        N descriptors × 16B {offset:u32, len:u32, reserved:8B}
-//   [desc_end_aligned..) raw packet bytes concatenated
+// packet:
+// [0..64)              64B header
+// [64..64+N*16)        N descriptors × 16B {offset:u32, len:u32, reserved:8B}
+// [desc_end_aligned..) raw packet bytes concatenated
 static std::vector<uint8_t> build_pkt_blob(const std::vector<PcapPkt> &pkts)
 {
     uint32_t n = (uint32_t)pkts.size();
@@ -85,9 +85,9 @@ static std::vector<uint8_t> build_pkt_blob(const std::vector<PcapPkt> &pkts)
     return blob;
 }
 
-// Result layout:
-//   [0..128)            summary: 32 x u32 counters
-//   [128..128+N*4)      per-packet: {matched[1], reserved[15], ruleId[16]}
+// result:
+// [0..128)            summary: 32 x u32 counters
+// [128..128+N*4)      per-packet: {matched[1], reserved[15], ruleId[16]}
 static void print_results(const uint8_t *res, uint32_t pkt_count)
 {
     uint32_t matched, processed, db_cyc, pkt_cyc, total_cyc;
