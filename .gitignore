@@ -4,3 +4,5 @@
 **/*.log
 **/*/hw_emu
 **/*/hw
+**/*.codex
+**/*.txt
