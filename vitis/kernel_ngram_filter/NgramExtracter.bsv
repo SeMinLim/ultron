@@ -3,8 +3,8 @@ package NgramExtracter;
 import FIFOF::*;
 import Vector::*;
 
-typedef 64 NGramLanes;
-typedef 64 NBitmapLanes;
+typedef 61 NGramLanes;
+typedef 61 NBitmapLanes;
 
 typedef struct {
     Bit#(32) byteIdx;  // gram_value / 8
