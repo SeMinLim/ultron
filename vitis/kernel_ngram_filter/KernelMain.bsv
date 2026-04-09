@@ -52,10 +52,9 @@ module mkKernelMain(KernelMainIfc);
     PacketReaderIfc       pktReader    <- mkPacketReader;
     ResultWriterIfc       resultWriter <- mkResultWriter;
 
-    // --- Cycle counters: one per pipeline section ---
-    CycleCounterIfc timerDb    <- mkCycleCounter;  // DB load phase
-    CycleCounterIfc timerPkt   <- mkCycleCounter;  // Packet processing phase
-    CycleCounterIfc timerTotal <- mkCycleCounter;  // End-to-end
+    CycleCounterIfc timerDb    <- mkCycleCounter;
+    CycleCounterIfc timerPkt   <- mkCycleCounter;
+    CycleCounterIfc timerTotal <- mkCycleCounter;
 
     Vector#(3, FIFO#(MemReq))     rdReqQs  <- replicateM(mkFIFO);
     Vector#(3, FIFO#(MemReq))     wrReqQs  <- replicateM(mkFIFO);
@@ -69,9 +68,10 @@ module mkKernelMain(KernelMainIfc);
     Reg#(Bit#(64)) rPktBase    <- mkRegU;
     Reg#(Bit#(64)) rResultBase <- mkRegU;
 
-    Reg#(Bit#(512)) payBuf  <- mkReg(0);
-    Reg#(Bit#(7))   payBufN <- mkReg(0);
-    Reg#(Bit#(32))  payLen  <- mkReg(0);
+    Reg#(Bit#(512)) payBuf   <- mkReg(0);
+    Reg#(Bit#(7))   payBufN  <- mkReg(0);
+    Reg#(Bit#(32))  payLen   <- mkReg(0);
+    Reg#(Bit#(1))   payEpoch <- mkReg(0); // flips per packet; selects BRAM half in ExactMatch
 
     Reg#(Bit#(32)) dataLoaderCycles   <- mkReg(0);
     Reg#(Bit#(32)) packetReaderCycles <- mkReg(0);
@@ -182,11 +182,12 @@ module mkKernelMain(KernelMainIfc);
 
             if (payBufN == 63 || last) begin
                 Bit#(7) cnt = last ? truncate(payBufN) + 1 : 64;
-                exactMatch.putPayloadWord(nextPayBuf, last);
+                exactMatch.putPayloadWord(nextPayBuf, last, payEpoch);
                 ngram.putBytes(nextPayBuf, 0, truncate(cnt), last);
                 payBufN <= 0;
                 payBuf  <= 0;
                 payLen  <= nextLen;
+                if (last) payEpoch <= payEpoch + 1;
             end else begin
                 payBuf  <= nextPayBuf;
                 payBufN <= nextN;
@@ -238,7 +239,7 @@ module mkKernelMain(KernelMainIfc);
         Bool hit = scanHits[scanIdx];
         case (scanGrams[scanIdx]) matches
             tagged Valid .g: if (hit) begin
-                gram.lookupReq(g.gram, g.anchor);
+                gram.lookupReq(g.gram, g.anchor, payLen, payEpoch);
                 gramLookups <= gramLookups + 1;
             end
             tagged Invalid:  noAction;
@@ -250,14 +251,14 @@ module mkKernelMain(KernelMainIfc);
     endrule
 
     rule collectGramHits(state == KProcess);
-        let r <- gram.lookupResp;
-        case (r) matches
+        match {.mr, .pLen, .ep} <- gram.lookupResp;
+        case (mr) matches
             tagged Valid .vr: begin
-                gramHits <= gramHits + 1;
+                gramHits    <= gramHits + 1;
                 exactChecks <= exactChecks + 1;
                 $display("KM gramHit rule=%0d anchor=%0d pre=%0d post=%0d len=%0d payLen=%0d",
-                         vr.ruleId, vr.anchor, vr.pre, vr.post, vr.len, payLen);
-                exactMatch.putRequest(vr, payLen);
+                         vr.ruleId, vr.anchor, vr.pre, vr.post, vr.len, pLen);
+                exactMatch.putRequest(vr, pLen, ep);
             end
             tagged Invalid: noAction;
         endcase
@@ -267,7 +268,7 @@ module mkKernelMain(KernelMainIfc);
         let r <- exactMatch.getResult;
         $display("KM exactResult hit=%b ruleId=%0d matchPos=%0d", r.hit, r.ruleId, r.matchPos);
         if (r.hit) begin
-            exactHits <= exactHits + 1;
+            exactHits  <= exactHits + 1;
             portChecks <= portChecks + 1;
             portMatch.putMeta(PomPktMeta {
                 ruleId:     r.ruleId,
@@ -280,19 +281,17 @@ module mkKernelMain(KernelMainIfc);
                 isUdp:      pktParser.isUdp,
                 isIcmp:     pktParser.isIcmp,
                 matchPos:   r.matchPos,
-                payloadLen: payLen
+                payloadLen: r.payLen
             });
         end else begin
             exactMisses <= exactMisses + 1;
-            resultWriter.addResult(False, 0);
-            payBuf  <= 0;
-            payBufN <= 0;
-            payLen  <= 0;
-            pktReader.nextPacket;
         end
     endrule
 
-    rule collectPortResult(state == KProcess && portMatch.outputReady);
+    rule collectPortResult(state == KProcess &&
+                          gram.idle &&
+                          !exactMatch.inputPending && !exactMatch.notEmpty &&
+                          portMatch.outputReady);
         let pr <- portMatch.getResult;
         $display("KM portResult hit=%b ruleId=%0d", pr.hit, pr.ruleId);
         if (pr.hit)
@@ -384,7 +383,6 @@ module mkKernelMain(KernelMainIfc);
         state <= KIdle;
     endrule
 
-    // --- AXI port interfaces ---
     Vector#(3, MemPortIfc) mem_;
     for (Integer i = 0; i < 3; i = i + 1) begin
         mem_[i] = interface MemPortIfc;
