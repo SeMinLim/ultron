@@ -1,405 +1,445 @@
+package KernelMain;
+
 import FIFO::*;
+import FIFOF::*;
 import Vector::*;
-import Serializer::*;
 
+import BitmapUram::*;
+import CycleCounter::*;
+import ExactPatternTable::*;
+import GramMatcher::*;
+import NgramExtracter::*;
+import PacketParser::*;
+import ExactMatch::*;
+import PortOffsetMatcher::*;
+import DataLoader::*;
+import PacketReader::*;
+import ResultWriter::*;
 
-typedef 0 ResultAddrStart;
-typedef 2 MemPortCnt;
-typedef enum {
-	ST_IDLE,
-	ST_READ_REQ,
-	ST_READ_WAIT,
-	ST_SER_PUT,
-	ST_SER_GET,
-	ST_DESER_GET,
-	ST_REP_PUT,
-	ST_REP_GET,
-	ST_LAST_PUT,
-	ST_LAST_GET,
-	ST_SKIP_FEED0,
-	ST_SKIP_GET0,
-	ST_SKIP_FEED1,
-	ST_SKIP_GET1,
-	ST_SKIP_TAIL,
-	ST_SHIFT_PUT,
-	ST_SHIFT_GET,
-	ST_FREE_RUN,
-	ST_PACK,
-	ST_WRITE_REQ,
-	ST_WRITE_WORD,
-	ST_DONE
-} TestState deriving (Bits, Eq);
 typedef struct {
-	Bit#(64) addr;
-	Bit#(32) bytes;
-} MemPortReq deriving (Eq, Bits);
-
-
-function Bit#(8) skipInput(UInt#(4) idx);
-	case (idx)
-		0:       return 8'hA0;
-		1:       return 8'hA1;
-		2:       return 8'hA2;
-		3:       return 8'hA3;
-		4:       return 8'hB0;
-		5:       return 8'hB1;
-		6:       return 8'hB2;
-		7:       return 8'hB3;
-		default: return 8'h00;
-	endcase
-endfunction
-function Bit#(10) freeInput(UInt#(3) idx);
-	case (idx)
-		0:       return 10'h3AB;
-		1:       return 10'h155;
-		2:       return 10'h2C3;
-		default: return 10'h000;
-	endcase
-endfunction
-
+    Bit#(64) addr;
+    Bit#(64) bytes;
+} MemReq deriving (Bits, Eq);
 
 interface MemPortIfc;
-	method ActionValue#(MemPortReq) readReq;
-	method ActionValue#(MemPortReq) writeReq;
-	method ActionValue#(Bit#(512))  writeWord;
-	method Action readWord(Bit#(512) word);
+    method ActionValue#(MemReq) readReq;
+    method ActionValue#(MemReq) writeReq;
+    method ActionValue#(Bit#(512)) writeWord;
+    method Action readWord(Bit#(512) word);
 endinterface
+
 interface KernelMainIfc;
-	method Action start(Bit#(32) param);
-	method ActionValue#(Bool) done;
-	interface Vector#(MemPortCnt, MemPortIfc) mem;
+    method Action start(Bit#(32) pktCount, Bit#(32) dbBytes,
+                        Bit#(64) dbBase, Bit#(64) pktBase, Bit#(64) resultBase);
+    method ActionValue#(Bool) done;
+    interface Vector#(3, MemPortIfc) mem;
 endinterface
+
+typedef 3 MemPortCnt;
+
+typedef enum { KIdle, KInit, KProcess, KWrite, KDone } KState deriving (Bits, Eq, FShow);
+
 module mkKernelMain(KernelMainIfc);
-	FIFO#(Bool) startQ <- mkFIFO;
-	FIFO#(Bool) doneQ  <- mkFIFO;
 
-	Reg#(Bool) started <- mkReg(False);
-	Reg#(TestState) state <- mkReg(ST_IDLE);
+    ExactPatternTableIfc  patternTable <- mkExactPatternTable;
+    BitmapUramIfc         bitmap       <- mkBitmapUram;
+    GramMatcherIfc        gram         <- mkGramMatcher;
+    NgramExtracterIfc     ngram        <- mkNgramExtracter;
+    PacketParserIfc       pktParser    <- mkPacketParser;
+    ExactMatchIfc         exactMatch   <- mkExactMatch(patternTable);
+    PortOffsetMatcherIfc  portMatch    <- mkPortOffsetMatcher;
+    DataLoaderIfc         dataLoader   <- mkDataLoader(bitmap, gram, patternTable, portMatch);
+    PacketReaderIfc       pktReader    <- mkPacketReader;
+    ResultWriterIfc       resultWriter <- mkResultWriter;
 
-	Vector#(MemPortCnt, FIFO#(MemPortReq)) readReqQs   <- replicateM(mkFIFO);
-	Vector#(MemPortCnt, FIFO#(MemPortReq)) writeReqQs  <- replicateM(mkFIFO);
-	Vector#(MemPortCnt, FIFO#(Bit#(512)))  writeWordQs <- replicateM(mkFIFO);
-	Vector#(MemPortCnt, FIFO#(Bit#(512)))  readWordQs  <- replicateM(mkFIFO);
-	//-----------------------------------------------------------------------------------
-	// passMask Bit Assignment
-	// bit0: mkSerializer,   bit1: mkStreamReplicate, bit2: mkStreamSerializeLast
-	// bit3: mkDeSerializer, bit4: mkStreamSkip,      bit5: mkPipelineShiftRight
-	// bit6: mkSerializerFreeform
-	//-----------------------------------------------------------------------------------
-	SerializerIfc#(32, 4)         ser      <- mkSerializer;
-	DeSerializerIfc#(8, 4)        deser    <- mkDeSerializer;
-	FIFO#(Bit#(8))                rep      <- mkStreamReplicate(3);
-	FIFO#(Bool)                   lastFlag <- mkStreamSerializeLast(4);
-	FIFO#(Bit#(8))                skip     <- mkStreamSkip(4, 2);
-	PipelineShiftIfc#(64, 6)      shifter  <- mkPipelineShiftRight;
-	SerializerFreeformIfc#(10, 6) freeform <- mkSerializerFreeform;
+    // --- Cycle counters: one per pipeline section ---
+    CycleCounterIfc timerDb    <- mkCycleCounter;  // DB load phase
+    CycleCounterIfc timerPkt   <- mkCycleCounter;  // Packet processing phase
+    CycleCounterIfc timerTotal <- mkCycleCounter;  // End-to-end
 
-	Reg#(Bit#(7))  passMask  <- mkReg(0);
-	Reg#(UInt#(3)) serCount  <- mkReg(0);
-	Reg#(Bit#(32)) serObs    <- mkReg(0);
-	Reg#(Bit#(32)) deserObs  <- mkReg(0);
+    Vector#(3, FIFO#(MemReq))     rdReqQs  <- replicateM(mkFIFO);
+    Vector#(3, FIFO#(MemReq))     wrReqQs  <- replicateM(mkFIFO);
+    Vector#(3, FIFO#(Bit#(512)))  wrWordQs <- replicateM(mkFIFO);
+    Vector#(3, FIFOF#(Bit#(512))) rdWordQs <- replicateM(mkSizedFIFOF(16));
 
-	Reg#(UInt#(2)) repCount  <- mkReg(0);
-	Reg#(Bit#(24)) repObs    <- mkReg(0);
+    FIFO#(Bool) doneQ <- mkFIFO;
+    Reg#(KState) state <- mkReg(KIdle);
 
-	Reg#(UInt#(3)) lastCount <- mkReg(0);
-	Reg#(Bit#(4))  lastObs   <- mkReg(0);
+    Reg#(Bit#(32)) rPktCount   <- mkRegU;
+    Reg#(Bit#(64)) rPktBase    <- mkRegU;
+    Reg#(Bit#(64)) rResultBase <- mkRegU;
 
-	Reg#(UInt#(4)) skipFeedIdx <- mkReg(0);
-	Reg#(Bit#(16)) skipObs     <- mkReg(0);
+    Reg#(Bit#(512)) payBuf  <- mkReg(0);
+    Reg#(Bit#(7))   payBufN <- mkReg(0);
+    Reg#(Bit#(32))  payLen  <- mkReg(0);
 
-	Reg#(Bit#(64)) shiftObs <- mkReg(0);
+    Reg#(Bit#(32)) dataLoaderCycles   <- mkReg(0);
+    Reg#(Bit#(32)) packetReaderCycles <- mkReg(0);
+    Reg#(Bit#(32)) packetParserCycles <- mkReg(0);
+    Reg#(Bit#(32)) ngramCycles        <- mkReg(0);
+    Reg#(Bit#(32)) bitmapCycles       <- mkReg(0);
+    Reg#(Bit#(32)) gramCycles         <- mkReg(0);
+    Reg#(Bit#(32)) exactCycles        <- mkReg(0);
+    Reg#(Bit#(32)) portCycles         <- mkReg(0);
+    Reg#(Bit#(32)) resultWriterCycles <- mkReg(0);
+    Reg#(Bit#(32)) gramsExtracted     <- mkReg(0);
+    Reg#(Bit#(32)) bitmapPassed       <- mkReg(0);
+    Reg#(Bit#(32)) gramLookups        <- mkReg(0);
+    Reg#(Bit#(32)) gramHits           <- mkReg(0);
+    Reg#(Bit#(32)) exactChecks        <- mkReg(0);
+    Reg#(Bit#(32)) exactHits          <- mkReg(0);
+    Reg#(Bit#(32)) exactMisses        <- mkReg(0);
+    Reg#(Bit#(32)) portChecks         <- mkReg(0);
+    Reg#(Bit#(32)) portHits           <- mkReg(0);
+    Reg#(Bit#(32)) portMisses         <- mkReg(0);
+    Reg#(Bit#(32)) noMatchPkts        <- mkReg(0);
+    Reg#(ResultSummary) resultSummary <- mkReg(unpack(0));
 
-	Reg#(UInt#(3)) freeInCount  <- mkReg(0);
-	Reg#(UInt#(3)) freeOutCount <- mkReg(0);
-	Reg#(Bit#(30)) freeObs      <- mkReg(0);
+    rule dbReadReq;
+        let {addr, bytes} <- dataLoader.readReq;
+        rdReqQs[0].enq(MemReq { addr: addr, bytes: bytes });
+    endrule
+    rule dbReadWord;
+        dataLoader.readWord(rdWordQs[0].first);
+        rdWordQs[0].deq;
+    endrule
 
-	Reg#(Bit#(32)) inputObs  <- mkReg(0);
-	Reg#(Bool)     inputPass <- mkReg(False);
-	
-	Reg#(Bit#(512)) resultWord <- mkReg(0);
+    function Bit#(32) countValidGrams(Vector#(NBitmapLanes, Maybe#(NgramOut)) grams);
+        Bit#(32) total = 0;
+        for (Integer i = 0; i < valueOf(NBitmapLanes); i = i + 1) begin
+            case (grams[i]) matches
+                tagged Valid .g: total = total + 1;
+                tagged Invalid:  total = total;
+            endcase
+        end
+        return total;
+    endfunction
 
-	Reg#(Bit#(32)) cycleCounter <- mkReg(0);
-	Reg#(Bit#(32)) cycleStart   <- mkReg(0);
-	rule incCycle;
-		cycleCounter <= cycleCounter + 1;
-	endrule
+    function Bit#(32) countHits(Vector#(NBitmapLanes, Bool) hits);
+        Bit#(32) total = 0;
+        for (Integer i = 0; i < valueOf(NBitmapLanes); i = i + 1)
+            if (hits[i]) total = total + 1;
+        return total;
+    endfunction
 
-	rule systemStart (!started);
-		startQ.deq;
+    rule pktReadReq;
+        let {addr, bytes} <- pktReader.readReq;
+        rdReqQs[1].enq(MemReq { addr: addr, bytes: bytes });
+    endrule
+    rule pktReadWord;
+        pktReader.readWord(rdWordQs[1].first);
+        rdWordQs[1].deq;
+    endrule
 
-		rep.clear;
-		lastFlag.clear;
-		skip.clear;
+    rule resWriteReq;
+        let {addr, bytes} <- resultWriter.writeReq;
+        wrReqQs[2].enq(MemReq { addr: addr, bytes: bytes });
+    endrule
+    rule resWriteWord;
+        let w <- resultWriter.writeWord;
+        wrWordQs[2].enq(w);
+    endrule
 
-		started      <= True;
-		state        <= ST_READ_REQ;
-		cycleStart   <= cycleCounter;
-		passMask     <= 0;
-		serCount     <= 0;
-		serObs       <= 0;
-		deserObs     <= 0;
-		repCount     <= 0;
-		repObs       <= 0;
-		lastCount    <= 0;
-		lastObs      <= 0;
-		skipFeedIdx  <= 0;
-		skipObs      <= 0;
-		shiftObs     <= 0;
-		freeInCount  <= 0;
-		freeOutCount <= 0;
-		freeObs      <= 0;
-		inputObs     <= 0;
-		inputPass    <= False;
-		resultWord   <= 0;
-	endrule
-	//-----------------------------------------------------------------------------------
-	// Read one 512-bit word from the input BO (port 0). The host writes 32'h11223344 to lane 0. 
-	// Test the host -> PLRAM(URAM-mapped) -> kernel read path.
-	//-----------------------------------------------------------------------------------
-	rule requestInputWord (started && state == ST_READ_REQ);
-		readReqQs[0].enq(MemPortReq{addr: 64'd0, bytes: 32'd64});
-		state <= ST_READ_WAIT;
-	endrule
-	rule receiveInputWord (started && state == ST_READ_WAIT);
-		let w = readWordQs[0].first;
-		readWordQs[0].deq;
-		
-		Bit#(32) hostWord = truncate(w);
-		inputObs  <= hostWord;
-		inputPass <= (hostWord == 32'h11223344);
-		state <= ST_SER_PUT;
-	endrule
-	//-----------------------------------------------------------------------------------
-	// 1) mkSerializer and 2) mkDeSerializer round-trip
-	//-----------------------------------------------------------------------------------
-	rule testSerializerPut (started && state == ST_SER_PUT);
-		ser.put(inputObs);
-		state <= ST_SER_GET;
-	endrule
-	rule testSerializerGet (started && state == ST_SER_GET);
-		let x <- ser.get;
-		Bit#(32) nextSer = (zeroExtend(x) << 24) | (serObs >> 8);
+    rule countModuleCycles(
+        (state == KInit && !dataLoader.loadDone) ||
+        (state == KProcess && !pktReader.allDone) ||
+        (state == KDone && !resultWriter.writeDone)
+    );
+        if (state == KInit && !dataLoader.loadDone)
+            dataLoaderCycles <= dataLoaderCycles + 1;
 
-		serObs <= nextSer;
-		deser.put(x);
+        if (state == KProcess && !pktReader.allDone) begin
+            packetReaderCycles <= packetReaderCycles + 1;
 
-		if (serCount == 3) begin
-			if (nextSer == inputObs) passMask <= passMask | 7'b0000001;
-			serCount <= 0;
-			state <= ST_DESER_GET;
-		end else begin
-			serCount <= serCount + 1;
-		end
-	endrule
-	rule testDeSerializerGet (started && state == ST_DESER_GET);
-		let x <- deser.get;
-		deserObs <= x;
-		
-		if (x == inputObs) passMask <= passMask | 7'b0001000;
-		state <= ST_REP_PUT;
-	endrule
-	//-----------------------------------------------------------------------------------
-	// 3) mkStreamReplicate
-	//-----------------------------------------------------------------------------------
-	rule testReplicatePut (started && state == ST_REP_PUT);
-		rep.enq(8'hA6);
-		state <= ST_REP_GET;
-	endrule
-	rule testReplicateGet (started && state == ST_REP_GET);
-		let x = rep.first;
-		rep.deq;
+            if (pktReader.pktReady || pktReader.pktDone)
+                packetParserCycles <= packetParserCycles + 1;
+            if (!ngram.idle)
+                ngramCycles <= ngramCycles + 1;
+            if (!bitmap.idle)
+                bitmapCycles <= bitmapCycles + 1;
+            if (!gram.idle)
+                gramCycles <= gramCycles + 1;
+            if (exactMatch.inputPending || exactMatch.notEmpty)
+                exactCycles <= exactCycles + 1;
+            if (!portMatch.idle)
+                portCycles <= portCycles + 1;
+        end
 
-		Bit#(24) nextRep = {repObs[15:0], x};
-		repObs <= nextRep;
+        if (state == KDone && !resultWriter.writeDone)
+            resultWriterCycles <= resultWriterCycles + 1;
+    endrule
 
-		if (repCount == 2) begin
-			if (nextRep == 24'hA6A6A6) passMask <= passMask | 7'b0000010;
-			repCount <= 0;
-			state <= ST_LAST_PUT;
-		end else begin
-			repCount <= repCount + 1;
-		end
-	endrule
-	//-----------------------------------------------------------------------------------
-	// 4) mkStreamSerializeLast
-	//-----------------------------------------------------------------------------------
-   	rule testLastPut (started && state == ST_LAST_PUT);
-		lastFlag.enq(True);
-		state <= ST_LAST_GET;
-	endrule
-	rule testLastGet (started && state == ST_LAST_GET);
-		let b = lastFlag.first;
-		lastFlag.deq;
+    rule feedByte(state == KProcess && pktReader.pktReady);
+        Bit#(8) b    = pktReader.getByte;
+        Bool    last = pktReader.pktLastByte;
+        pktParser.putByte(b, last);
+        pktReader.advanceByte;
 
-		Bit#(4) nextLast = {lastObs[2:0], pack(b)};
-		lastObs <= nextLast;
+        if (pktParser.inPayload) begin
+            Bit#(512) nextPayBuf = (payBuf >> 8) | (zeroExtend(b) << 504);
+            Bit#(7)   nextN      = payBufN + 1;
+            Bit#(32)  nextLen    = payLen + 1;
 
-		if (lastCount == 3) begin
-			if (nextLast == 4'b0001) passMask <= passMask | 7'b0000100;
-			lastCount <= 0;
-			state <= ST_SKIP_FEED0;
-		end else begin
-			lastCount <= lastCount + 1;
-		end
-	endrule
-	//-----------------------------------------------------------------------------------
-	// 5) mkStreamSkip
-	//-----------------------------------------------------------------------------------
-	rule testSkipFeed0 (started && state == ST_SKIP_FEED0);
-		skip.enq(skipInput(skipFeedIdx));
-		
-		if (skipFeedIdx == 2) begin
-			skipFeedIdx <= 3;
-			state <= ST_SKIP_GET0;
-		end else begin
-			skipFeedIdx <= skipFeedIdx + 1;
-		end
-	endrule
-	rule testSkipGet0 (started && state == ST_SKIP_GET0);
-		let x = skip.first;
-		skip.deq;
+            if (payBufN == 63 || last) begin
+                Bit#(7) cnt = last ? truncate(payBufN) + 1 : 64;
+                exactMatch.putPayloadWord(nextPayBuf, last);
+                ngram.putBytes(nextPayBuf, 0, truncate(cnt), last);
+                payBufN <= 0;
+                payBuf  <= 0;
+                payLen  <= nextLen;
+            end else begin
+                payBuf  <= nextPayBuf;
+                payBufN <= nextN;
+                payLen  <= nextLen;
+            end
+        end
+    endrule
 
-		skipObs <= {8'h00, x};
-		state <= ST_SKIP_FEED1;
-	endrule
-	rule testSkipFeed1 (started && state == ST_SKIP_FEED1);
-		skip.enq(skipInput(skipFeedIdx));
-		
-		if (skipFeedIdx == 6) begin
-			skipFeedIdx <= 7;
-			state <= ST_SKIP_GET1;
-		end else begin
-			skipFeedIdx <= skipFeedIdx + 1;
-		end
-	endrule
-	rule testSkipGet1 (started && state == ST_SKIP_GET1);
-		let x = skip.first;
-		skip.deq;
+    FIFOF#(Vector#(NBitmapLanes, Maybe#(NgramOut))) gramSideQ <- mkSizedFIFOF(4);
 
-		Bit#(16) nextSkip = {skipObs[7:0], x};
-		skipObs <= nextSkip;
+    rule dispatchGrams(state == KProcess && ngram.gramsReady);
+        let grams <- ngram.getGrams;
+        gramsExtracted <= gramsExtracted + countValidGrams(grams);
+        Vector#(NBitmapLanes, Bit#(21)) keys = newVector;
+        for (Integer i = 0; i < valueOf(NBitmapLanes); i = i + 1) begin
+            case (grams[i]) matches
+                tagged Valid .g: keys[i] = {g.gram[22:16], g.gram[14:8], g.gram[6:0]};
+                tagged Invalid:  keys[i] = 0;
+            endcase
+        end
+        bitmap.lookup(keys);
+        gramSideQ.enq(grams);
+    endrule
 
-		if (nextSkip == 16'hA2B2) passMask <= passMask | 7'b0010000;
-		state <= ST_SKIP_TAIL;
-	endrule
-	rule testSkipTail (started && state == ST_SKIP_TAIL);
-	// Complete the frame so the internal index returns to 0 before the next run.
-		skip.enq(skipInput(7));
-		state <= ST_SHIFT_PUT;
-	endrule
-	//-----------------------------------------------------------------------------------
-	// 6) mkPipelineShiftRight
-   	//-----------------------------------------------------------------------------------
-	rule testShiftPut (started && state == ST_SHIFT_PUT);
-		shifter.put(64'hFEDCBA9876543210, 6'd12);
-		state <= ST_SHIFT_GET;
-	endrule
-	rule testShiftGet (started && state == ST_SHIFT_GET);
-		let x <- shifter.get;
-		shiftObs <= x;
+    FIFOF#(Tuple2#(Vector#(NBitmapLanes, Bool),
+                   Vector#(NBitmapLanes, Maybe#(NgramOut)))) hitPairQ <- mkSizedFIFOF(4);
 
-		if (x == 64'h000FEDCBA9876543) passMask <= passMask | 7'b0100000;
-		state <= ST_FREE_RUN;
-	endrule
-	//-----------------------------------------------------------------------------------
-	// 7) mkSerializerFreeform (3 x 10-bit -> 5 x 6-bit).
-	// Expected outputs: 2B, 1E, 15, 0D, 2C
-	// Packed observation: 0x2B79536C
-	//-----------------------------------------------------------------------------------
-	rule testFreeformFeed (started && state == ST_FREE_RUN && freeInCount < 3);
-		freeform.put(freeInput(freeInCount));
-		freeInCount <= freeInCount + 1;
-	endrule
-	rule testFreeformGet (started && state == ST_FREE_RUN && freeOutCount < 5);
-		let x <- freeform.get;
-		Bit#(30) nextFree = {freeObs[23:0], x};
-		freeObs <= nextFree;
+    rule pairBitmapHits;
+        let hits  <- bitmap.result;
+        let grams = gramSideQ.first; gramSideQ.deq;
+        bitmapPassed <= bitmapPassed + countHits(hits);
+        hitPairQ.enq(tuple2(hits, grams));
+    endrule
 
-		if (freeOutCount == 4) begin
-			if (nextFree == 30'h2B79536C) passMask <= passMask | 7'b1000000;
-			state <= ST_PACK;
-		end else begin
-			freeOutCount <= freeOutCount + 1;
-		end
-	endrule
-	//-----------------------------------------------------------------------------------
-	// Results
-	// 16 x 32-bit lanes in one 512-bit result word.
-	// lane  0: magic,                                  lane  1: status (3 means PASS),
-	// lane  2: passMask,                               lane  3: elapsed cycles,
-	// lane  4: serializer observation,                 lane  5: deserializer observation
-	// lane  6: replicate observation,                  lane  7: serialize-last observation, 
-	// lane  8: skip observation,                       lane  9: shift observation low 32b, 
-	// lane 10: shift observation high 32b,             lane 11: freeform observation
-	// lane 12: host input word observed by the kernel, lane 13: host input pass flag (1 if lane12 == 0x11223344)
-	// lane 14: zero, 				    lane 15: zero
-	//-----------------------------------------------------------------------------------
-	rule packResults (started && state == ST_PACK);
-		Bit#(32) magic      = 32'h53524C5A; // 'SRLZ'
-		Bit#(32) cycles     = cycleCounter - cycleStart;
-		Bit#(32) passMask32 = zeroExtend(passMask);
-		Bit#(32) repObs32   = zeroExtend(repObs);
-		Bit#(32) lastObs32  = zeroExtend(lastObs);
-		Bit#(32) skipObs32  = zeroExtend(skipObs);
-		Bit#(32) freeObs32  = zeroExtend(freeObs);
-		Bit#(32) shiftLo32  = shiftObs[31:0];
-		Bit#(32) shiftHi32  = shiftObs[63:32];
-		Bit#(32) inputPass32 = zeroExtend(pack(inputPass));
-		Bit#(32) status     = (inputPass && (passMask == 7'b1111111)) ? 32'd3 : (32'hBAD00000 | zeroExtend(passMask));
+    Reg#(Bool)                                    scanBusy  <- mkReg(False);
+    Reg#(Bit#(7))                                 scanIdx   <- mkReg(0);
+    Reg#(Vector#(NBitmapLanes, Bool))             scanHits  <- mkRegU;
+    Reg#(Vector#(NBitmapLanes, Maybe#(NgramOut))) scanGrams <- mkRegU;
 
-		resultWord <= { 32'h0, 32'h0, inputPass32, inputObs, freeObs32, shiftHi32, shiftLo32, skipObs32,
-				lastObs32, repObs32, deserObs, serObs, cycles, passMask32, status, magic };
-		state <= ST_WRITE_REQ;
-	endrule
+    rule startScan(!scanBusy && hitPairQ.notEmpty);
+        let {hits, grams} = hitPairQ.first; hitPairQ.deq;
+        scanHits  <= hits;
+        scanGrams <= grams;
+        scanIdx   <= 0;
+        scanBusy  <= True;
+    endrule
 
-	rule reqWriteResult (started && state == ST_WRITE_REQ);
-		writeReqQs[1].enq(MemPortReq{addr: fromInteger(valueOf(ResultAddrStart)), bytes: 64});
-		state <= ST_WRITE_WORD;
-	endrule
-	rule writeResult (started && state == ST_WRITE_WORD);
-		writeWordQs[1].enq(resultWord);
-		state <= ST_DONE;
-	endrule
+    rule doScan(scanBusy);
+        Bool hit = scanHits[scanIdx];
+        case (scanGrams[scanIdx]) matches
+            tagged Valid .g: if (hit) begin
+                gram.lookupReq(g.gram, g.anchor);
+                gramLookups <= gramLookups + 1;
+            end
+            tagged Invalid:  noAction;
+        endcase
+        if (scanIdx == fromInteger(valueOf(NBitmapLanes) - 1))
+            scanBusy <= False;
+        else
+            scanIdx <= scanIdx + 1;
+    endrule
 
-	rule finish (started && state == ST_DONE);
-		started <= False;
-		state <= ST_IDLE;
-		doneQ.enq(True);
-	endrule
+    rule collectGramHits(state == KProcess);
+        let r <- gram.lookupResp;
+        case (r) matches
+            tagged Valid .vr: begin
+                gramHits <= gramHits + 1;
+                exactChecks <= exactChecks + 1;
+                $display("KM gramHit rule=%0d anchor=%0d pre=%0d post=%0d len=%0d payLen=%0d",
+                         vr.ruleId, vr.anchor, vr.pre, vr.post, vr.len, payLen);
+                exactMatch.putRequest(vr, payLen);
+            end
+            tagged Invalid: noAction;
+        endcase
+    endrule
 
-	Vector#(MemPortCnt, MemPortIfc) mem_;
-	for (Integer i = 0; i < valueOf(MemPortCnt); i = i + 1) begin
-		mem_[i] = interface MemPortIfc;
-			method ActionValue#(MemPortReq) readReq;
-				let r = readReqQs[i].first;
-				readReqQs[i].deq;
-				return r;
-			endmethod
-			method ActionValue#(MemPortReq) writeReq;
-				let r = writeReqQs[i].first;
-				writeReqQs[i].deq;
-				return r;
-			endmethod
-			method ActionValue#(Bit#(512)) writeWord;
-				let w = writeWordQs[i].first;
-				writeWordQs[i].deq;
-				return w;
-			endmethod
-			method Action readWord(Bit#(512) word);
-				readWordQs[i].enq(word);
-			endmethod
-		endinterface;
-	end
+    rule drainExact(state == KProcess && !exactMatch.inputPending && exactMatch.notEmpty);
+        let r <- exactMatch.getResult;
+        $display("KM exactResult hit=%b ruleId=%0d matchPos=%0d", r.hit, r.ruleId, r.matchPos);
+        if (r.hit) begin
+            exactHits <= exactHits + 1;
+            portChecks <= portChecks + 1;
+            portMatch.putMeta(PomPktMeta {
+                ruleId:     r.ruleId,
+                ipProto:    pktParser.getProto,
+                srcPort:    pktParser.getSrcPort,
+                dstPort:    pktParser.getDstPort,
+                icmpType:   pktParser.getIcmpType,
+                icmpCode:   pktParser.getIcmpCode,
+                isTcp:      pktParser.isTcp,
+                isUdp:      pktParser.isUdp,
+                isIcmp:     pktParser.isIcmp,
+                matchPos:   r.matchPos,
+                payloadLen: payLen
+            });
+        end else begin
+            exactMisses <= exactMisses + 1;
+            resultWriter.addResult(False, 0);
+            payBuf  <= 0;
+            payBufN <= 0;
+            payLen  <= 0;
+            pktReader.nextPacket;
+        end
+    endrule
 
+    rule collectPortResult(state == KProcess && portMatch.outputReady);
+        let pr <- portMatch.getResult;
+        $display("KM portResult hit=%b ruleId=%0d", pr.hit, pr.ruleId);
+        if (pr.hit)
+            portHits <= portHits + 1;
+        else
+            portMisses <= portMisses + 1;
+        resultWriter.addResult(pr.hit, pr.ruleId);
+        payBuf  <= 0;
+        payBufN <= 0;
+        payLen  <= 0;
+        pktReader.nextPacket;
+    endrule
 
-	method Action start(Bit#(32) param) if (!started);
-		startQ.enq(True);
-	endmethod
-	method ActionValue#(Bool) done;
-		let d = doneQ.first;
-		doneQ.deq;
-		return d;
-	endmethod
-	interface mem = mem_;
+    rule completePktNoMatch(
+        state == KProcess &&
+        pktReader.pktDone &&
+        ngram.idle &&
+        bitmap.idle &&
+        gram.idle &&
+        !gramSideQ.notEmpty &&
+        !hitPairQ.notEmpty &&
+        !scanBusy &&
+        !exactMatch.inputPending &&
+        !exactMatch.notEmpty &&
+        portMatch.idle
+    );
+        noMatchPkts <= noMatchPkts + 1;
+        resultWriter.addResult(False, 0);
+        payBuf  <= 0;
+        payBufN <= 0;
+        payLen  <= 0;
+        pktReader.nextPacket;
+    endrule
+
+    rule doProcDone(state == KProcess && pktReader.allDone);
+        $display("KM process done");
+        timerPkt.markDone;
+        timerTotal.markDone;
+        state <= KWrite;
+    endrule
+
+    rule doInit(state == KInit && dataLoader.loadDone);
+        $display("KM init done");
+        timerDb.markDone;
+        timerPkt.markStart;
+        pktReader.startRead(rPktBase, rPktCount);
+        state <= KProcess;
+    endrule
+
+    rule doWrite(state == KWrite);
+        $display("KM write start");
+        let summary = ResultSummary {
+            dbCycles:           timerDb.elapsed,
+            pktCycles:          timerPkt.elapsed,
+            totalCycles:        timerTotal.elapsed,
+            dataLoaderCycles:   dataLoaderCycles,
+            packetReaderCycles: packetReaderCycles,
+            packetParserCycles: packetParserCycles,
+            ngramCycles:        ngramCycles,
+            bitmapCycles:       bitmapCycles,
+            gramCycles:         gramCycles,
+            exactCycles:        exactCycles,
+            portCycles:         portCycles,
+            resultWriterCycles: resultWriterCycles,
+            gramsExtracted:     gramsExtracted,
+            bitmapPassed:       bitmapPassed,
+            gramLookups:        gramLookups,
+            gramHits:           gramHits,
+            exactChecks:        exactChecks,
+            exactHits:          exactHits,
+            exactMisses:        exactMisses,
+            portChecks:         portChecks,
+            portHits:           portHits,
+            portMisses:         portMisses,
+            noMatchPkts:        noMatchPkts
+        };
+        resultSummary <= summary;
+        resultWriter.startWrite(rResultBase, rPktCount, summary);
+        state <= KDone;
+    endrule
+
+    rule doDone(state == KDone && resultWriter.writeDone);
+        $display("KM done");
+        doneQ.enq(True);
+        state <= KIdle;
+    endrule
+
+    // --- AXI port interfaces ---
+    Vector#(3, MemPortIfc) mem_;
+    for (Integer i = 0; i < 3; i = i + 1) begin
+        mem_[i] = interface MemPortIfc;
+            method ActionValue#(MemReq) readReq;
+                let r = rdReqQs[i].first; rdReqQs[i].deq; return r;
+            endmethod
+            method ActionValue#(MemReq) writeReq;
+                let r = wrReqQs[i].first; wrReqQs[i].deq; return r;
+            endmethod
+            method ActionValue#(Bit#(512)) writeWord;
+                let w = wrWordQs[i].first; wrWordQs[i].deq; return w;
+            endmethod
+            method Action readWord(Bit#(512) word);
+                rdWordQs[i].enq(word);
+            endmethod
+        endinterface;
+    end
+
+    method Action start(Bit#(32) pktCount, Bit#(32) dbBytes,
+                        Bit#(64) dbBase, Bit#(64) pktBase, Bit#(64) resultBase)
+            if (state == KIdle);
+        rPktCount   <= pktCount;
+        rPktBase    <= pktBase;
+        rResultBase <= resultBase;
+        dataLoaderCycles   <= 0;
+        packetReaderCycles <= 0;
+        packetParserCycles <= 0;
+        ngramCycles        <= 0;
+        bitmapCycles       <= 0;
+        gramCycles         <= 0;
+        exactCycles        <= 0;
+        portCycles         <= 0;
+        resultWriterCycles <= 0;
+        gramsExtracted     <= 0;
+        bitmapPassed       <= 0;
+        gramLookups        <= 0;
+        gramHits           <= 0;
+        exactChecks        <= 0;
+        exactHits          <= 0;
+        exactMisses        <= 0;
+        portChecks         <= 0;
+        portHits           <= 0;
+        portMisses         <= 0;
+        noMatchPkts        <= 0;
+        resultSummary      <= unpack(0);
+        payBuf             <= 0;
+        payBufN            <= 0;
+        payLen             <= 0;
+        timerTotal.markStart;
+        timerDb.markStart;
+        dataLoader.startLoad(dbBase, dbBytes);
+        state <= KInit;
+    endmethod
+
+    method ActionValue#(Bool) done;
+        let d = doneQ.first; doneQ.deq; return d;
+    endmethod
+
+    interface mem = mem_;
 endmodule
+
+endpackage
