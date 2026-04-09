@@ -168,6 +168,12 @@ module mkPortOffsetMatcher(PortOffsetMatcherIfc);
         Bool groupHit = (grp != POM_None);
         Bool winOk    = groupHit && inWindow(pomIsBig(winE), pomOffset(winE), m.matchPos, m.payloadLen);
 
+        $display("POM meta tcp=%0d udp=%0d icmp=%0d src=%0d dst=%0d proto=%0d matchPos=%0d payloadLen=%0d",
+                 pack(m.isTcp), pack(m.isUdp), pack(m.isIcmp), m.srcPort, m.dstPort, m.ipProto, m.matchPos, m.payloadLen);
+        $display("POM hits tcpDst=%0d tcpSrc=%0d udpDst=%0d udpSrc=%0d ip=%0d icmp=%0d grp=%0d valid=%0d isBig=%0d off=%0d winOk=%0d",
+                 pack(tcpDstHit), pack(tcpSrcHit), pack(udpDstHit), pack(udpSrcHit), pack(ipHit), pack(icmpHit),
+                 pack(grp), pack(pomValid(winE)), pack(pomIsBig(winE)), pomOffset(winE), pack(winOk));
+
         outQ.enq(PomResult {
             hit:    winOk,
             ruleId: winOk ? m.ruleId : 0,
