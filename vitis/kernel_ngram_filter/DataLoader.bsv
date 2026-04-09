@@ -55,7 +55,7 @@ module mkDataLoader#(
     Reg#(Bit#(32))  ghtDone  <- mkReg(0);
 
     Reg#(Bit#(32)) portWord  <- mkReg(0);
-    Reg#(Bit#(5))  portSubIdx<- mkReg(0);
+    Reg#(Bit#(4))  portSubIdx<- mkReg(0);
 
     function RuleInfo unpackRuleInfo(Bit#(128) raw);
         return RuleInfo {
