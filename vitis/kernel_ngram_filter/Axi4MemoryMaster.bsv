@@ -104,6 +104,11 @@ module mkAxi4MemoryMaster (Axi4MemoryMasterIfc#(addrSz,dataSz))
 	Integer maxBurstBytes = maxBurstWords*(valueOf(dataSz)/8);
 	Integer wordByteSzBits = valueOf(TLog#(dataSz))-3; // -3 for bytes
 
+	function Bit#(8) burstLenForBytes(Bit#(addrSz) sizeBytes);
+		Bit#(addrSz) beats = (sizeBytes + fromInteger((valueOf(dataSz) / 8) - 1)) >> wordByteSzBits;
+		return truncate(beats - 1);
+	endfunction
+
 	Reg#(Bit#(addrSz)) writeBurstCurAddr <- mkReg(0);
 	Reg#(Bit#(addrSz)) writeBurstBytesLeft <- mkReg(0);
 
@@ -116,7 +121,7 @@ module mkAxi4MemoryMaster (Axi4MemoryMasterIfc#(addrSz,dataSz))
 
 				writeBurstSubQ.enq(tuple2(writeBurstCurAddr, fromInteger(maxBurstWords-1))); // because 0 is one beat
 			end else begin
-				writeBurstSubQ.enq(tuple2(writeBurstCurAddr, truncate((writeBurstBytesLeft>>wordByteSzBits)-1))); // because 0 is one beat
+				writeBurstSubQ.enq(tuple2(writeBurstCurAddr, burstLenForBytes(writeBurstBytesLeft))); // because 0 is one beat
 				writeBurstBytesLeft <= 0;
 			end
 		end else begin
@@ -129,7 +134,7 @@ module mkAxi4MemoryMaster (Axi4MemoryMasterIfc#(addrSz,dataSz))
 				writeBurstBytesLeft <= rsz - fromInteger(maxBurstBytes); 
 				writeBurstCurAddr <= raddr + fromInteger(maxBurstBytes); 
 			end else begin
-				writeBurstSubQ.enq(tuple2(raddr,truncate((rsz>>wordByteSzBits)-1))); // because 0 is one beat
+				writeBurstSubQ.enq(tuple2(raddr,burstLenForBytes(rsz))); // because 0 is one beat
 			end
 		end
 	endrule
@@ -177,7 +182,7 @@ module mkAxi4MemoryMaster (Axi4MemoryMasterIfc#(addrSz,dataSz))
 
 				readBurstSubQ.enq(tuple2(readBurstCurAddr, fromInteger(maxBurstWords-1))); // because 0 is one beat
 			end else begin
-				readBurstSubQ.enq(tuple2(readBurstCurAddr, truncate((readBurstBytesLeft>>wordByteSzBits)-1))); // because 0 is one beat
+				readBurstSubQ.enq(tuple2(readBurstCurAddr, burstLenForBytes(readBurstBytesLeft))); // because 0 is one beat
 				readBurstBytesLeft <= 0;
 			end
 		end else begin
@@ -190,18 +195,29 @@ module mkAxi4MemoryMaster (Axi4MemoryMasterIfc#(addrSz,dataSz))
 				readBurstBytesLeft <= rsz - fromInteger(maxBurstBytes); 
 				readBurstCurAddr <= raddr + fromInteger(maxBurstBytes); 
 			end else begin
-				readBurstSubQ.enq(tuple2(raddr,truncate((rsz>>wordByteSzBits)-1))); // because 0 is one beat
+				readBurstSubQ.enq(tuple2(raddr,burstLenForBytes(rsz))); // because 0 is one beat
 			end
 		end
 	endrule
 
-	PulseWire readAddressReadyW <- mkPulseWire;
-	RWire#(Tuple2#(Bit#(addrSz),Bit#(8))) readAddressW <- mkRWire;
-	rule applyReadAddress;
-		if ( readAddressReadyW ) begin
-			readBurstSubQ.deq;
-			readAddressW.wset(readBurstSubQ.first);
-		end
+	// AXI4 requires arvalid to stay asserted until arready.
+	// Use a register to hold the pending address, so arvalid stays True
+	// even if arready arrives many cycles after readBurstSubQ is populated.
+	PulseWire         readAddressReadyW <- mkPulseWire;
+	Reg#(Bool)        readAddrValid     <- mkReg(False);
+	Reg#(Bit#(addrSz)) readAddrAddr    <- mkRegU;
+	Reg#(Bit#(8))     readAddrLen      <- mkRegU;
+
+	rule loadReadAddr(!readAddrValid && readBurstSubQ.notEmpty);
+		let item = readBurstSubQ.first;
+		readBurstSubQ.deq;
+		readAddrAddr  <= tpl_1(item);
+		readAddrLen   <= tpl_2(item);
+		readAddrValid <= True;
+	endrule
+
+	rule clearReadAddr(readAddrValid && readAddressReadyW);
+		readAddrValid <= False;
 	endrule
 	
 	PulseWire readDataValidW <- mkPulseWire;
@@ -262,18 +278,16 @@ module mkAxi4MemoryMaster (Axi4MemoryMasterIfc#(addrSz,dataSz))
 	
 		// write read addr to axi
 		method Bool arvalid;
-			return isValid(readAddressW.wget);
+			return readAddrValid;
 		endmethod
 		method Action read_address_ready ( Bool arready);
-			if ( arready ) readAddressReadyW.send;
+			if ( arready && readAddrValid ) readAddressReadyW.send;
 		endmethod
 		method Bit#(addrSz) araddr;
-			let a = fromMaybe(?,readAddressW.wget);
-			return tpl_1(a);
+			return readAddrAddr;
 		endmethod
 		method Bit#(8) arlen;
-			let a = fromMaybe(?,readAddressW.wget);
-			return tpl_2(a);
+			return readAddrLen;
 		endmethod
 
 
