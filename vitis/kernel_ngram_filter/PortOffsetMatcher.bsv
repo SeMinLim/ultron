@@ -11,7 +11,7 @@ typedef enum {
     POM_IpProto,
     POM_IcmpTypeCode,
     POM_None
-} PlmGroup deriving (Bits, Eq, FShow);
+} PomGroup deriving (Bits, Eq, FShow);
 
 typedef struct {
     Bit#(16) ruleId;
@@ -25,29 +25,29 @@ typedef struct {
     Bool     isIcmp;
     Bit#(32) matchPos;
     Bit#(32) payloadLen;
-} PlmPktMeta deriving (Bits, Eq, FShow);
+} PomPktMeta deriving (Bits, Eq, FShow);
 
 typedef struct {
     Bool     hit;
     Bit#(16) ruleId;
-    PlmGroup group;
+    PomGroup group;
     Bool     isBig;
     Bit#(32) offset;
-} PlmResult deriving (Bits, Eq, FShow);
+} PomResult deriving (Bits, Eq, FShow);
 
-// PlmEntry (32-bit): [0]=valid [1]=isBig [15:2]=offset[13:0] [31:16]=matchKey
-typedef Bit#(32) PlmEntry;
+// PomEntry (32-bit): [0]=valid [1]=isBig [15:2]=offset[13:0] [31:16]=matchKey
+typedef Bit#(32) PomEntry;
 
-function Bool     plmValid(PlmEntry e)    = (e[0:0] != 0);
-function Bool     plmIsBig(PlmEntry e)    = (e[1:1] != 0);
-function Bit#(32) plmOffset(PlmEntry e)   = zeroExtend(e[15:2]);
-function Bit#(16) plmPortKey(PlmEntry e)  = e[31:16];
-function Bit#(8)  plmProtoKey(PlmEntry e) = e[23:16];
-function Bit#(8)  plmIcmpCode(PlmEntry e) = e[23:16];
+function Bool     pomValid(PomEntry e)    = (e[0:0] != 0);
+function Bool     pomIsBig(PomEntry e)    = (e[1:1] != 0);
+function Bit#(32) pomOffset(PomEntry e)   = zeroExtend(e[15:2]);
+function Bit#(16) pomPortKey(PomEntry e)  = e[31:16];
+function Bit#(8)  pomProtoKey(PomEntry e) = e[23:16];
+function Bit#(8)  pomIcmpCode(PomEntry e) = e[23:16];
 
 interface PortOffsetMatcherIfc;
-    method Action putMeta(PlmPktMeta meta);
-    method ActionValue#(PlmResult) getResult;
+    method Action putMeta(PomPktMeta meta);
+    method ActionValue#(PomResult) getResult;
     method Bool inputReady;
     method Bool outputReady;
     // DbLoader init: port bitmap BRAMs (128 × 512-bit), tbl: 0=tcpDst 1=tcpSrc 2=udpDst 3=udpSrc
@@ -89,9 +89,9 @@ module mkPortOffsetMatcher(PortOffsetMatcherIfc);
     icmpCfg.outFIFODepth = 2;
     BRAM2Port#(Bit#(8), Bit#(32)) icmpWin <- mkBRAM2Server(icmpCfg);
 
-    FIFOF#(PlmPktMeta) pendingQ <- mkSizedFIFOF(16);
-    FIFOF#(PlmPktMeta) stageBuf <- mkSizedFIFOF(2);
-    FIFOF#(PlmResult)  outQ     <- mkSizedFIFOF(16);
+    FIFOF#(PomPktMeta) pendingQ <- mkSizedFIFOF(16);
+    FIFOF#(PomPktMeta) stageBuf <- mkSizedFIFOF(2);
+    FIFOF#(PomResult)  outQ     <- mkSizedFIFOF(16);
 
     function Bool bmBitHit(Bit#(512) line, Bit#(9) pos);
         Bit#(512) shifted = line >> pos;
@@ -142,14 +142,14 @@ module mkPortOffsetMatcher(PortOffsetMatcherIfc);
         let ipProtoE <- ipProtoWin.portA.response.get();
         let icmpE    <- icmpWin.portA.response.get();
 
-        Bool tcpDstHit = m.isTcp && bmBitHit(tcpDstLine, m.dstPort[8:0]) && plmValid(tcpDstE) && plmPortKey(tcpDstE) == m.dstPort;
-        Bool tcpSrcHit = m.isTcp && bmBitHit(tcpSrcLine, m.srcPort[8:0]) && plmValid(tcpSrcE) && plmPortKey(tcpSrcE) == m.srcPort;
-        Bool udpDstHit = m.isUdp && bmBitHit(udpDstLine, m.dstPort[8:0]) && plmValid(udpDstE) && plmPortKey(udpDstE) == m.dstPort;
-        Bool udpSrcHit = m.isUdp && bmBitHit(udpSrcLine, m.srcPort[8:0]) && plmValid(udpSrcE) && plmPortKey(udpSrcE) == m.srcPort;
-        Bool ipHit     = plmValid(ipProtoE) && plmProtoKey(ipProtoE) == m.ipProto;
-        Bool icmpHit   = m.isIcmp && plmValid(icmpE) && (plmIcmpCode(icmpE) == 8'hFF || plmIcmpCode(icmpE) == m.icmpCode);
+        Bool tcpDstHit = m.isTcp && bmBitHit(tcpDstLine, m.dstPort[8:0]) && pomValid(tcpDstE) && pomPortKey(tcpDstE) == m.dstPort;
+        Bool tcpSrcHit = m.isTcp && bmBitHit(tcpSrcLine, m.srcPort[8:0]) && pomValid(tcpSrcE) && pomPortKey(tcpSrcE) == m.srcPort;
+        Bool udpDstHit = m.isUdp && bmBitHit(udpDstLine, m.dstPort[8:0]) && pomValid(udpDstE) && pomPortKey(udpDstE) == m.dstPort;
+        Bool udpSrcHit = m.isUdp && bmBitHit(udpSrcLine, m.srcPort[8:0]) && pomValid(udpSrcE) && pomPortKey(udpSrcE) == m.srcPort;
+        Bool ipHit     = pomValid(ipProtoE) && pomProtoKey(ipProtoE) == m.ipProto;
+        Bool icmpHit   = m.isIcmp && pomValid(icmpE) && (pomIcmpCode(icmpE) == 8'hFF || pomIcmpCode(icmpE) == m.icmpCode);
 
-        PlmGroup grp =
+        PomGroup grp =
             tcpDstHit ? POM_TcpDstPort   :
             tcpSrcHit ? POM_TcpSrcPort   :
             udpDstHit ? POM_UdpDstPort   :
@@ -158,7 +158,7 @@ module mkPortOffsetMatcher(PortOffsetMatcherIfc);
             icmpHit   ? POM_IcmpTypeCode :
                         POM_None;
 
-        PlmEntry winE =
+        PomEntry winE =
             tcpDstHit ? tcpDstE  :
             tcpSrcHit ? tcpSrcE  :
             udpDstHit ? udpDstE  :
@@ -167,22 +167,22 @@ module mkPortOffsetMatcher(PortOffsetMatcherIfc);
             icmpHit   ? icmpE    : 0;
 
         Bool groupHit = (grp != POM_None);
-        Bool winOk    = groupHit && inWindow(plmIsBig(winE), plmOffset(winE), m.matchPos, m.payloadLen);
+        Bool winOk    = groupHit && inWindow(pomIsBig(winE), pomOffset(winE), m.matchPos, m.payloadLen);
 
-        outQ.enq(PlmResult {
+        outQ.enq(PomResult {
             hit:    winOk,
             ruleId: winOk ? m.ruleId : 0,
             group:  winOk ? grp : POM_None,
-            isBig:  plmIsBig(winE),
-            offset: plmOffset(winE)
+            isBig:  pomIsBig(winE),
+            offset: pomOffset(winE)
         });
     endrule
 
-    method Action putMeta(PlmPktMeta meta) if (pendingQ.notFull);
+    method Action putMeta(PomPktMeta meta) if (pendingQ.notFull);
         pendingQ.enq(meta);
     endmethod
 
-    method ActionValue#(PlmResult) getResult if (outQ.notEmpty);
+    method ActionValue#(PomResult) getResult if (outQ.notEmpty);
         let r = outQ.first; outQ.deq; return r;
     endmethod
 
