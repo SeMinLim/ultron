@@ -36,21 +36,19 @@ bool verify_ms_bitmap(Bitmap *b_arr, Bitmap *v_arr, SingletonResult *sr) {
         }
 
         // Checking verifying & next stage.
-        for (int cur_stage=0; cur_stage < stage-1; cur_stage++) {
+        for (int cur_stage = 0; cur_stage < stage - 1; cur_stage++) {
+
             Bitmap* curr_v_bm = v_arr + cur_stage;
-            if(!bitmap_test_gram(curr_v_bm, gram)) {
+            if (!bitmap_test_gram(curr_v_bm, gram)) {
                 res = false;
                 break;
             }
 
-            uint8_t* next_gram = malloc((size_t) (sizeof(uint8_t) * 3));
-            memcpy(
-                next_gram, 
-                next_grams + (cur_stage * 3), 
-                (size_t) (sizeof(uint8_t) * 3)
-            );
+            uint8_t next_gram[3];
+            memcpy(next_gram, next_grams + (cur_stage * 3), 3);
+
             Bitmap* curr_bm = b_arr + (cur_stage + 1);
-            if(!bitmap_test_gram(curr_bm, next_gram)) {
+            if (!bitmap_test_gram(curr_bm, next_gram)) {
                 res = false;
                 break;
             }
