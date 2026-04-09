@@ -12,6 +12,7 @@
 #include "packet_parser.h"
 
 #define N 3
+// #define MAX_STAGE 4
 
 static int cmp_gram(const void *a, const void *b) { return memcmp(a, b, N); }
 
@@ -27,6 +28,8 @@ int main(int argc, char *argv[])
 {
     const char *rule_file = (argc > 1) ? argv[1] : "rule.txt";
     const char *pcap_file = (argc > 2) ? argv[2] : NULL;
+    const char MAX_STAGE = (argc > 3) ? atoi(argv[3]) : 4;
+    const char verbose = (argc > 4) ? atoi(argv[3]) : 1;
 
     RuleSet *rs = rules_load(rule_file);
     if (!rs) {
@@ -71,7 +74,7 @@ int main(int argc, char *argv[])
     free(buf);
 
     printf("=== singleton build ===\n");
-    SingletonResult *sr = singleton_build(rs);
+    SingletonResult *sr = singleton_build(rs, MAX_STAGE);
     if (!sr) {
         fprintf(stderr, "singleton_build failed\n");
         rules_free(rs);
@@ -89,23 +92,63 @@ int main(int argc, char *argv[])
     printf("singletons : %d  (degree=1, unique gram)\n", n_singleton);
     printf("shared     : %d  (degree>1, gram in multiple rules)\n\n", n_shared);
 
-    printf("%-6s  %-10s  %-5s  %-4s  %-4s  %s\n",
-           "ruleid", "gram", "pos", "pre", "post", "deg");
-    printf("------  ----------  -----  ----  ----  ---\n");
-    for (int i = 0; i < sr->count; i++) {
-        GramAssign *a = &sr->assigns[i];
-        printf("%-6d  ", a->rule_id);
-        print_gram(a->gram);
-        printf("%-7s  %-5d  %-4d  %-4d  %d\n",
-               "", a->gram_pos, a->pre_offset, a->post_offset, a->degree);
+
+    if (verbose > 0) {
+        printf("%-6s  %-10s  %-5s  %-4s  %-4s  %-3s  %-5s  %s\n",
+            "ruleid", "gram", "pos", "pre", "post", "deg", "stage", "next_grams");
+        printf("------  ----------  -----  ----  ----  ---  -----  ----------\n");
+
+
+        int print_range = (verbose > 1) ? sr->count : (n_singleton < 5 ? sr->count : 5);
+
+        for (int i = 0; i < print_range; i++) {
+            GramAssign *a = &sr->assigns[i];
+            printf("%-6d  ", a->rule_id);
+            print_gram(a->gram);
+            printf("%-7s  %-5d  %-4d  %-4d  %-3d  %-5d  ",
+                "", a->gram_pos, a->pre_offset, a->post_offset, a->degree, a->stage);
+            if (a->next_grams) {
+                for (int j = 0; j < a->stage - 1; j++) {
+                    print_gram(&a->next_grams[j * N]);
+                }
+            }
+            printf("\n");
+        }
     }
 
     printf("\n=== bitmap build ===\n");
     Bitmap *bm = calloc(1, sizeof(Bitmap));
     bitmap_clear(bm);
-
     for (int i = 0; i < sr->count; i++)
         bitmap_set_gram(bm, sr->assigns[i].gram);
+
+    Bitmap* bm_arr = malloc(MAX_STAGE * sizeof(Bitmap));
+    Bitmap* bm_verifier_arr = malloc((MAX_STAGE-1) * sizeof(Bitmap));
+    for (int i=0; i < (MAX_STAGE-1); i ++)
+        bitmap_clear(bm_verifier_arr + i);
+    for (int i=0; i < MAX_STAGE; i ++)
+        bitmap_clear(bm_arr + i);
+
+    for (int i = 0; i < sr->count; i++) {
+        uint8_t* gram = sr->assigns[i].gram;
+        int stage = sr->assigns[i].stage;
+        bitmap_set_gram(bm_arr, gram);
+
+        for (int cur_stage = 1; cur_stage < stage; cur_stage++) {
+            Bitmap* current_verifier = bm_verifier_arr + (cur_stage-1);
+            bitmap_set_gram(current_verifier, gram);
+
+            uint8_t next_gram[N];
+            memcpy(
+                next_gram,
+                sr->assigns[i].next_grams + ((cur_stage - 1) * N),
+                (size_t)N
+            );
+            Bitmap* current_stage = bm_arr + cur_stage;
+            bitmap_set_gram(current_stage, next_gram);
+        }
+    }
+
 
     int verify_ok = 1;
     for (int i = 0; i < sr->count; i++) {
@@ -121,9 +164,12 @@ int main(int argc, char *argv[])
         while (b) { bits_set += b & 1; b >>= 1; }
     }
 
-    printf("grams in bitmap : %d\n", bits_set);
-    printf("bitmap size     : %d bytes (256KB)\n", (int)BITMAP_BYTES);
-    printf("verify          : %s\n", verify_ok ? "OK" : "FAIL");
+    bool ms_verify_res = verify_ms_bitmap(bm_arr, bm_verifier_arr, sr);
+
+    printf("grams in bitmap     : %d\n", bits_set);
+    printf("bitmap size         : %d bytes (256KB)\n", (int)BITMAP_BYTES);
+    printf("verify              : %s\n", verify_ok ? "OK" : "FAIL");
+    printf("ms_verify           : %s\n", ms_verify_res ? "OK" : "FAIL");
 
     printf("\n=== matching stage ===\n");
     MatchCtx        mctx;
@@ -159,11 +205,12 @@ int main(int argc, char *argv[])
                                      candidates, nc < 1024 ? nc : 1024,
                                      rs, matches, 256);
                 if (nm > 0) n_matched_pkts++;
-
-                for (int j = 0; j < nm; j++)
-                    printf("  [ALERT] frame=%-5d  rule=%-4d  anchor=%-4d\n",
-                           n_frames, matches[j].rule_id, matches[j].anchor);
-
+                
+                if (verbose > 1) {
+                    for (int j = 0; j < nm; j++)
+                        printf("  [ALERT] frame=%-5d  rule=%-4d  anchor=%-4d\n",
+                            n_frames, matches[j].rule_id, matches[j].anchor);
+                }
                 pcap_frame_free(&frame);
             }
 
@@ -231,6 +278,8 @@ int main(int argc, char *argv[])
     match_destroy(&mctx);
 
     free(bm);
+    free(bm_arr);
+    free(bm_verifier_arr);
     singleton_free(sr);
     rules_free(rs);
     return 0;
