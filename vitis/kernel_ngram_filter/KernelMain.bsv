@@ -37,7 +37,7 @@ endinterface
 
 typedef 3 MemPortCnt;
 
-typedef enum { KIdle, KInit, KProcess, KWrite, KDone } KState deriving (Bits, Eq, FShow);
+typedef enum { KIdle, KInit, KProcess, KWritePrep, KWrite, KDone } KState deriving (Bits, Eq, FShow);
 
 module mkKernelMain(KernelMainIfc);
 
@@ -331,7 +331,7 @@ module mkKernelMain(KernelMainIfc);
         $display("KM process done");
         timerPkt.markDone;
         timerTotal.markDone;
-        state <= KWrite;
+        state <= KWritePrep;
     endrule
 
     rule doInit(state == KInit && dataLoader.loadDone);
@@ -342,8 +342,7 @@ module mkKernelMain(KernelMainIfc);
         state <= KProcess;
     endrule
 
-    rule doWrite(state == KWrite);
-        $display("KM write start");
+    rule captureWriteSummary(state == KWritePrep);
         let summary = ResultSummary {
             dbCycles:           timerDb.elapsed,
             pktCycles:          timerPkt.elapsed,
@@ -370,7 +369,12 @@ module mkKernelMain(KernelMainIfc);
             noMatchPkts:        noMatchPkts
         };
         resultSummary <= summary;
-        resultWriter.startWrite(rResultBase, rPktCount, summary);
+        state <= KWrite;
+    endrule
+
+    rule doWrite(state == KWrite);
+        $display("KM write start");
+        resultWriter.startWrite(rResultBase, rPktCount, resultSummary);
         state <= KDone;
     endrule
 

@@ -15,7 +15,6 @@ interface ResultWriterIfc;
     method Action startWrite(Bit#(64) resultBase, Bit#(32) pktCount,
                              ResultSummary summary);
     method Bool   writeDone;
-    // AXI write port (wired to mem port 2)
     method ActionValue#(Tuple2#(Bit#(64), Bit#(64))) writeReq;
     method ActionValue#(Bit#(512)) writeWord;
 endinterface
@@ -64,10 +63,9 @@ module mkResultWriter(ResultWriterIfc);
     Reg#(Bit#(32)) wordsLeft     <- mkReg(0);  // per-packet words to write
     Reg#(ResultSummary) summaryR <- mkReg(unpack(0));
 
-    // Pack 16 × 32-bit per-packet entries into 512-bit words
     Reg#(Vector#(16, Bit#(32))) pktBuf   <- mkReg(replicate(0));
-    Reg#(Bit#(5))               pktBufN  <- mkReg(0);  // entries in pktBuf
-    Reg#(Bit#(32))              pktsDone <- mkReg(0);   // packets written
+    Reg#(Bit#(5))               pktBufN  <- mkReg(0);
+    Reg#(Bit#(32))              pktsDone <- mkReg(0);
 
     rule writeSummary0(writing && summaryWordsLeft == 2 && !done && writeWordQ.notFull);
         Bit#(512) sumWord = 0;
@@ -104,7 +102,7 @@ module mkResultWriter(ResultWriterIfc);
         sumWord[287:256] = summaryR.noMatchPkts;
         writeWordQ.enq(sumWord);
         summaryWordsLeft <= 0;
-        wordsLeft <= (pktTotal + 15) / 16;  // ceiling div: per-packet words
+        wordsLeft <= (pktTotal + 15) / 16;
         pktsDone  <= 0;
         pktBufN   <= 0;
         pktBuf    <= replicate(0);
@@ -144,7 +142,6 @@ module mkResultWriter(ResultWriterIfc);
         resultBase_r  <= resultBase;
         pktTotal      <= pktCount;
         summaryR      <= summary;
-        // Issue write request: 128B summary + pktCount × 4B (padded to 64B boundary)
         Bit#(64) totalBytes = 128 + zeroExtend((pktCount + 15) / 16) * 64;
         writeReqQ.enq(tuple2(resultBase, totalBytes));
         writing   <= True;
