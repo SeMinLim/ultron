@@ -1,12 +1,5 @@
 package GramIdTable;
 
-// URAM-backed gram→rule-metadata table.
-// CuckooHash#(32, 40, 14): keySz=32 (gram), valSz=40 (RuleInfo packed), logSz=14.
-// In synthesis, RegFile with 2^14 × (32+1+40) entries maps to URAM banks.
-// Requires keySz >= 2*logSz: 32 >= 28. OK.
-//
-// RuleInfo packed as 40-bit cuckoo value:
-//   [39:24] ruleId  [23:16] pre (int8)  [15:8] post (int8)  [7:0] len
 
 import CuckooHash::*;
 

@@ -2,6 +2,7 @@
 #include <string.h>
 #include <limits.h>
 #include "singleton.h"
+#include "bitmap.h"
 
 typedef struct { uint32_t *v; int n, cap; } U32Vec;
 
@@ -91,11 +92,6 @@ static void ght_free(GHT *ht)
     free(ht);
 }
 
-static inline uint32_t pack3(const uint8_t *p)
-{
-    return ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2];
-}
-
 SingletonResult *singleton_build(const RuleSet *rs)
 {
     int nr  = rs->count;
@@ -114,7 +110,7 @@ SingletonResult *singleton_build(const RuleSet *rs)
         const Rule *r = &rs->rules[rid];
         if (r->pat_len < 3) continue;
         for (int i = 0; i <= r->pat_len - 3; i++) {
-            uint32_t idx = pack3((const uint8_t *)r->pattern + i);
+            uint32_t idx = bitmap_idx((const uint8_t *)r->pattern + i);
             if (vec_has(&rule_grams[rid], idx)) continue;
             vec_push(&rule_grams[rid], idx);
             gnode_add_rule(ght_insert(ht, idx), rid);
@@ -195,14 +191,15 @@ SingletonResult *singleton_build(const RuleSet *rs)
 
         int gram_pos = 0;
         for (int i = 0; i <= r->pat_len - 3; i++) {
-            if (pack3((const uint8_t *)r->pattern + i) == gi) { gram_pos = i; break; }
+            if (bitmap_idx((const uint8_t *)r->pattern + i) == gi) {
+                gram_pos = i;
+                break;
+            }
         }
 
         GramAssign *a  = &res->assigns[res->count++];
         a->gram_idx    = gi;
-        a->gram[0]     = (uint8_t)(gi >> 16);
-        a->gram[1]     = (uint8_t)(gi >>  8);
-        a->gram[2]     = (uint8_t)(gi      );
+        memcpy(a->gram, r->pattern + gram_pos, sizeof(a->gram));
         a->rule_id     = r->id;
         a->gram_pos    = gram_pos;
         a->pre_offset  = -gram_pos;

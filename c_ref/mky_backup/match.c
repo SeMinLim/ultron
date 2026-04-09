@@ -43,9 +43,7 @@ int match_scan(const MatchCtx *ctx,
         if (!bitmap_test_gram(bm, pkt + anchor))
             continue;
 
-        int gidx = (int)(((uint32_t)pkt[anchor    ] << 16)
-                       | ((uint32_t)pkt[anchor + 1] <<  8)
-                       |  (uint32_t)pkt[anchor + 2]);
+        int gidx = (int)bitmap_idx(pkt + anchor);
 
         int base;
         if (!ht_lookup(ctx->ht, gidx, &base))

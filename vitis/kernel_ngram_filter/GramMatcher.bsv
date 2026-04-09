@@ -20,6 +20,7 @@ interface GramMatcherIfc;
     method Bool notBusy;
     method Action lookupReq(Bit#(32) gram, Bit#(32) anchor);
     method ActionValue#(Maybe#(VerifyReq)) lookupResp;
+    method Bool idle;
 endinterface
 
 (* synthesize *)
@@ -47,6 +48,8 @@ module mkGramMatcher(GramMatcherIfc);
             tagged Invalid: return tagged Invalid;
         endcase
     endmethod
+
+    method Bool idle = tbl.notBusy && !anchorQ.notEmpty;
 endmodule
 
 endpackage

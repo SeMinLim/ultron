@@ -122,7 +122,7 @@ int main(int argc, char *argv[])
     }
 
     printf("grams in bitmap : %d\n", bits_set);
-    printf("bitmap size     : %d bytes (2MB)\n", (int)BITMAP_BYTES);
+    printf("bitmap size     : %d bytes (256KB)\n", (int)BITMAP_BYTES);
     printf("verify          : %s\n", verify_ok ? "OK" : "FAIL");
 
     printf("\n=== matching stage ===\n");

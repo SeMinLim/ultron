@@ -5,7 +5,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-#define BITMAP_BITS  (1U << 24)
+#define BITMAP_BITS  (1U << 21)
 #define BITMAP_BYTES (BITMAP_BITS >> 3)
 #define BITMAP_GUARD 3
 
@@ -15,9 +15,9 @@ typedef struct {
 
 static inline uint32_t bitmap_idx(const uint8_t *gram)
 {
-    return ((uint32_t)gram[0] << 16)
-         | ((uint32_t)gram[1] <<  8)
-         |  (uint32_t)gram[2];
+    return ((uint32_t)(gram[0] & 0x7f) << 14)
+         | ((uint32_t)(gram[1] & 0x7f) <<  7)
+         |  (uint32_t)(gram[2] & 0x7f);
 }
 
 static inline void bitmap_set(Bitmap *b, uint32_t idx)
