@@ -1,8 +1,9 @@
 package CuckooHash;
 
-// https://www.geeksforgeeks.org/dsa/cuckoo-hashing/
+// ref: https://www.geeksforgeeks.org/dsa/cuckoo-hashing/
 
 import FIFO::*;
+import FIFOF::*;
 import RegFile::*;
 
 typedef struct {
@@ -41,9 +42,9 @@ module mkCuckooHash(CuckooHashIfc#(keySz, valSz, logSz))
 	Reg#(Bit#(logSz)) clearIdx <- mkReg(0);
 	Reg#(Bool)        clearAlt <- mkReg(False);
 
-	FIFO#(Bool)                 insertAckQ  <- mkFIFO;
-	FIFO#(Bit#(keySz))         lookupReqQ  <- mkFIFO;
-	FIFO#(Maybe#(Bit#(valSz))) lookupRespQ <- mkFIFO;
+	FIFOF#(Bool)                 insertAckQ  <- mkFIFOF;
+	FIFOF#(Bit#(keySz))         lookupReqQ  <- mkSizedFIFOF(128);
+	FIFOF#(Maybe#(Bit#(valSz))) lookupRespQ <- mkSizedFIFOF(128);
 
 	function Bit#(logSz) h0(Bit#(keySz) k) = truncate(k);
 	function Bit#(logSz) h1(Bit#(keySz) k) = truncate(k >> fromInteger(valueOf(logSz)));
@@ -65,7 +66,7 @@ module mkCuckooHash(CuckooHashIfc#(keySz, valSz, logSz))
 		end
 	endrule
 
-	rule doLookup (htState == HT_IDLE);
+	rule doLookup (htState == HT_IDLE && lookupReqQ.notEmpty);
 		let key = lookupReqQ.first;
 		lookupReqQ.deq;
 		let e0 = table0.sub(h0(key));
@@ -114,8 +115,7 @@ module mkCuckooHash(CuckooHashIfc#(keySz, valSz, logSz))
 	endmethod
 
 	method ActionValue#(Bool) insertAck;
-		insertAckQ.deq;
-		return insertAckQ.first;
+		let v = insertAckQ.first; insertAckQ.deq; return v;
 	endmethod
 
 	method Action lookupReq(Bit#(keySz) key);
@@ -123,8 +123,7 @@ module mkCuckooHash(CuckooHashIfc#(keySz, valSz, logSz))
 	endmethod
 
 	method ActionValue#(Maybe#(Bit#(valSz))) lookupResp;
-		lookupRespQ.deq;
-		return lookupRespQ.first;
+		let v = lookupRespQ.first; lookupRespQ.deq; return v;
 	endmethod
 
 	method Bool notBusy;
