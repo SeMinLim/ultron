@@ -50,9 +50,8 @@ interface PortOffsetMatcherIfc;
     method ActionValue#(PomResult) getResult;
     method Bool inputReady;
     method Bool outputReady;
-    // DbLoader init: port bitmap BRAMs (128 × 512-bit), tbl: 0=tcpDst 1=tcpSrc 2=udpDst 3=udpSrc
+    method Bool idle;
     method Action writeBitmap(Bit#(2) tbl, Bit#(7) addr, Bit#(512) data);
-    // DbLoader init: port window BRAMs (1024 × 32-bit), tbl: 0=tcpDst 1=tcpSrc 2=udpDst 3=udpSrc
     method Action writeWindow(Bit#(2) tbl, Bit#(10) addr, Bit#(32) data);
     method Action writeIpProto(Bit#(8) addr, Bit#(32) data);
     method Action writeIcmp(Bit#(8) addr, Bit#(32) data);
@@ -188,6 +187,7 @@ module mkPortOffsetMatcher(PortOffsetMatcherIfc);
 
     method Bool inputReady  = pendingQ.notFull;
     method Bool outputReady = outQ.notEmpty;
+    method Bool idle        = !pendingQ.notEmpty && !stageBuf.notEmpty && !outQ.notEmpty;
 
     method Action writeBitmap(Bit#(2) tbl, Bit#(7) addr, Bit#(512) data);
         let req = BRAMRequest { write: True, responseOnWrite: False, address: addr, datain: data };

@@ -1,9 +1,5 @@
 package BitmapUram;
 
-// key21 = {b0[6:0], b1[6:0], b2[6:0]}  (lower 7 bits of each gram byte)
-// line_addr = key21[20:9]   (12 bits → 512-bit line)
-// bit_index  = key21[8:0]   (9 bits  → bit within line)
-
 import BRAM::*;
 import FIFOF::*;
 import Vector::*;
@@ -14,6 +10,7 @@ interface BitmapUramIfc;
     method Action writeWord(Bit#(12) lineAddr, Bit#(512) data);
     method Action lookup(Vector#(NLanes, Bit#(21)) keys);
     method ActionValue#(Vector#(NLanes, Bool)) result;
+    method Bool idle;
 endinterface
 
 (* synthesize *)
@@ -59,6 +56,8 @@ module mkBitmapUram(BitmapUramIfc);
     method ActionValue#(Vector#(NLanes, Bool)) result;
         let v = resultQ.first; resultQ.deq; return v;
     endmethod
+
+    method Bool idle = !keyQ.notEmpty && !resultQ.notEmpty;
 endmodule
 
 endpackage

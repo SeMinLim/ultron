@@ -14,7 +14,6 @@ typedef enum {
     DLBitmap,
     DLGhtFetch,
     DLGhtUnpack,
-    DLGhtInsert,
     DLGhtAck,
     DLPattern,
     DLPortBitmap,
