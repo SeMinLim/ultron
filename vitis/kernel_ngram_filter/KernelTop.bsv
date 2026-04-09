@@ -1,3 +1,5 @@
+package KernelTop;
+
 import Axi4LiteControllerXrt::*;
 import Axi4MemoryMaster::*;
 
@@ -10,9 +12,11 @@ import KernelMain::*;
 
 interface KernelTopIfc;
 	(* always_ready *)
-	interface Axi4MemoryMasterPinsIfc#(64,512) in;
+	interface Axi4MemoryMasterPinsIfc#(64,512) db;
 	(* always_ready *)
-	interface Axi4MemoryMasterPinsIfc#(64,512) out;
+	interface Axi4MemoryMasterPinsIfc#(64,512) pkt;
+	(* always_ready *)
+	interface Axi4MemoryMasterPinsIfc#(64,512) result;
 	(* always_ready *)
 	interface Axi4LiteControllerXrtPinsIfc#(12,32) s_axi_control;
 	(* always_ready *)
@@ -24,18 +28,9 @@ module kernel (KernelTopIfc);
 	Clock defaultClock <- exposeCurrentClock;
 	Reset defaultReset <- exposeCurrentReset;
 
-	// AXI
 	Axi4LiteControllerXrtIfc#(12,32) axi4control <- mkAxi4LiteControllerXrt(defaultClock, defaultReset);
-	Vector#(2, Axi4MemoryMasterIfc#(64,512)) axi4mem <- replicateM(mkAxi4MemoryMaster_64_512);
-	
-	// KernelMain
+	Vector#(MemPortCnt, Axi4MemoryMasterIfc#(64,512)) axi4mem <- replicateM(mkAxi4MemoryMaster_64_512);
 	KernelMainIfc kernelMain <- mkKernelMain;
-
-	// Cycle Counter
-	Reg#(Bit#(32)) cycleCounter <- mkReg(0);
-	rule incCycle;
-		cycleCounter <= cycleCounter + 1;
-	endrule
 
 	Reg#(Bool) started <- mkReg(False);
 	rule assertControl;
@@ -44,22 +39,22 @@ module kernel (KernelTopIfc);
 		end
 	endrule
 
-	// Check Started if AXI controller is ready
-	FIFO#(Bit#(32)) startQ <- mkFIFO;
 	Reg#(Bool) last_ap_start <- mkReg(False);
-	rule checkStart; 
-		if ( !last_ap_start && axi4control.ap_start ) begin
-			startQ.enq(axi4control.scalar00);
-		end
+	rule sampleApStart ( last_ap_start != axi4control.ap_start );
 		last_ap_start <= axi4control.ap_start;
 	endrule
-	rule relayStart (!started);
-		startQ.deq;
-		kernelMain.start(startQ.first);
+
+	rule checkStart ( !last_ap_start && axi4control.ap_start && !started );
+		kernelMain.start(
+			axi4control.pktCount,
+			axi4control.dbBytes,
+			axi4control.dbBase,
+			axi4control.pktBase,
+			axi4control.resultBase
+		);
 		started <= True;
 	endrule
 
-	// Check KernelMain operation is finished
 	rule checkDone ( started );
 		Bool done <- kernelMain.done;
 		if ( done ) begin
@@ -73,13 +68,11 @@ module kernel (KernelTopIfc);
 	for ( Integer i = 0; i < valueOf(MemPortCnt); i=i+1 ) begin
 		rule relayReadReq00 ( started );
 			let r <- kernelMain.mem[i].readReq;
-			if ( i == 0 ) axi4mem[i].readReq(axi4control.mem_addr+r.addr,zeroExtend(r.bytes));
-			else axi4mem[i].readReq(axi4control.file_addr+r.addr,zeroExtend(r.bytes));
+			axi4mem[i].readReq(r.addr, r.bytes);
 		endrule
 		rule relayWriteReq ( started );
 			let r <- kernelMain.mem[i].writeReq;
-			if ( i == 0 ) axi4mem[i].writeReq(axi4control.mem_addr+r.addr,zeroExtend(r.bytes));
-			else axi4mem[i].writeReq(axi4control.file_addr+r.addr,zeroExtend(r.bytes));
+			axi4mem[i].writeReq(r.addr, r.bytes);
 		endrule
 		rule relayWriteWord ( started );
 			let r <- kernelMain.mem[i].writeWord;
@@ -92,8 +85,11 @@ module kernel (KernelTopIfc);
 	end
 
 
-	interface in = axi4mem[0].pins;
-	interface out = axi4mem[1].pins;
+	interface db = axi4mem[0].pins;
+	interface pkt = axi4mem[1].pins;
+	interface result = axi4mem[2].pins;
 	interface s_axi_control = axi4control.pins;
 	interface interrupt = axi4control.interrupt;
 endmodule
+
+endpackage
