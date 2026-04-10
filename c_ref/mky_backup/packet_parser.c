@@ -40,11 +40,11 @@ static int parse_transport(uint8_t proto,
 
     case PROTO_ICMP:
     case PROTO_ICMP6:
-        if (transport_len < 8) return -1;
+        if (transport_len < 2) return -1;
         out->icmp_type       = transport[0];
         out->icmp_code       = transport[1];
-        out->payload         = transport + 8;
-        out->payload_len     = transport_len - 8;
+        out->payload         = transport + 2;
+        out->payload_len     = transport_len - 2;
         return 0;
 
     default:

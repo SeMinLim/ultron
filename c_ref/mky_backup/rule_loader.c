@@ -108,6 +108,10 @@ RuleSet *rules_load(const char *filename)
         if (decoded_len > 64)
             continue;
 
+        for (int k = 0; k < decoded_len; k++)
+            if ((unsigned char)decoded[k] >= 0x41 && (unsigned char)decoded[k] <= 0x5A)
+                decoded[k] |= 0x20;
+
         Rule *r        = &rs->rules[rs->count];
         r->id          = id;
         r->pat_len     = decoded_len;
