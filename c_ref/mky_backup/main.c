@@ -12,8 +12,6 @@
 #include "packet_parser.h"
 
 #define N 3
-// #define MAX_STAGE 4
-
 static int cmp_gram(const void *a, const void *b) { return memcmp(a, b, N); }
 
 static void print_gram(const uint8_t *g)
@@ -24,12 +22,35 @@ static void print_gram(const uint8_t *g)
     }
 }
 
+static MatchCount collect_candidates(const MatchCtx *mctx,
+                              const uint8_t *pkt, int pkt_len,
+                              const Bitmap *bm, const Bitmap *vm,
+                              MatchCandidate **candidates, int *candidate_cap,
+                              int max_stage)
+{
+    MatchCount res = match_scan(mctx, pkt, pkt_len, bm, vm,
+                                 *candidates, *candidate_cap, max_stage);
+
+    while (res.nc > *candidate_cap) {
+        *candidate_cap = res.nc;
+        *candidates = realloc(*candidates,
+                              (size_t)*candidate_cap * sizeof(MatchCandidate));
+        res = match_scan(mctx, pkt, pkt_len, bm, vm,
+                         *candidates, *candidate_cap, max_stage);
+    }
+
+    return res;
+}
+
 int main(int argc, char *argv[])
 {
     const char *rule_file = (argc > 1) ? argv[1] : "rule.txt";
     const char *pcap_file = (argc > 2) ? argv[2] : NULL;
-    const char MAX_STAGE = (argc > 3) ? atoi(argv[3]) : 4;
-    const char verbose = (argc > 4) ? atoi(argv[3]) : 1;
+    int max_stage = (argc > 3) ? atoi(argv[3]) : 2;
+    int verbose = (argc > 4) ? atoi(argv[4]) : 1;
+
+    if (max_stage < 1)
+        max_stage = 1;
 
     RuleSet *rs = rules_load(rule_file);
     if (!rs) {
@@ -74,7 +95,7 @@ int main(int argc, char *argv[])
     free(buf);
 
     printf("=== singleton build ===\n");
-    SingletonResult *sr = singleton_build(rs, MAX_STAGE);
+    SingletonResult *sr = singleton_build(rs, max_stage);
     if (!sr) {
         fprintf(stderr, "singleton_build failed\n");
         rules_free(rs);
@@ -117,16 +138,11 @@ int main(int argc, char *argv[])
     }
 
     printf("\n=== bitmap build ===\n");
-    Bitmap *bm = calloc(1, sizeof(Bitmap));
-    bitmap_clear(bm);
-    for (int i = 0; i < sr->count; i++)
-        bitmap_set_gram(bm, sr->assigns[i].gram);
-
-    Bitmap* bm_arr = malloc(MAX_STAGE * sizeof(Bitmap));
-    Bitmap* bm_verifier_arr = malloc((MAX_STAGE-1) * sizeof(Bitmap));
-    for (int i=0; i < (MAX_STAGE-1); i ++)
+    Bitmap* bm_arr = malloc((size_t)max_stage * sizeof(Bitmap));
+    Bitmap* bm_verifier_arr = malloc((size_t)(max_stage - 1) * sizeof(Bitmap));
+    for (int i=0; i < (max_stage-1); i ++)
         bitmap_clear(bm_verifier_arr + i);
-    for (int i=0; i < MAX_STAGE; i ++)
+    for (int i=0; i < max_stage; i ++)
         bitmap_clear(bm_arr + i);
 
     for (int i = 0; i < sr->count; i++) {
@@ -152,28 +168,39 @@ int main(int argc, char *argv[])
 
     int verify_ok = 1;
     for (int i = 0; i < sr->count; i++) {
-        if (!bitmap_test_gram(bm, sr->assigns[i].gram)) {
+        if (!bitmap_test_gram(bm_arr, sr->assigns[i].gram)) {
             fprintf(stderr, "bitmap verify FAIL rule_id=%d\n", sr->assigns[i].rule_id);
             verify_ok = 0;
         }
     }
 
-    int bits_set = 0;
-    for (int i = 0; i < (int)BITMAP_BYTES; i++) {
-        uint8_t b = bm->data[i];
-        while (b) { bits_set += b & 1; b >>= 1; }
-    }
+    int stage1_bits_set = bitmap_count_bits(bm_arr);
+    int stage_bits_total = stage1_bits_set;
+    int verifier_bits_total = 0;
+
+    for (int i = 1; i < max_stage; i++)
+        stage_bits_total += bitmap_count_bits(bm_arr + i);
+    for (int i = 0; i < max_stage - 1; i++)
+        verifier_bits_total += bitmap_count_bits(bm_verifier_arr + i);
 
     bool ms_verify_res = verify_ms_bitmap(bm_arr, bm_verifier_arr, sr);
 
-    printf("grams in bitmap     : %d\n", bits_set);
-    printf("bitmap size         : %d bytes (256KB)\n", (int)BITMAP_BYTES);
+    printf("stage-1 grams       : %d\n", stage1_bits_set);
+    for (int i = 1; i < max_stage; i++)
+        printf("stage-%d grams       : %d\n", i + 1, bitmap_count_bits(bm_arr + i));
+    for (int i = 0; i < max_stage - 1; i++)
+        printf("verify-%d grams      : %d\n", i + 1, bitmap_count_bits(bm_verifier_arr + i));
+    printf("bitmap grams total  : %d\n", stage_bits_total + verifier_bits_total);
+    printf("bitmap size         : %d bytes per bitmap (256KB)\n", (int)BITMAP_BYTES);
+    printf("bitmap size total   : %zu bytes total\n",
+           ((size_t)max_stage + (size_t)(max_stage - 1)) * sizeof(Bitmap));
     printf("verify              : %s\n", verify_ok ? "OK" : "FAIL");
-    printf("ms_verify           : %s\n", ms_verify_res ? "OK" : "FAIL");
+    printf("bitmap verify       : %s\n", ms_verify_res ? "OK" : "FAIL");
 
     printf("\n=== matching stage ===\n");
     MatchCtx        mctx;
-    MatchCandidate  candidates[1024];
+    int             candidate_cap = 1024;
+    MatchCandidate *candidates = malloc((size_t)candidate_cap * sizeof(MatchCandidate));
     MatchResult     matches[256];
     match_init(&mctx, sr);
 
@@ -182,10 +209,11 @@ int main(int argc, char *argv[])
         if (!pr) {
             fprintf(stderr, "failed to open pcap: %s\n", pcap_file);
         } else {
-            printf("pcap           : %s\n", pcap_file);
+            printf("pcap             : %s\n", pcap_file);
             PcapFrame frame;
             int n_frames = 0, n_parsed = 0, n_matched_pkts = 0;
             int n_bm_pkts = 0;
+            int bitmap_hits_gram_cnt = 0, total_ngram_cnt = 0;
 
             while (pcap_next(pr, &frame)) {
                 n_frames++;
@@ -197,29 +225,39 @@ int main(int argc, char *argv[])
                 }
                 n_parsed++;
 
-                int nc = match_scan(&mctx, pkt.payload, (int)pkt.payload_len,
-                                    bm, candidates, 1024);
-                if (nc > 0) n_bm_pkts++;
+                total_ngram_cnt += pkt.payload_len - N + 1;
+
+                MatchCount mc = collect_candidates(&mctx, pkt.payload, (int)pkt.payload_len,
+                                            bm_arr, bm_verifier_arr,
+                                            &candidates, &candidate_cap, max_stage);
+                if (mc.nc > 0) n_bm_pkts++;
+                if (mc.ngram_hit > 0) bitmap_hits_gram_cnt += mc.ngram_hit;
 
                 int nm = exact_match(pkt.payload, (int)pkt.payload_len,
-                                     candidates, nc < 1024 ? nc : 1024,
+                                     candidates, mc.nc,
                                      rs, matches, 256);
                 if (nm > 0) n_matched_pkts++;
                 
                 if (verbose > 1) {
-                    for (int j = 0; j < nm; j++)
-                        printf("  [ALERT] frame=%-5d  rule=%-4d  anchor=%-4d\n",
-                            n_frames, matches[j].rule_id, matches[j].anchor);
+                    int print_range = (verbose > 1) ? nm : (nm < 5 ? nm : 5);
+                    for (int j = 0; j < print_range; j++){
+                        printf("  [ALERT] frame=%-5d  rule=%-4d  anchor=%-4d  pattern=%30s\n",
+                            n_frames, matches[j].rule_id, matches[j].anchor, rs->rules[matches[j].rule_id].pattern);
+                        printf("detected pattern: \"%.60s\"\n\n", pkt.payload); 
+                        }  
                 }
                 pcap_frame_free(&frame);
             }
 
-            printf("frames total   : %d\n", n_frames);
-            printf("frames parsed  : %d  (IPv4/IPv6 TCP/UDP/ICMP with payload)\n", n_parsed);
-            printf("bitmap hit pkts: %d / %d  (%.1f%%)\n",
+            printf("frames total     : %6d\n", n_frames);
+            printf("frames parsed    : %6d  (IPv4/IPv6 TCP/UDP/ICMP with payload)\n", n_parsed);
+            printf("bitmap hit pkts  : %6d / %8d  (%.1f%%)\n",
                    n_bm_pkts, n_parsed,
                    n_parsed ? 100.0 * n_bm_pkts / n_parsed : 0.0);
-            printf("matched packets: %d / %d  (%.1f%%)\n",
+            printf("bitmap hit grams : %6d / %8d  (%.1f%%)\n",
+                   bitmap_hits_gram_cnt, total_ngram_cnt,
+                   total_ngram_cnt ? 100.0 * bitmap_hits_gram_cnt / total_ngram_cnt : 0.0);
+            printf("matched packets  : %6d / %8d  (%.1f%%)\n",
                    n_matched_pkts, n_parsed,
                    n_parsed ? 100.0 * n_matched_pkts / n_parsed : 0.0);
             pcap_close(pr);
@@ -230,12 +268,13 @@ int main(int argc, char *argv[])
             const Rule *r = &rs->rules[i];
             if (r->pat_len < 3) continue;
 
-            int nc = match_scan(&mctx, (const uint8_t *)r->pattern, r->pat_len,
-                                bm, candidates, 1024);
-            total_bm += nc;
+            MatchCount mc = collect_candidates(&mctx, (const uint8_t *)r->pattern, r->pat_len,
+                                        bm_arr, bm_verifier_arr,
+                                        &candidates, &candidate_cap, max_stage);
+            total_bm += mc.nc;
 
             int nm = exact_match((const uint8_t *)r->pattern, r->pat_len,
-                                 candidates, nc < 1024 ? nc : 1024,
+                                 candidates, mc.nc,
                                  rs, matches, 256);
             total_exact += nm;
 
@@ -255,11 +294,13 @@ int main(int argc, char *argv[])
         for (int i = 0; i < rs->count && shown < 5; i++) {
             const Rule *r = &rs->rules[i];
             if (r->pat_len < 3) continue;
-            int nc = match_scan(&mctx, (const uint8_t *)r->pattern, r->pat_len,
-                                bm, candidates, 1024);
+            MatchCount mc = collect_candidates(&mctx, (const uint8_t *)r->pattern, r->pat_len,
+                                        bm_arr, bm_verifier_arr,
+                                        &candidates, &candidate_cap, max_stage);
             int nm = exact_match((const uint8_t *)r->pattern, r->pat_len,
-                                 candidates, nc < 1024 ? nc : 1024,
+                                 candidates, mc.nc,
                                  rs, matches, 256);
+
             for (int j = 0; j < nm; j++) {
                 if (matches[j].rule_id != r->id) continue;
                 int anch = matches[j].anchor;
@@ -277,7 +318,7 @@ int main(int argc, char *argv[])
 
     match_destroy(&mctx);
 
-    free(bm);
+    free(candidates);
     free(bm_arr);
     free(bm_verifier_arr);
     singleton_free(sr);

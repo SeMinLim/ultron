@@ -232,6 +232,8 @@ SingletonResult *singleton_build(const RuleSet *rs, int max_stage)
 void singleton_free(SingletonResult *r)
 {
     if (!r) return;
+    for (int i = 0; i < r->count; i++)
+        free(r->assigns[i].next_grams);
     free(r->assigns);
     free(r);
 }
