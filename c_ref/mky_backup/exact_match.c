@@ -32,7 +32,7 @@ int exact_match(const uint8_t *pkt, int pkt_len,
         if ((end - start) == r->pat_len &&
             memcmp(pkt + start, r->pattern, (size_t)r->pat_len) == 0) {
             if (n < out_max)
-                out[n] = (MatchResult){ a->rule_id, anchor };
+                out[n] = (MatchResult){ a->rule_id, anchor, start };
             n++;
         }
     }

@@ -8,6 +8,7 @@
 typedef struct {
     int rule_id;
     int anchor;
+    int match_start;
 } MatchResult;
 
 int exact_match(const uint8_t *pkt, int pkt_len,
