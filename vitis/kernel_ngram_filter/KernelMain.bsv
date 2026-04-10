@@ -80,7 +80,7 @@ module mkKernelMain(KernelMainIfc);
     Reg#(Bit#(32)) bitmapCycles       <- mkReg(0);
     Reg#(Bit#(32)) gramCycles         <- mkReg(0);
     Reg#(Bit#(32)) exactCycles        <- mkReg(0);
-    Reg#(Bit#(32)) pomCycles         <- mkReg(0);
+    Reg#(Bit#(32)) pomCycles          <- mkReg(0);
     Reg#(Bit#(32)) resultWriterCycles <- mkReg(0);
     Reg#(Bit#(32)) gramsExtracted     <- mkReg(0);
     Reg#(Bit#(32)) bitmapPassed       <- mkReg(0);
@@ -89,9 +89,9 @@ module mkKernelMain(KernelMainIfc);
     Reg#(Bit#(32)) exactChecks        <- mkReg(0);
     Reg#(Bit#(32)) exactHits          <- mkReg(0);
     Reg#(Bit#(32)) exactMisses        <- mkReg(0);
-    Reg#(Bit#(32)) pomChecks         <- mkReg(0);
-    Reg#(Bit#(32)) pomHits           <- mkReg(0);
-    Reg#(Bit#(32)) pomMisses         <- mkReg(0);
+    Reg#(Bit#(32)) pomChecks          <- mkReg(0);
+    Reg#(Bit#(32)) pomHits            <- mkReg(0);
+    Reg#(Bit#(32)) pomMisses          <- mkReg(0);
     Reg#(Bit#(32)) noMatchPkts        <- mkReg(0);
     Reg#(ResultSummary) resultSummary <- mkReg(unpack(0));
 
@@ -353,7 +353,7 @@ module mkKernelMain(KernelMainIfc);
             bitmapCycles:       bitmapCycles,
             gramCycles:         gramCycles,
             exactCycles:        exactCycles,
-            pomCycles:         pomCycles,
+            pomCycles:          pomCycles,
             resultWriterCycles: resultWriterCycles,
             gramsExtracted:     gramsExtracted,
             bitmapPassed:       bitmapPassed,
@@ -362,9 +362,9 @@ module mkKernelMain(KernelMainIfc);
             exactChecks:        exactChecks,
             exactHits:          exactHits,
             exactMisses:        exactMisses,
-            pomChecks:         pomChecks,
-            pomHits:           pomHits,
-            pomMisses:         pomMisses,
+            pomChecks:          pomChecks,
+            pomHits:            pomHits,
+            pomMisses:          pomMisses,
             noMatchPkts:        noMatchPkts
         };
         resultSummary <= summary;
@@ -414,7 +414,7 @@ module mkKernelMain(KernelMainIfc);
         bitmapCycles       <= 0;
         gramCycles         <= 0;
         exactCycles        <= 0;
-        pomCycles         <= 0;
+        pomCycles          <= 0;
         resultWriterCycles <= 0;
         gramsExtracted     <= 0;
         bitmapPassed       <= 0;
@@ -423,9 +423,9 @@ module mkKernelMain(KernelMainIfc);
         exactChecks        <= 0;
         exactHits          <= 0;
         exactMisses        <= 0;
-        pomChecks         <= 0;
-        pomHits           <= 0;
-        pomMisses         <= 0;
+        pomChecks          <= 0;
+        pomHits            <= 0;
+        pomMisses          <= 0;
         noMatchPkts        <= 0;
         resultSummary      <= unpack(0);
         payBuf             <= 0;

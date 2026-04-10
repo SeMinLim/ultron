@@ -2,7 +2,6 @@ package GramMatcher;
 
 // gram -> Ruleid, pre, post, len
 
-import FIFO::*;
 import FIFOF::*;
 import GramIdTable::*;
 
@@ -23,7 +22,6 @@ typedef struct {
 interface GramMatcherIfc;
     method Action insert(Bit#(32) gram, RuleInfo info);
     method ActionValue#(Bool) insertAck;
-    method Bool notBusy;
     method Action lookupReq(Bit#(32) gram, Bit#(32) anchor, Bit#(32) payLen, Bit#(1) epoch);
     method ActionValue#(Tuple3#(Maybe#(VerifyReq), Bit#(32), Bit#(1))) lookupResp;
     method Bool idle;
@@ -36,7 +34,6 @@ module mkGramMatcher(GramMatcherIfc);
 
     method Action insert(Bit#(32) gram, RuleInfo info) = tbl.insert(gram, info);
     method ActionValue#(Bool) insertAck = tbl.insertAck;
-    method Bool notBusy = tbl.notBusy;
 
     method Action lookupReq(Bit#(32) gram, Bit#(32) anchor, Bit#(32) payLen, Bit#(1) epoch);
         tbl.lookupReq(gram);

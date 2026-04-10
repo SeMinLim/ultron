@@ -1,9 +1,5 @@
 package PacketParser;
 
-import FIFO::*;
-import FIFOF::*;
-import SpecialFIFOs::*;
-
 typedef enum {
     Eth,
     Ipv4,

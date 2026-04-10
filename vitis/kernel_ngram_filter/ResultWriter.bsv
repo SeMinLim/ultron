@@ -6,7 +6,6 @@ package ResultWriter;
 //   [0..128)              128B summary: 32 x u32 counters
 //   [128..128+pktCount×4) per-packet: {matched[1], reserved[15], ruleId[16]} per packet
 
-import FIFO::*;
 import FIFOF::*;
 import Vector::*;
 

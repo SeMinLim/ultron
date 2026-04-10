@@ -7,8 +7,6 @@ typedef 61 NGramLanes;
 typedef 61 NBitmapLanes;
 
 typedef struct {
-    Bit#(32) byteIdx;  // gram_value / 8
-    Bit#(3)  bitIdx;   // gram_value % 8
     Bit#(32) gram;
     Bit#(32) anchor;
 } NgramOut deriving (Bits, Eq, FShow);
@@ -65,10 +63,8 @@ module mkNgramExtracter(NgramExtracterIfc);
                 Bit#(32) g32 = zeroExtend(g24);
 
                 result[fromInteger(i)] = tagged Valid (NgramOut {
-                    byteIdx: g32 >> 3,
-                    bitIdx:  truncate(g32),
-                    gram:    g32,
-                    anchor:  base + fromInteger(i) - 2
+                    gram:   g32,
+                    anchor: base + fromInteger(i) - 2
                 });
             end
         end

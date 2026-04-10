@@ -66,7 +66,7 @@ module kernel (KernelTopIfc);
 	
 
 	for ( Integer i = 0; i < valueOf(MemPortCnt); i=i+1 ) begin
-		rule relayReadReq00 ( started );
+		rule relayReadReq ( started );
 			let r <- kernelMain.mem[i].readReq;
 			axi4mem[i].readReq(r.addr, r.bytes);
 		endrule

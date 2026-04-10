@@ -1,6 +1,5 @@
 package DataLoader;
 
-import FIFO::*;
 import FIFOF::*;
 import BitmapUram::*;
 import GramIdTable::*;

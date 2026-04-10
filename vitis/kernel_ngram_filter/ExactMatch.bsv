@@ -1,6 +1,5 @@
 package ExactMatch;
 
-import FIFO::*;
 import FIFOF::*;
 import BRAM::*;
 import GramMatcher::*;

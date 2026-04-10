@@ -56,6 +56,7 @@ module mkPacketReader(PacketReaderIfc);
     Reg#(Bit#(7))   lineBytes <- mkReg(0);
     Reg#(Bit#(32))  bytesLeft <- mkReg(0);
     Reg#(Bool)      lineValid <- mkReg(False);
+
     rule doHeader(state == PRHeader && wordQ.notEmpty);
         wordQ.deq;
         readReqQ.enq(tuple2(baseAddr + 64, zeroExtend(pktTotal) * 16));
