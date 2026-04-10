@@ -4,6 +4,8 @@
 #include "singleton.h"
 #include "bitmap.h"
 
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+
 typedef struct { uint32_t *v; int n, cap; } U32Vec;
 
 static void vec_push(U32Vec *v, uint32_t x)
@@ -92,7 +94,7 @@ static void ght_free(GHT *ht)
     free(ht);
 }
 
-SingletonResult *singleton_build(const RuleSet *rs)
+SingletonResult *singleton_build(const RuleSet *rs, int max_stage)
 {
     int nr  = rs->count;
     int est = 0;
@@ -205,6 +207,16 @@ SingletonResult *singleton_build(const RuleSet *rs)
         a->pre_offset  = -gram_pos;
         a->post_offset = r->pat_len - gram_pos - 3;
         a->degree      = node ? node->count : 1;
+
+        a->stage      = MIN((int)((r->pat_len - gram_pos) / 3), max_stage);
+        a->next_grams = NULL;
+        if (a->stage > 0) {
+            size_t copy_range = (size_t)(3 * (a->stage-1) * sizeof(uint8_t));
+            a->next_grams = malloc(copy_range);
+            memcpy(a->next_grams,
+                   r->pattern + a->gram_pos + sizeof(a->gram),
+                   copy_range);
+        }
     }
 
     for (int i = 0; i < nr; i++) free(rule_grams[i].v);

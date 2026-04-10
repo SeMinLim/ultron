@@ -12,6 +12,9 @@ typedef struct {
     int      pre_offset;
     int      post_offset;
     int      degree;
+
+    int      stage;
+    uint8_t* next_grams;
 } GramAssign;
 
 typedef struct {
@@ -20,7 +23,7 @@ typedef struct {
     int         uncovered;
 } SingletonResult;
 
-SingletonResult *singleton_build(const RuleSet *rs);
-void             singleton_free(SingletonResult *r);
+SingletonResult     *singleton_build(const RuleSet *rs, int max_stage);
+void                singleton_free(SingletonResult *r);
 
 #endif
