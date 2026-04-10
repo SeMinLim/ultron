@@ -80,7 +80,7 @@ module mkKernelMain(KernelMainIfc);
     Reg#(Bit#(32)) bitmapCycles       <- mkReg(0);
     Reg#(Bit#(32)) gramCycles         <- mkReg(0);
     Reg#(Bit#(32)) exactCycles        <- mkReg(0);
-    Reg#(Bit#(32)) portCycles         <- mkReg(0);
+    Reg#(Bit#(32)) pomCycles         <- mkReg(0);
     Reg#(Bit#(32)) resultWriterCycles <- mkReg(0);
     Reg#(Bit#(32)) gramsExtracted     <- mkReg(0);
     Reg#(Bit#(32)) bitmapPassed       <- mkReg(0);
@@ -89,9 +89,9 @@ module mkKernelMain(KernelMainIfc);
     Reg#(Bit#(32)) exactChecks        <- mkReg(0);
     Reg#(Bit#(32)) exactHits          <- mkReg(0);
     Reg#(Bit#(32)) exactMisses        <- mkReg(0);
-    Reg#(Bit#(32)) portChecks         <- mkReg(0);
-    Reg#(Bit#(32)) portHits           <- mkReg(0);
-    Reg#(Bit#(32)) portMisses         <- mkReg(0);
+    Reg#(Bit#(32)) pomChecks         <- mkReg(0);
+    Reg#(Bit#(32)) pomHits           <- mkReg(0);
+    Reg#(Bit#(32)) pomMisses         <- mkReg(0);
     Reg#(Bit#(32)) noMatchPkts        <- mkReg(0);
     Reg#(ResultSummary) resultSummary <- mkReg(unpack(0));
 
@@ -161,8 +161,8 @@ module mkKernelMain(KernelMainIfc);
                 gramCycles <= gramCycles + 1;
             if (exactMatch.inputPending || exactMatch.notEmpty)
                 exactCycles <= exactCycles + 1;
-            if (!portMatch.idle)
-                portCycles <= portCycles + 1;
+            if (portMatch.processing)
+                pomCycles <= pomCycles + 1;
         end
 
         if (state == KDone && !resultWriter.writeDone)
@@ -269,7 +269,7 @@ module mkKernelMain(KernelMainIfc);
         $display("KM exactResult hit=%b ruleId=%0d matchPos=%0d", r.hit, r.ruleId, r.matchPos);
         if (r.hit) begin
             exactHits  <= exactHits + 1;
-            portChecks <= portChecks + 1;
+            pomChecks <= pomChecks + 1;
             portMatch.putMeta(PomPktMeta {
                 ruleId:     r.ruleId,
                 ipProto:    pktParser.getProto,
@@ -295,9 +295,9 @@ module mkKernelMain(KernelMainIfc);
         let pr <- portMatch.getResult;
         $display("KM portResult hit=%b ruleId=%0d", pr.hit, pr.ruleId);
         if (pr.hit)
-            portHits <= portHits + 1;
+            pomHits <= pomHits + 1;
         else
-            portMisses <= portMisses + 1;
+            pomMisses <= pomMisses + 1;
         resultWriter.addResult(pr.hit, pr.ruleId);
         payBuf  <= 0;
         payBufN <= 0;
@@ -353,7 +353,7 @@ module mkKernelMain(KernelMainIfc);
             bitmapCycles:       bitmapCycles,
             gramCycles:         gramCycles,
             exactCycles:        exactCycles,
-            portCycles:         portCycles,
+            pomCycles:         pomCycles,
             resultWriterCycles: resultWriterCycles,
             gramsExtracted:     gramsExtracted,
             bitmapPassed:       bitmapPassed,
@@ -362,9 +362,9 @@ module mkKernelMain(KernelMainIfc);
             exactChecks:        exactChecks,
             exactHits:          exactHits,
             exactMisses:        exactMisses,
-            portChecks:         portChecks,
-            portHits:           portHits,
-            portMisses:         portMisses,
+            pomChecks:         pomChecks,
+            pomHits:           pomHits,
+            pomMisses:         pomMisses,
             noMatchPkts:        noMatchPkts
         };
         resultSummary <= summary;
@@ -414,7 +414,7 @@ module mkKernelMain(KernelMainIfc);
         bitmapCycles       <= 0;
         gramCycles         <= 0;
         exactCycles        <= 0;
-        portCycles         <= 0;
+        pomCycles         <= 0;
         resultWriterCycles <= 0;
         gramsExtracted     <= 0;
         bitmapPassed       <= 0;
@@ -423,9 +423,9 @@ module mkKernelMain(KernelMainIfc);
         exactChecks        <= 0;
         exactHits          <= 0;
         exactMisses        <= 0;
-        portChecks         <= 0;
-        portHits           <= 0;
-        portMisses         <= 0;
+        pomChecks         <= 0;
+        pomHits           <= 0;
+        pomMisses         <= 0;
         noMatchPkts        <= 0;
         resultSummary      <= unpack(0);
         payBuf             <= 0;

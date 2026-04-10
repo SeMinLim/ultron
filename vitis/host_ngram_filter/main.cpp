@@ -93,7 +93,7 @@ static void print_results(const uint8_t *res, uint32_t pkt_count)
     uint32_t matched, processed, db_cyc, pkt_cyc, total_cyc;
     uint32_t dl_cyc, pr_cyc, pp_cyc, ng_cyc, bm_cyc, gm_cyc, ex_cyc, pom_cyc, rw_cyc;
     uint32_t grams_extracted, bitmap_passed, gram_lookups, gram_hits;
-    uint32_t exact_checks, exact_hits, exact_misses, port_checks, port_hits, port_misses, no_match_pkts;
+    uint32_t exact_checks, exact_hits, exact_misses, pom_checks, pom_hits, pom_misses, no_match_pkts;
     memcpy(&matched,   res +  0, 4);
     memcpy(&processed, res +  4, 4);
     memcpy(&db_cyc,    res +  8, 4);
@@ -115,18 +115,18 @@ static void print_results(const uint8_t *res, uint32_t pkt_count)
     memcpy(&exact_checks,    res + 72, 4);
     memcpy(&exact_hits,      res + 76, 4);
     memcpy(&exact_misses,    res + 80, 4);
-    memcpy(&port_checks,     res + 84, 4);
-    memcpy(&port_hits,       res + 88, 4);
-    memcpy(&port_misses,     res + 92, 4);
+    memcpy(&pom_checks,      res + 84, 4);
+    memcpy(&pom_hits,        res + 88, 4);
+    memcpy(&pom_misses,      res + 92, 4);
     memcpy(&no_match_pkts,   res + 96, 4);
     printf("matched=%u  processed=%u\n", matched, processed);
     printf("cycles: db_load=%u  pkt_proc=%u  total=%u\n",
            db_cyc, pkt_cyc, total_cyc);
-    printf("module_cycles: data_loader=%u  packet_reader=%u  packet_parser=%u  ngram=%u  bitmap=%u  gram=%u  exact=%u  port=%u  result_writer=%u\n",
+    printf("module_cycles: data_loader=%u  packet_reader=%u  packet_parser=%u  ngram=%u  bitmap=%u  gram=%u  exact=%u  pom=%u  result_writer=%u\n",
            dl_cyc, pr_cyc, pp_cyc, ng_cyc, bm_cyc, gm_cyc, ex_cyc, pom_cyc, rw_cyc);
-    printf("stats: grams_extracted=%u  bitmap_passed=%u  gram_lookups=%u  gram_hits=%u  exact_checks=%u  exact_hits=%u  exact_misses=%u  port_checks=%u  port_hits=%u  port_misses=%u  no_match_pkts=%u\n",
+    printf("stats: grams_extracted=%u  bitmap_passed=%u  gram_lookups=%u  gram_hits=%u  exact_checks=%u  exact_hits=%u  exact_misses=%u  pom_checks=%u  pom_hits=%u  pom_misses=%u  no_match_pkts=%u\n",
            grams_extracted, bitmap_passed, gram_lookups, gram_hits, exact_checks,
-           exact_hits, exact_misses, port_checks, port_hits, port_misses, no_match_pkts);
+           exact_hits, exact_misses, pom_checks, pom_hits, pom_misses, no_match_pkts);
 
     for (uint32_t i = 0; i < pkt_count; i++) {
         uint32_t entry;

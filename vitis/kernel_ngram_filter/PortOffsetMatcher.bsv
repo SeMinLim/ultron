@@ -51,6 +51,7 @@ interface PortOffsetMatcherIfc;
     method Bool inputReady;
     method Bool outputReady;
     method Bool idle;
+    method Bool processing;
     method Action writeBitmap(Bit#(2) tbl, Bit#(7) addr, Bit#(512) data);
     method Action writeWindow(Bit#(2) tbl, Bit#(10) addr, Bit#(32) data);
     method Action writeIpProto(Bit#(8) addr, Bit#(32) data);
@@ -194,6 +195,7 @@ module mkPortOffsetMatcher(PortOffsetMatcherIfc);
     method Bool inputReady  = pendingQ.notFull;
     method Bool outputReady = outQ.notEmpty;
     method Bool idle        = !pendingQ.notEmpty && !stageBuf.notEmpty && !outQ.notEmpty;
+    method Bool processing  = pendingQ.notEmpty || stageBuf.notEmpty;
 
     method Action writeBitmap(Bit#(2) tbl, Bit#(7) addr, Bit#(512) data);
         let req = BRAMRequest { write: True, responseOnWrite: False, address: addr, datain: data };
