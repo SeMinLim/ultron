@@ -14,6 +14,8 @@ TEST_UNIT_OBJS = $(TEST_UNIT_SRCS:.c=.o)
 
 RULE    = ../../rule.txt
 PCAP    = full.pcap
+MAX_STAGE = 3
+VERBOSE = 1
 
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^
@@ -28,7 +30,7 @@ $(TEST_UNIT): $(TEST_UNIT_OBJS)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 run: $(TARGET)
-	./$(TARGET) $(RULE) $(PCAP)
+	./$(TARGET) $(RULE) $(PCAP) $(MAX_STAGE) $(VERBOSE)
 
 run-test-bm: $(TEST_BM)
 	./$(TEST_BM)
