@@ -8,6 +8,9 @@
 #include "bitmap.h"
 #include "match.h"
 #include "exact_match.h"
+#include "port_offset_matcher.h"
+#include "priority.h"
+#include "pm_output.h"
 #include "pcap_reader.h"
 #include "packet_parser.h"
 
@@ -213,7 +216,12 @@ int main(int argc, char *argv[])
             PcapFrame frame;
             int n_frames = 0, n_parsed = 0, n_matched_pkts = 0;
             int n_bm_pkts = 0;
+            int n_exact_pkts = 0;
             int bitmap_hits_gram_cnt = 0, total_ngram_cnt = 0;
+
+            typedef struct { int frame; int ids[256]; int n; } PmRecord;
+            PmRecord *pm_log = malloc(16384 * sizeof(PmRecord));
+            int pm_log_cnt = 0;
 
             while (pcap_next(pr, &frame)) {
                 n_frames++;
@@ -227,24 +235,44 @@ int main(int argc, char *argv[])
 
                 total_ngram_cnt += pkt.payload_len - N + 1;
 
-                MatchCount mc = collect_candidates(&mctx, pkt.payload, (int)pkt.payload_len,
+                uint8_t folded[65536];
+                size_t flen = pkt.payload_len < sizeof(folded) ? pkt.payload_len : sizeof(folded);
+                for (size_t fi = 0; fi < flen; fi++) {
+                    uint8_t b = pkt.payload[fi];
+                    folded[fi] = (b >= 0x41 && b <= 0x5A) ? b | 0x20 : b;
+                }
+
+                MatchCount mc = collect_candidates(&mctx, folded, (int)flen,
                                             bm_arr, bm_verifier_arr,
                                             &candidates, &candidate_cap, max_stage);
                 if (mc.nc > 0) n_bm_pkts++;
                 if (mc.ngram_hit > 0) bitmap_hits_gram_cnt += mc.ngram_hit;
 
-                int nm = exact_match(pkt.payload, (int)pkt.payload_len,
+                int nm = exact_match(folded, (int)flen,
                                      candidates, mc.nc,
                                      rs, matches, 256);
-                if (nm > 0) n_matched_pkts++;
+                if (nm > 0) n_exact_pkts++;
+
+                MatchResult filtered[256];
+                int nf = port_offset_match(matches, nm, rs, &pkt, filtered, 256);
+                priority_sort(filtered, nf, rs);
+                if (nf > 0) {
+                    n_matched_pkts++;
+                    if (pm_log_cnt < 16384) {
+                        PmRecord *rec = &pm_log[pm_log_cnt++];
+                        rec->frame = n_frames;
+                        rec->n = nf < 256 ? nf : 256;
+                        for (int j = 0; j < rec->n; j++)
+                            rec->ids[j] = filtered[j].rule_id;
+                    }
+                }
                 
                 if (verbose > 1) {
-                    int print_range = (verbose > 1) ? nm : (nm < 5 ? nm : 5);
-                    for (int j = 0; j < print_range; j++){
+                    for (int j = 0; j < nf; j++) {
                         printf("  [ALERT] frame=%-5d  rule=%-4d  anchor=%-4d  pattern=%30s\n",
-                            n_frames, matches[j].rule_id, matches[j].anchor, rs->rules[matches[j].rule_id].pattern);
-                        printf("detected pattern: \"%.60s\"\n\n", pkt.payload); 
-                        }  
+                            n_frames, filtered[j].rule_id, filtered[j].anchor, rs->rules[filtered[j].rule_id].pattern);
+                        printf("detected pattern: \"%.60s\"\n\n", pkt.payload);
+                    }
                 }
                 pcap_frame_free(&frame);
             }
@@ -257,9 +285,22 @@ int main(int argc, char *argv[])
             printf("bitmap hit grams : %6d / %8d  (%.1f%%)\n",
                    bitmap_hits_gram_cnt, total_ngram_cnt,
                    total_ngram_cnt ? 100.0 * bitmap_hits_gram_cnt / total_ngram_cnt : 0.0);
+            printf("exact match pkts : %6d / %8d  (%.1f%%)\n",
+                   n_exact_pkts, n_parsed,
+                   n_parsed ? 100.0 * n_exact_pkts / n_parsed : 0.0);
             printf("matched packets  : %6d / %8d  (%.1f%%)\n",
                    n_matched_pkts, n_parsed,
                    n_parsed ? 100.0 * n_matched_pkts / n_parsed : 0.0);
+
+            printf("\n=== pm output ===\n");
+            printf("%-8s  %s\n", "frame", "rule ids");
+            for (int i = 0; i < pm_log_cnt; i++) {
+                printf("%-8d ", pm_log[i].frame);
+                for (int j = 0; j < pm_log[i].n; j++)
+                    printf("%s%d", j ? " " : "", pm_log[i].ids[j]);
+                printf("\n");
+            }
+            free(pm_log);
             pcap_close(pr);
         }
     } else {

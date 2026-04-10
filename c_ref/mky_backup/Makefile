@@ -1,7 +1,7 @@
 CC      = gcc
 CFLAGS  = -Wall -O2
 TARGET  = main
-SRCS    = main.c rule_loader.c ngram_extract.c cuckoo_hash.c hashtable.c bitmap.c singleton.c match.c exact_match.c pcap_reader.c packet_parser.c
+SRCS    = main.c rule_loader.c ngram_extract.c cuckoo_hash.c hashtable.c bitmap.c singleton.c match.c exact_match.c port_offset_matcher.c priority.c pm_output.c pcap_reader.c packet_parser.c
 OBJS    = $(SRCS:.c=.o)
 
 TEST_BM      = test_bitmap
@@ -12,7 +12,7 @@ TEST_UNIT      = test_unit
 TEST_UNIT_SRCS = test_unit.c rule_loader.c ngram_extract.c singleton.c bitmap.c cuckoo_hash.c hashtable.c
 TEST_UNIT_OBJS = $(TEST_UNIT_SRCS:.c=.o)
 
-RULE    = ../../rule.txt
+RULE    = rule.txt
 PCAP    = full.pcap
 MAX_STAGE = 3
 VERBOSE = 1
