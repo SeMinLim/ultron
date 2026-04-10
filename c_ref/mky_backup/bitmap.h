@@ -34,6 +34,7 @@ static inline bool bitmap_get(const Bitmap *b, uint32_t idx)
 void bitmap_clear(Bitmap *b);
 void bitmap_set_gram(Bitmap *b, const uint8_t *gram);
 bool bitmap_test_gram(const Bitmap *b, const uint8_t *gram);
+int  bitmap_count_bits(const Bitmap *b);
 bool verify_ms_bitmap(Bitmap *b_arr, Bitmap *v_arr, SingletonResult *sr);
 
 #endif

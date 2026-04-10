@@ -1,4 +1,5 @@
 #include <stdlib.h>
+#include <string.h>
 #include "match.h"
 
 static int cmp_by_gram_idx(const void *a, const void *b)
@@ -8,6 +9,26 @@ static int cmp_by_gram_idx(const void *a, const void *b)
     if (x->gram_idx < y->gram_idx) return -1;
     if (x->gram_idx > y->gram_idx) return  1;
     return 0;
+}
+
+static int match_candidate_stages(const GramAssign *assign,
+                                  const uint8_t *pkt, int pkt_len, int anchor,
+                                  const Bitmap *bm, const Bitmap *vm)
+{
+    for (int stage = 0; stage < assign->stage - 1; stage++) {
+        const Bitmap *current_vm = vm + stage;
+        const Bitmap *current_bm = bm + stage + 1;
+        int next_anchor = anchor + (stage + 1) * 3;
+
+        if (!bitmap_test_gram(current_vm, assign->gram))
+            return 0;
+        if (next_anchor + 3 > pkt_len)
+            return 0;
+        if (!bitmap_test_gram(current_bm, pkt + next_anchor))
+            return 0;
+    }
+
+    return 1;
 }
 
 void match_init(MatchCtx *ctx, SingletonResult *sr)
@@ -32,18 +53,23 @@ void match_destroy(MatchCtx *ctx)
     ctx->sr = NULL;
 }
 
-int match_scan(const MatchCtx *ctx,
+MatchCount match_scan(const MatchCtx *ctx,
                const uint8_t *pkt, int pkt_len,
-               const Bitmap *bm,
-               MatchCandidate *out, int out_max)
+               const Bitmap *bm, const Bitmap *vm,
+               MatchCandidate *out, int out_max, int max_stage)
 {
-    int n = 0;
+    (void)max_stage;
+
+    MatchCount res = {0, 0};
 
     for (int anchor = 0; anchor <= pkt_len - 3; anchor++) {
-        if (!bitmap_test_gram(bm, pkt + anchor))
+        const uint8_t *gram = pkt + anchor;
+        int anchor_hit = 0;
+
+        if (!bitmap_test_gram(bm, gram))
             continue;
 
-        int gidx = (int)bitmap_idx(pkt + anchor);
+        int gidx = (int)bitmap_idx(gram);
 
         int base;
         if (!ht_lookup(ctx->ht, gidx, &base))
@@ -52,11 +78,16 @@ int match_scan(const MatchCtx *ctx,
         for (int j = base;
              j < ctx->sr->count && ctx->sr->assigns[j].gram_idx == (uint32_t)gidx;
              j++) {
-            if (n < out_max)
-                out[n] = (MatchCandidate){ anchor, &ctx->sr->assigns[j] };
-            n++;
+            if (!match_candidate_stages(&ctx->sr->assigns[j], pkt, pkt_len, anchor, bm, vm))
+                continue;
+            anchor_hit = 1;
+            if (res.nc < out_max)
+                out[res.nc] = (MatchCandidate){ anchor, &ctx->sr->assigns[j] };
+            res.nc++;
         }
-    }
 
-    return n;
+        if (anchor_hit)
+            res.ngram_hit++;
+    }
+    return res;
 }

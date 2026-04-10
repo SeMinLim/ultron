@@ -20,6 +20,21 @@ bool bitmap_test_gram(const Bitmap *b, const uint8_t *gram)
     return bitmap_get(b, bitmap_idx(gram));
 }
 
+int bitmap_count_bits(const Bitmap *b)
+{
+    int bits_set = 0;
+
+    for (int i = 0; i < (int)BITMAP_BYTES; i++) {
+        uint8_t byte = b->data[i];
+        while (byte) {
+            bits_set += byte & 1;
+            byte >>= 1;
+        }
+    }
+
+    return bits_set;
+}
+
 bool verify_ms_bitmap(Bitmap *b_arr, Bitmap *v_arr, SingletonResult *sr) {
     bool res = true;
 
