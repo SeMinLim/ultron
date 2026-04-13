@@ -33,6 +33,7 @@ typedef struct {
     int      cap;
     int      degree;
     int      gone;
+    int      n_assigned;
 } GNode;
 
 typedef struct {
@@ -160,6 +161,7 @@ SingletonResult *singleton_build(const RuleSet *rs, int max_stage)
             if (rule_cov[rid]) continue;
             rule_cov[rid] = 1;
             rule_sel[rid] = (int)sidx;
+            sel->n_assigned++;
             n_uncov--;
 
             for (int k = 0; k < rule_grams[rid].n; k++) {
@@ -206,7 +208,7 @@ SingletonResult *singleton_build(const RuleSet *rs, int max_stage)
         a->gram_pos    = gram_pos;
         a->pre_offset  = -gram_pos;
         a->post_offset = r->pat_len - gram_pos - 3;
-        a->degree      = node ? node->count : 1;
+        a->degree      = node ? node->n_assigned : 1;
 
         a->stage      = MIN((int)((r->pat_len - gram_pos) / 3), max_stage);
         a->next_grams = NULL;
