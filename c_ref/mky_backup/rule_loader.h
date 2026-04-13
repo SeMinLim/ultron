@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 #define MAX_PATTERN_LEN 256
-#define MAX_RULES       4096
+#define MAX_RULES       65536
 
 typedef struct {
     int      id;

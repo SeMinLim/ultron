@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <malloc.h>
 #include "hashtable.h"
 
 static int h1(int key, int cap) { return (int)((unsigned)key % (unsigned)cap); }
@@ -10,6 +11,11 @@ static int h2(int key, int cap) { return (int)(((unsigned)key * 2654435761u) % (
 static int slot(int tid, int key, int cap)
 {
     return tid == 0 ? h1(key, cap) : h2(key, cap);
+}
+
+static size_t allocation_usable_bytes(const void *ptr)
+{
+    return ptr ? malloc_usable_size((void *)ptr) : 0;
 }
 
 HashTable *ht_create(int capacity)
@@ -64,6 +70,32 @@ bool ht_delete(HashTable *ht, int key)
         return true;
     }
     return false;
+}
+
+size_t ht_memory_usage_bytes(const HashTable *ht)
+{
+    if (!ht) return 0;
+    return sizeof(*ht) + 2U * (size_t)ht->capacity * sizeof(HEntry);
+}
+
+size_t ht_runtime_memory_usage_bytes(const HashTable *ht)
+{
+    if (!ht) return 0;
+    return allocation_usable_bytes(ht)
+         + allocation_usable_bytes(ht->table[0])
+         + allocation_usable_bytes(ht->table[1]);
+}
+
+int ht_total_slots(const HashTable *ht)
+{
+    if (!ht) return 0;
+    return ht->capacity * 2;
+}
+
+size_t ht_occupied_entry_bytes(const HashTable *ht)
+{
+    if (!ht) return 0;
+    return (size_t)ht->count * sizeof(HEntry);
 }
 
 bool ht_insert(HashTable *ht, int key, int val)

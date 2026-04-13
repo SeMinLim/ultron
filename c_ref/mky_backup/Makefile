@@ -12,7 +12,7 @@ TEST_UNIT      = test_unit
 TEST_UNIT_SRCS = test_unit.c rule_loader.c ngram_extract.c singleton.c bitmap.c cuckoo_hash.c hashtable.c
 TEST_UNIT_OBJS = $(TEST_UNIT_SRCS:.c=.o)
 
-RULE    = rule.txt
+RULE    = new_64k_rule.txt
 PCAP    = full.pcap
 MAX_STAGE = 3
 VERBOSE = 1

@@ -4,6 +4,7 @@
 #define HASHTABLE_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include "cuckoo_hash.h"
 
 #define HT_MAX_LOOP 64
@@ -25,6 +26,10 @@ void       ht_destroy(HashTable *ht);
 bool ht_insert(HashTable *ht, int key, int val);
 bool ht_lookup(const HashTable *ht, int key, int *val_out);
 bool ht_delete(HashTable *ht, int key);
+int ht_total_slots(const HashTable *ht);
+size_t ht_occupied_entry_bytes(const HashTable *ht);
+size_t ht_memory_usage_bytes(const HashTable *ht);
+size_t ht_runtime_memory_usage_bytes(const HashTable *ht);
 
 void ht_print(const HashTable *ht);
 
