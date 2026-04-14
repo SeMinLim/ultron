@@ -110,7 +110,7 @@ bit index = (gram[0] & 0x7F) << 14
 make
 
 # 실행 (룰파일 pcap파일 최대스테이지 verbosity)
-make run 
+make run RULE=<rule 파일> PCAP=<pcap 파일> 
 
 ```
 
