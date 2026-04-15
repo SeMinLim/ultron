@@ -17,7 +17,8 @@ include makefile_us_alveo.mk
 # kernel_ngram_filter and host_ngram_filter are symlinks inside bluevitis/ but live as
 # siblings in their real location. CURDIR resolves to the physical path, so the shared
 # ../../sw/host_$(PROJECT) path doesn't exist; override it here.
-HOSTDIR := $(CURDIR)/../host_$(PROJECT)
+HOSTDIR := $(CURDIR)/../../sw/host_$(PROJECT)
+
 
 help:
 	@echo "Makefile Usage:"
