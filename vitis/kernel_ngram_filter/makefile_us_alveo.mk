@@ -71,18 +71,25 @@ package: host build emconfig
 # 9. Run Application (Auto-handles Emulation Mode)
 #----------------------------------------------------------------------------------------
 XCLBIN_ABS_PATH := $(CURDIR)/$(BUILD_DIR)/kernel.xclbin
-run: 
+DB_BLOB  ?= $(HOSTDIR)/db.bin
+PCAP     ?= $(HOSTDIR)/full.pcap
+
+$(DB_BLOB):
+	cd $(HOSTDIR)/gen && cc -O2 -std=c17 -o ngram_db_gen ngram_db_gen.c
+	$(HOSTDIR)/gen/ngram_db_gen $(HOSTDIR)/rule.txt $(DB_BLOB)
+
+run: $(DB_BLOB)
 ifeq ($(TARGET),hw_emu)
 	@echo "========================================="
 	@echo " Running Hardware Emulation... "
 	@echo "========================================="
 	cp -rf $(BUILD_DIR)/emconfig.json $(HOSTDIR)/
-	cd $(HOSTDIR) && export XCL_EMULATION_MODE=hw_emu && ./obj/main $(XCLBIN_ABS_PATH)
+	cd $(HOSTDIR) && export XCL_EMULATION_MODE=hw_emu && ./obj/main $(XCLBIN_ABS_PATH) $(DB_BLOB) $(PCAP)
 else
 	@echo "========================================="
 	@echo " Running on Actual Hardware... "
 	@echo "========================================="
-	cd $(HOSTDIR) && unset XCL_EMULATION_MODE && ./obj/main $(XCLBIN_ABS_PATH)
+	cd $(HOSTDIR) && unset XCL_EMULATION_MODE && ./obj/main $(XCLBIN_ABS_PATH) $(DB_BLOB) $(PCAP)
 endif
 #----------------------------------------------------------------------------------------
 # 10. Cleaning Rules
