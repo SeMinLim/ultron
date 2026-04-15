@@ -4,7 +4,7 @@ import BRAM::*;
 import FIFOF::*;
 import Vector::*;
 
-typedef 61 NLanes;
+typedef 64 NLanes;
 
 interface BitmapUramIfc;
     method Action writeWord(Bit#(12) lineAddr, Bit#(512) data);

@@ -68,10 +68,16 @@ module mkKernelMain(KernelMainIfc);
     Reg#(Bit#(64)) rPktBase    <- mkRegU;
     Reg#(Bit#(64)) rResultBase <- mkRegU;
 
-    Reg#(Bit#(512)) payBuf   <- mkReg(0);
-    Reg#(Bit#(7))   payBufN  <- mkReg(0);
-    Reg#(Bit#(32))  payLen   <- mkReg(0);
-    Reg#(Bit#(1))   payEpoch <- mkReg(0); // flips per packet; selects BRAM half in ExactMatch
+    Reg#(Bit#(32))  payTotalLen  <- mkReg(0); // total payload length; 0 = not yet captured
+    Reg#(Bit#(6))   payOff       <- mkReg(0); // payload byte 0 offset within first BRAM line
+    Reg#(Bit#(1))   payEpoch     <- mkReg(0); // flips per packet; selects BRAM half in ExactMatch
+    Reg#(Bit#(1))   payWriteEpoch <- mkRegU;  // epoch captured when payload writing begins (frozen)
+
+    // First-hit tracking: only send ONE exactMatch hit per packet to portMatch.
+    // Prevents portMatch.outQ accumulation (depth 16) and BSV implicit-condition
+    // deadlock from portMatch.putMeta inside a conditional.
+    Reg#(Bool)               pktHitSent <- mkReg(False);
+    Reg#(Maybe#(PomPktMeta)) pomPending  <- mkReg(tagged Invalid);
 
     Reg#(Bit#(32)) dataLoaderCycles   <- mkReg(0);
     Reg#(Bit#(32)) packetReaderCycles <- mkReg(0);
@@ -169,30 +175,47 @@ module mkKernelMain(KernelMainIfc);
             resultWriterCycles <= resultWriterCycles + 1;
     endrule
 
-    rule feedByte(state == KProcess && pktReader.pktReady);
+    // Feed header bytes one at a time until the parser enters payload state.
+    // For pure-header packets (no payload) the epoch is bumped here on the last byte.
+    rule feedHeaderByte(state == KProcess && pktReader.pktReady && !pktParser.inPayload);
         Bit#(8) b    = pktReader.getByte;
         Bool    last = pktReader.pktLastByte;
         pktParser.putByte(b, last);
         pktReader.advanceByte;
+        if (last) payEpoch <= payEpoch + 1;
+    endrule
 
-        if (pktParser.inPayload) begin
-            Bit#(512) nextPayBuf = (payBuf >> 8) | (zeroExtend(b) << 504);
-            Bit#(7)   nextN      = payBufN + 1;
-            Bit#(32)  nextLen    = payLen + 1;
+    // Feed one full AXI word per cycle once the parser is in payload state.
+    // curLine is the unshifted 512-bit word; payload bytes start at lineByteOffset.
+    // On the first word we capture payTotalLen and payOff for use by GramMatcher
+    // and ExactMatch.  On the last word we signal the parser and bump the epoch.
+    rule feedPayloadWord(state == KProcess && pktReader.pktReady && pktParser.inPayload);
+        Bit#(512) word = pktReader.getLine;
+        Bit#(6)   off  = pktReader.lineByteOffset;
+        Bit#(7)   cnt  = pktReader.lineValidBytes;
+        Bool      last = pktReader.lineIsLast;
 
-            if (payBufN == 63 || last) begin
-                Bit#(7) cnt = last ? truncate(payBufN) + 1 : 64;
-                exactMatch.putPayloadWord(nextPayBuf, last, payEpoch);
-                ngram.putBytes(nextPayBuf, 0, truncate(cnt), last);
-                payBufN <= 0;
-                payBuf  <= 0;
-                payLen  <= nextLen;
-                if (last) payEpoch <= payEpoch + 1;
-            end else begin
-                payBuf  <= nextPayBuf;
-                payBufN <= nextN;
-                payLen  <= nextLen;
-            end
+        // First payload word: record total payload length and the offset of
+        // payload byte 0 within this AXI word (pay_off for ExactMatch).
+        // Capture once per packet: total payload length, BRAM line offset, and
+        // the epoch used for writing (payEpoch before the last-word flip).
+        if (payTotalLen == 0) begin
+            payTotalLen   <= pktReader.bytesRemaining;
+            payOff        <= off;
+            payWriteEpoch <= payEpoch;
+        end
+
+        // Forward to ngram extractor (word-level, 61 grams/cycle).
+        ngram.putBytes(word, zeroExtend(off), cnt, last);
+
+        // Forward raw AXI word to ExactMatch BRAM (64 bytes/cycle, no alignment needed).
+        exactMatch.putPayloadWord(word, last, payEpoch);
+
+        pktReader.advanceLine;
+
+        if (last) begin
+            pktParser.putByte(0, True);  // reset parser
+            payEpoch <= payEpoch + 1;
         end
     endrule
 
@@ -239,7 +262,7 @@ module mkKernelMain(KernelMainIfc);
         Bool hit = scanHits[scanIdx];
         case (scanGrams[scanIdx]) matches
             tagged Valid .g: if (hit) begin
-                gram.lookupReq(g.gram, g.anchor, payLen, payEpoch);
+                gram.lookupReq(g.gram, g.anchor, payTotalLen, payWriteEpoch, payOff);
                 gramLookups <= gramLookups + 1;
             end
             tagged Invalid:  noAction;
@@ -250,42 +273,54 @@ module mkKernelMain(KernelMainIfc);
             scanIdx <= scanIdx + 1;
     endrule
 
+
+    // GramMatcher filters sentinels internally — outQ only contains valid hits.
+    // No gramStageQ or sentinel-drain rules needed.
     rule collectGramHits(state == KProcess);
-        match {.mr, .pLen, .ep} <- gram.lookupResp;
-        case (mr) matches
-            tagged Valid .vr: begin
-                gramHits    <= gramHits + 1;
-                exactChecks <= exactChecks + 1;
-                $display("KM gramHit rule=%0d anchor=%0d pre=%0d post=%0d len=%0d payLen=%0d",
-                         vr.ruleId, vr.anchor, vr.pre, vr.post, vr.len, pLen);
-                exactMatch.putRequest(vr, pLen, ep);
-            end
-            tagged Invalid: noAction;
-        endcase
+        let gr <- gram.lookupResp;
+        let vr = validValue(gr.vreq);
+        gramHits    <= gramHits + 1;
+        exactChecks <= exactChecks + 1;
+        $display("KM gramHit rule=%0d anchor=%0d pre=%0d post=%0d len=%0d payLen=%0d",
+                 vr.ruleId, vr.anchor, vr.pre, vr.post, vr.len, gr.payLen);
+        exactMatch.putRequest(vr, gr.payLen, gr.epoch, gr.pay_off);
     endrule
 
-    rule drainExact(state == KProcess && !exactMatch.inputPending && exactMatch.notEmpty);
+    // Drain exactMatch results into registers only — no method calls that could
+    // block.  Only the FIRST hit per packet is staged into pomPending; subsequent
+    // hits are counted but discarded so portMatch.pendingQ (depth 16) never fills.
+    rule drainExact(state == KProcess && exactMatch.notEmpty);
         let r <- exactMatch.getResult;
         $display("KM exactResult hit=%b ruleId=%0d matchPos=%0d", r.hit, r.ruleId, r.matchPos);
         if (r.hit) begin
-            exactHits  <= exactHits + 1;
-            pomChecks <= pomChecks + 1;
-            portMatch.putMeta(PomPktMeta {
-                ruleId:     r.ruleId,
-                ipProto:    pktParser.getProto,
-                srcPort:    pktParser.getSrcPort,
-                dstPort:    pktParser.getDstPort,
-                icmpType:   pktParser.getIcmpType,
-                icmpCode:   pktParser.getIcmpCode,
-                isTcp:      pktParser.isTcp,
-                isUdp:      pktParser.isUdp,
-                isIcmp:     pktParser.isIcmp,
-                matchPos:   r.matchPos,
-                payloadLen: r.payLen
-            });
+            exactHits <= exactHits + 1;
+            if (!pktHitSent) begin
+                pktHitSent <= True;
+                pomChecks  <= pomChecks + 1;
+                pomPending <= tagged Valid PomPktMeta {
+                    ruleId:     r.ruleId,
+                    ipProto:    pktParser.getProto,
+                    srcPort:    pktParser.getSrcPort,
+                    dstPort:    pktParser.getDstPort,
+                    icmpType:   pktParser.getIcmpType,
+                    icmpCode:   pktParser.getIcmpCode,
+                    isTcp:      pktParser.isTcp,
+                    isUdp:      pktParser.isUdp,
+                    isIcmp:     pktParser.isIcmp,
+                    matchPos:   r.matchPos,
+                    payloadLen: r.payLen
+                };
+            end
         end else begin
             exactMisses <= exactMisses + 1;
         end
+    endrule
+
+    // Forward the staged portMatch request.  Separate rule so drainExact never
+    // sees portMatch.pendingQ.notFull as a CAN_FIRE condition.
+    rule sendToPom(pomPending matches tagged Valid .m);
+        portMatch.putMeta(m);
+        pomPending <= tagged Invalid;
     endrule
 
     rule collectPortResult(state == KProcess &&
@@ -299,9 +334,8 @@ module mkKernelMain(KernelMainIfc);
         else
             pomMisses <= pomMisses + 1;
         resultWriter.addResult(pr.hit, pr.ruleId);
-        payBuf  <= 0;
-        payBufN <= 0;
-        payLen  <= 0;
+        pktHitSent  <= False;
+        payTotalLen <= 0;
         pktReader.nextPacket;
     endrule
 
@@ -320,9 +354,8 @@ module mkKernelMain(KernelMainIfc);
     );
         noMatchPkts <= noMatchPkts + 1;
         resultWriter.addResult(False, 0);
-        payBuf  <= 0;
-        payBufN <= 0;
-        payLen  <= 0;
+        pktHitSent  <= False;
+        payTotalLen <= 0;
         pktReader.nextPacket;
     endrule
 
@@ -428,9 +461,10 @@ module mkKernelMain(KernelMainIfc);
         pomMisses          <= 0;
         noMatchPkts        <= 0;
         resultSummary      <= unpack(0);
-        payBuf             <= 0;
-        payBufN            <= 0;
-        payLen             <= 0;
+        payTotalLen        <= 0;
+        payOff             <= 0;
+        pktHitSent         <= False;
+        pomPending         <= tagged Invalid;
         timerTotal.markStart;
         timerDb.markStart;
         dataLoader.startLoad(dbBase, dbBytes);

@@ -46,7 +46,7 @@ typedef struct {
 
 module mkResultWriter(ResultWriterIfc);
 
-    FIFOF#(Tuple2#(Bool, Bit#(16))) resultsQ <- mkSizedFIFOF(4096);
+    FIFOF#(Tuple2#(Bool, Bit#(16))) resultsQ <- mkSizedFIFOF(32768);
 
     FIFOF#(Tuple2#(Bit#(64), Bit#(64))) writeReqQ <- mkFIFOF;
     FIFOF#(Bit#(512))                   writeWordQ <- mkSizedFIFOF(8);

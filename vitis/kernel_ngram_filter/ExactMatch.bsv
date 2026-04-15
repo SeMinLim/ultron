@@ -12,10 +12,12 @@ typedef struct {
     Bit#(32) payLen;
 } ExMatchResult deriving (Bits, Eq, FShow);
 
+// Per-request context queued in inQ.
 typedef struct {
     VerifyReq req;
     Bit#(32)  payload_len;
     Bit#(1)   epoch;
+    Bit#(6)   pay_off;   // payload byte 0 sits at BRAM byte pay_off in line 0
 } ExactRequest deriving (Bits, Eq, FShow);
 
 typedef enum {
@@ -25,13 +27,22 @@ typedef enum {
     EXCmpRsp
 } EXState deriving (Bits, Eq, FShow);
 
+// Case-insensitive match: fold uppercase to lowercase before comparing.
 function Bit#(8) foldCase(Bit#(8) b);
     return ((b >= 8'h41) && (b <= 8'h5A)) ? (b | 8'h20) : b;
 endfunction
 
 interface ExactMatchIfc;
+    // Write one full AXI word (64 bytes) of packet payload into the BRAM.
+    // Words are written in order; last=True marks the final word of the packet.
+    // epoch selects which BRAM half to use (ping-pong between packets).
     method Action putPayloadWord(Bit#(512) word, Bool last, Bit#(1) epoch);
-    method Action putRequest(VerifyReq r, Bit#(32) payload_len, Bit#(1) epoch);
+
+    // Queue a verify request.  pay_off is the byte offset of payload[0] within
+    // BRAM line 0 (equals PacketReader.lineByteOffset at the first payload line).
+    method Action putRequest(VerifyReq r, Bit#(32) payload_len,
+                             Bit#(1) epoch, Bit#(6) pay_off);
+
     method ActionValue#(ExMatchResult) getResult;
     method Bool notEmpty;
     method Bool inputPending;
@@ -42,8 +53,12 @@ module mkExactMatch#(ExactPatternTableIfc patTbl)(ExactMatchIfc);
 
     BRAM_Configure cfgPayload = defaultValue;
     cfgPayload.memorySize = payloadLines;
-    cfgPayload.latency    = 2;
+    cfgPayload.latency    = 1;
 
+    // 512-bit wide, 512 lines = 32 KB total.
+    // Epoch bit splits this into two 16 KB halves (256 lines each).
+    // portA: write path (putPayloadWord — 64 bytes per call, one call per AXI word).
+    // portB: read path  (doCmpReq — one byte extracted per cycle).
     BRAM2Port#(Bit#(9), Bit#(512)) payloadTbl <- mkBRAM2Server(cfgPayload);
 
     FIFOF#(ExactRequest)  inQ  <- mkSizedFIFOF(1024);
@@ -57,6 +72,7 @@ module mkExactMatch#(ExactPatternTableIfc patTbl)(ExactMatchIfc);
     Reg#(Bit#(6))      cmpByteOff <- mkReg(0);
     Reg#(Bit#(512))    patReg     <- mkRegU;
 
+    // Bounds-check and kick off pattern fetch.
     rule doReady (st == EXReady && inQ.notEmpty);
         let r = inQ.first; inQ.deq;
 
@@ -65,9 +81,12 @@ module mkExactMatch#(ExactPatternTableIfc patTbl)(ExactMatchIfc);
         Int#(32) patLenI = unpack(zeroExtend(r.req.len));
         Int#(32) payLenI = unpack(r.payload_len);
 
-        if (r.req.len == 0 || startI < 0 || endI < 0 || startI > endI ||
-            endI > payLenI || (endI - startI) != patLenI) begin
-            outQ.enq(ExMatchResult { hit: False, ruleId: 0, matchPos: 0, payLen: r.payload_len });
+        Bool bad = (r.req.len == 0 || startI < 0 || endI < 0 ||
+                    startI > endI  || endI > payLenI ||
+                    (endI - startI) != patLenI);
+        if (bad) begin
+            outQ.enq(ExMatchResult { hit: False, ruleId: 0,
+                                     matchPos: 0, payLen: r.payload_len });
         end else begin
             patTbl.readPattern(truncate(r.req.ruleId));
             curReq   <= r;
@@ -83,10 +102,13 @@ module mkExactMatch#(ExactPatternTableIfc patTbl)(ExactMatchIfc);
         st     <= EXCmpReq;
     endrule
 
+    // Issue a BRAM read for the payload byte at position (curStart + cmpPos).
+    // pay_off shifts all addresses so that payload byte 0 lands at BRAM byte pay_off.
     rule doCmpReq (st == EXCmpReq);
-        Int#(32) payPosI = curStart + unpack(cmpPos);
-        Bit#(8)  lineAddr = truncate(pack(payPosI) >> 6);
-        Bit#(6)  byteOff  = truncate(pack(payPosI));
+        Int#(32) payPosI    = curStart + unpack(cmpPos);
+        Bit#(32) bramByte32 = pack(payPosI) + zeroExtend(curReq.pay_off);
+        Bit#(8)  lineAddr   = truncate(bramByte32 >> 6);
+        Bit#(6)  byteOff    = truncate(bramByte32);
 
         payloadTbl.portB.request.put(BRAMRequest {
             write: False, responseOnWrite: False,
@@ -95,6 +117,7 @@ module mkExactMatch#(ExactPatternTableIfc patTbl)(ExactMatchIfc);
         st <= EXCmpRsp;
     endrule
 
+    // Compare one byte; loop until mismatch or full pattern matched.
     rule doCmpRsp (st == EXCmpRsp);
         let payLine <- payloadTbl.portB.response.get;
 
@@ -105,10 +128,12 @@ module mkExactMatch#(ExactPatternTableIfc patTbl)(ExactMatchIfc);
         Bit#(8) patB  = truncate(patReg >> patSh);
 
         if (patB != foldCase(payB)) begin
-            outQ.enq(ExMatchResult { hit: False, ruleId: 0, matchPos: 0, payLen: curReq.payload_len });
+            outQ.enq(ExMatchResult { hit: False, ruleId: 0,
+                                     matchPos: 0, payLen: curReq.payload_len });
             st <= EXReady;
         end else if (cmpPos + 1 >= zeroExtend(curReq.req.len)) begin
-            outQ.enq(ExMatchResult { hit: True, ruleId: curReq.req.ruleId, matchPos: pack(curStart), payLen: curReq.payload_len });
+            outQ.enq(ExMatchResult { hit: True,  ruleId: curReq.req.ruleId,
+                                     matchPos: pack(curStart), payLen: curReq.payload_len });
             st <= EXReady;
         end else begin
             cmpPos <= cmpPos + 1;
@@ -116,20 +141,24 @@ module mkExactMatch#(ExactPatternTableIfc patTbl)(ExactMatchIfc);
         end
     endrule
 
+    // Write one full AXI word to the BRAM.  payWrLine counts words written for
+    // this packet; reset on last so the next packet starts at line 0.
     method Action putPayloadWord(Bit#(512) word, Bool last, Bit#(1) epoch);
         payloadTbl.portA.request.put(BRAMRequest {
             write: True, responseOnWrite: False,
             address: {epoch, payWrLine}, datain: word });
-        if (last) begin
+        if (last)
             payWrLine <= 0;
-        end else if (payWrLine < fromInteger(payloadLines/2 - 1)) begin
+        else if (payWrLine < fromInteger(payloadLines/2 - 1))
             payWrLine <= payWrLine + 1;
-        end
     endmethod
 
-    method Action putRequest(VerifyReq r, Bit#(32) payload_len, Bit#(1) epoch) if (inQ.notFull);
-        inQ.enq(ExactRequest { req: r, payload_len: payload_len, epoch: epoch });
+    method Action putRequest(VerifyReq r, Bit#(32) payload_len,
+                             Bit#(1) epoch, Bit#(6) pay_off) if (inQ.notFull);
+        inQ.enq(ExactRequest { req: r, payload_len: payload_len,
+                               epoch: epoch, pay_off: pay_off });
     endmethod
+
 
     method ActionValue#(ExMatchResult) getResult;
         let v = outQ.first; outQ.deq; return v;

@@ -16,17 +16,16 @@ interface GramIdTableIfc;
     method ActionValue#(Bool) insertAck;
     method Bool notBusy;
     method Action lookupReq(Bit#(32) gram);
-    method ActionValue#(Maybe#(RuleInfo)) lookupResp;
+    method ActionValue#(Maybe#(RuleInfo)) getResult;
 endinterface
 
-typedef enum { LkIdle, LkReq, LkRsp } LkState deriving (Bits, Eq, FShow);
+typedef enum { LkIdle, LkRsp } LkState deriving (Bits, Eq, FShow);
 
 (* synthesize *)
 module mkGramIdTable(GramIdTableIfc);
 
     Vector#(16, CuckooHashIfc#(32, 40, 9)) ht <- replicateM(mkCuckooHash);
 
-    // insert
     Reg#(Bit#(4))  insertTbl <- mkReg(0);
     FIFOF#(Bool)   ackOutQ   <- mkSizedFIFOF(4);
     FIFOF#(Bool)   htAckQ    <- mkSizedFIFOF(4);
@@ -43,62 +42,91 @@ module mkGramIdTable(GramIdTableIfc);
         ackOutQ.enq(True);
     endrule
 
-    // lookup
-    FIFOF#(Bit#(32))          inQ  <- mkSizedFIFOF(128);
-    FIFOF#(Maybe#(Bit#(40))) outQ  <- mkSizedFIFOF(128);
+    FIFOF#(Bit#(32))         inQ   <- mkSizedFIFOF(128);
+    FIFOF#(Maybe#(Bit#(40))) outQ  <- mkSizedFIFOF(64);
 
+    // rspStage[i]: tagged Invalid = waiting for shard i to respond
     Vector#(16, Reg#(Maybe#(Maybe#(Bit#(40))))) rspStage
         <- replicateM(mkReg(tagged Invalid));
 
     for (Integer i = 0; i < 16; i = i + 1) begin
-        rule drainStage (rspStage[i] == tagged Invalid);
+        rule drainStage (!isValid(rspStage[i]));
             let v <- ht[i].lookupResp;
             rspStage[i] <= tagged Valid v;
         endrule
     end
 
-    Reg#(LkState)  lkSt       <- mkReg(LkIdle);
-    Reg#(Bit#(32)) lkGram     <- mkReg(0);
-    Reg#(Bit#(4))  lkStartTbl <- mkReg(0);
-    Reg#(Bit#(4))  lkCurTbl   <- mkReg(0);
-    Reg#(Bit#(4))  lkTried    <- mkReg(0);
+    // Completed result vectors queued here so doLkRsp never waits on drain.
+    // Depth = CuckooHash latency so back-pressure only if drain is truly behind.
+    FIFOF#(Vector#(16, Maybe#(Bit#(40)))) drainQ <- mkSizedFIFOF(4);
 
-    rule doLkIdle (lkSt == LkIdle && inQ.notEmpty);
-        let gram = inQ.first; inQ.deq;
-        lkGram   <= gram;
-        lkCurTbl <= lkStartTbl;
-        lkTried  <= 0;
-        lkSt     <= LkReq;
-    endrule
+    Reg#(LkState)                        lkSt     <- mkReg(LkIdle);
+    Reg#(Bool)                           drainBusy <- mkReg(False);
+    Reg#(Bit#(4))                        drainIdx  <- mkReg(0);
+    Reg#(Vector#(16, Maybe#(Bit#(40)))) drainBuf  <- mkRegU;
 
-    rule doLkReq (lkSt == LkReq);
+    function Bool allStagesReady();
+        Bool ok = True;
         for (Integer i = 0; i < 16; i = i + 1)
-            if (lkCurTbl == fromInteger(i))
-                ht[i].lookupReq(lkGram);
+            ok = ok && isValid(rspStage[i]);
+        return ok;
+    endfunction
+
+    function Maybe#(Bit#(4)) nextHit(Bit#(4) start);
+        Maybe#(Bit#(4)) r = tagged Invalid;
+        for (Integer i = 15; i >= 0; i = i - 1) begin
+            Bit#(4) idx = fromInteger(i);
+            if (idx >= start && isValid(drainBuf[i]))
+                r = tagged Valid idx;
+        end
+        return r;
+    endfunction
+
+    // Issue all 16 shards simultaneously.
+    rule doLkReq (lkSt == LkIdle && inQ.notEmpty);
+        let gram = inQ.first; inQ.deq;
+        for (Integer i = 0; i < 16; i = i + 1)
+            ht[i].lookupReq(gram);
         lkSt <= LkRsp;
     endrule
 
-    rule doLkRsp (lkSt == LkRsp);
-        let staged = (readVReg(rspStage))[lkCurTbl];
-        case (staged) matches
-            tagged Invalid: noAction;
-            tagged Valid .r: begin
-                for (Integer i = 0; i < 16; i = i + 1)
-                    if (lkCurTbl == fromInteger(i))
-                        rspStage[i] <= tagged Invalid;
-                if (isValid(r)) begin
-                    outQ.enq(tagged Valid validValue(r));
-                    lkStartTbl <= lkStartTbl + 1;
-                    lkSt <= LkIdle;
-                end else if (lkTried == 15) begin
-                    outQ.enq(tagged Invalid);
-                    lkStartTbl <= lkStartTbl + 1;
-                    lkSt <= LkIdle;
-                end else begin
-                    lkCurTbl <= lkCurTbl + 1;
-                    lkTried  <= lkTried + 1;
-                    lkSt <= LkReq;
-                end
+    // Collect responses, push to drainQ, immediately issue next gram if available.
+    // No longer gated on drain — drainQ absorbs the result so the pipeline keeps moving.
+    rule doLkRsp (lkSt == LkRsp && allStagesReady() && drainQ.notFull);
+        Vector#(16, Maybe#(Bit#(40))) results = newVector;
+        for (Integer i = 0; i < 16; i = i + 1)
+            results[i] = validValue(rspStage[i]);
+        for (Integer i = 0; i < 16; i = i + 1)
+            rspStage[i] <= tagged Invalid;
+        drainQ.enq(results);
+        if (inQ.notEmpty) begin
+            let gram = inQ.first; inQ.deq;
+            for (Integer i = 0; i < 16; i = i + 1)
+                ht[i].lookupReq(gram);
+        end else
+            lkSt <= LkIdle;
+    endrule
+
+    // Load next result vector from drainQ when idle.
+    rule startDrain (!drainBusy && drainQ.notEmpty);
+        drainBuf  <= drainQ.first; drainQ.deq;
+        drainIdx  <= 0;
+        drainBusy <= True;
+    endrule
+
+    // Emit hits one per cycle (priority encoder), then sentinel.
+    rule doDrain (drainBusy);
+        case (nextHit(drainIdx)) matches
+            tagged Valid .idx: begin
+                outQ.enq(tagged Valid validValue(drainBuf[idx]));
+                drainIdx <= idx + 1;
+                Vector#(16, Maybe#(Bit#(40))) nb = drainBuf;
+                nb[idx] = tagged Invalid;
+                drainBuf <= nb;
+            end
+            tagged Invalid: begin
+                outQ.enq(tagged Invalid);
+                drainBusy <= False;
             end
         endcase
     endrule
@@ -119,19 +147,19 @@ module mkGramIdTable(GramIdTableIfc);
         Bool allIdle = True;
         for (Integer i = 0; i < 16; i = i + 1)
             allIdle = allIdle && ht[i].notBusy;
-        return allIdle;
+        return allIdle && !inQ.notEmpty && !drainQ.notEmpty && !drainBusy && !outQ.notEmpty;
     endmethod
 
     method Action lookupReq(Bit#(32) gram);
         inQ.enq(gram);
     endmethod
 
-    method ActionValue#(Maybe#(RuleInfo)) lookupResp;
-        let r = outQ.first; outQ.deq;
-        case (r) matches
-            tagged Valid .v: return tagged Valid unpack(v);
-            tagged Invalid:  return tagged Invalid;
-        endcase
+    method ActionValue#(Maybe#(RuleInfo)) getResult;
+        let v = outQ.first; outQ.deq;
+        return case (v) matches
+            tagged Valid .b: tagged Valid unpack(b);
+            tagged Invalid:  tagged Invalid;
+        endcase;
     endmethod
 
 endmodule

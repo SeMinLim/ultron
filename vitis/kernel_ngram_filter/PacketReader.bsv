@@ -8,6 +8,11 @@ package PacketReader;
 //   [descs_end..)          raw packet bytes concatenated
 //
 // 4 descriptors fit per 64B AXI word (each descriptor is 16B).
+//
+// curLine is NOT shifted as bytes are consumed.  Instead, curByteOff tracks the
+// current read position within the line (0..63).  This lets callers inspect the
+// full, unmodified AXI word (getLine) alongside the byte offset (lineByteOffset),
+// which is used by ExactMatch as pay_off.
 
 import FIFO::*;
 import FIFOF::*;
@@ -29,6 +34,12 @@ interface PacketReaderIfc;
     method Bool     pktLastByte;
     method Bit#(8)  getByte;
     method Action   advanceByte;
+    method Bit#(512) getLine;
+    method Bit#(6)   lineByteOffset;    // byte index of current read position in curLine
+    method Bit#(7)   lineValidBytes;    // valid payload bytes remaining in this line
+    method Bool      lineIsLast;        // true if this line holds the last payload bytes
+    method Action    advanceLine;
+    method Bit#(32)  bytesRemaining;    // packet bytes not yet consumed (payload length proxy)
     method Bool     pktDone;
     method Action   nextPacket;
     method Bool     allDone;
@@ -46,16 +57,16 @@ module mkPacketReader(PacketReaderIfc);
     Reg#(Bit#(32)) pktTotal <- mkReg(0);
     Reg#(Bit#(32)) pktIdx   <- mkReg(0);
 
-    FIFOF#(Tuple2#(Bit#(32), Bit#(32))) descFifo <- mkSizedFIFOF(256);
+    FIFOF#(Tuple2#(Bit#(32), Bit#(32))) descFifo <- mkSizedFIFOF(32768);
 
     Reg#(Bit#(512)) descBuf   <- mkRegU;
     Reg#(Bit#(3))   descSub   <- mkReg(0);
     Reg#(Bit#(32))  descTotal <- mkReg(0);
 
-    Reg#(Bit#(512)) curLine   <- mkRegU;
-    Reg#(Bit#(7))   lineBytes <- mkReg(0);
-    Reg#(Bit#(32))  bytesLeft <- mkReg(0);
-    Reg#(Bool)      lineValid <- mkReg(False);
+    Reg#(Bit#(512)) curLine    <- mkRegU;
+    Reg#(Bit#(6))   curByteOff <- mkReg(0);   // read position within curLine (0 = byte 0)
+    Reg#(Bit#(32))  bytesLeft  <- mkReg(0);   // packet bytes not yet consumed
+    Reg#(Bool)      lineValid  <- mkReg(False);
 
     rule doHeader(state == PRHeader && wordQ.notEmpty);
         wordQ.deq;
@@ -103,10 +114,11 @@ module mkPacketReader(PacketReaderIfc);
         state     <= PRFeedPkt;
     endrule
 
+    // Fetch next AXI word into curLine; reset byte offset to 0.
     rule fetchLine(state == PRFeedPkt && !lineValid && wordQ.notEmpty);
-        curLine   <= wordQ.first; wordQ.deq;
-        lineBytes <= 63;
-        lineValid <= True;
+        curLine    <= wordQ.first; wordQ.deq;
+        curByteOff <= 0;
+        lineValid  <= True;
     endrule
 
     rule doNextPkt(state == PRNextPkt && descFifo.notEmpty);
@@ -124,22 +136,57 @@ module mkPacketReader(PacketReaderIfc);
         state <= PRHeader;
     endmethod
 
-    method Bool pktReady = (state == PRFeedPkt) && lineValid && (bytesLeft > 0);
-
+    method Bool pktReady    = (state == PRFeedPkt) && lineValid && (bytesLeft > 0);
     method Bool pktLastByte = (state == PRFeedPkt) && lineValid && (bytesLeft == 1);
 
+    // Extract the byte at curByteOff from the unshifted curLine.
     method Bit#(8) getByte if (lineValid && bytesLeft > 0);
-        return curLine[7:0];
+        Bit#(9) sh = zeroExtend(curByteOff) << 3;
+        return truncate(curLine >> sh);
     endmethod
 
+    // Advance one byte: move curByteOff forward; invalidate line at word boundary or
+    // last packet byte so fetchLine picks up the next word.
     method Action advanceByte if (lineValid && bytesLeft > 0);
-        curLine   <= curLine >> 8;
-        bytesLeft <= bytesLeft - 1;
-        if (lineBytes == 0)
+        curByteOff <= curByteOff + 1;
+        bytesLeft  <= bytesLeft - 1;
+        if (curByteOff == 63 || bytesLeft == 1)
             lineValid <= False;
-        else
-            lineBytes <= lineBytes - 1;
     endmethod
+
+    // Full unshifted AXI word — callers use lineByteOffset to find where their
+    // data starts within this word.
+    method Bit#(512) getLine if (lineValid && bytesLeft > 0);
+        return curLine;
+    endmethod
+
+    // Byte offset of the current read position within curLine.
+    // For the first payload word this equals pay_off for ExactMatch.
+    method Bit#(6) lineByteOffset if (lineValid && bytesLeft > 0);
+        return curByteOff;
+    endmethod
+
+    // How many bytes of this line belong to the current packet.
+    method Bit#(7) lineValidBytes if (lineValid && bytesLeft > 0);
+        Bit#(7) avail = 7'd64 - zeroExtend(curByteOff);
+        return (zeroExtend(avail) < bytesLeft) ? avail : truncate(bytesLeft);
+    endmethod
+
+    // True when all remaining packet bytes are in this line.
+    method Bool lineIsLast if (lineValid && bytesLeft > 0);
+        Bit#(32) avail = zeroExtend(7'd64 - zeroExtend(curByteOff));
+        return bytesLeft <= avail;
+    endmethod
+
+    // Consume the rest of this line and mark it invalid so fetchLine loads the next.
+    method Action advanceLine if (lineValid && bytesLeft > 0);
+        Bit#(32) avail   = zeroExtend(7'd64 - zeroExtend(curByteOff));
+        Bit#(32) consume = (avail < bytesLeft) ? avail : bytesLeft;
+        bytesLeft <= bytesLeft - consume;
+        lineValid <= False;
+    endmethod
+
+    method Bit#(32) bytesRemaining = bytesLeft;
 
     method Bool pktDone = (state == PRFeedPkt) && (bytesLeft == 0);
 

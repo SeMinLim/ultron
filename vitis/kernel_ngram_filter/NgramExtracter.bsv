@@ -3,8 +3,8 @@ package NgramExtracter;
 import FIFOF::*;
 import Vector::*;
 
-typedef 61 NGramLanes;
-typedef 61 NBitmapLanes;
+typedef 64 NGramLanes;
+typedef 64 NBitmapLanes;
 
 typedef struct {
     Bit#(32) gram;
@@ -28,19 +28,26 @@ module mkNgramExtracter(NgramExtracterIfc);
 
     FIFOF#(Vector#(NBitmapLanes, Maybe#(NgramOut))) outQ <- mkSizedFIFOF(16);
 
+    // Carry bytes from the previous batch needed to form cross-batch 3-grams.
     Reg#(Bit#(8))  carry0   <- mkReg(0);
     Reg#(Bit#(8))  carry1   <- mkReg(0);
     Reg#(Bool)     hasCarry <- mkReg(False);
     Reg#(Bit#(32)) basePos  <- mkReg(0);
 
+    // One-deep batch register (reference style: no FIFO, just a ready flag).
     Reg#(Vector#(NGramLanes, Bit#(8))) batchBuf   <- mkRegU;
     Reg#(Bit#(7))                      batchCount <- mkReg(0);
     Reg#(Bool)                         batchLast  <- mkReg(False);
     Reg#(Bool)                         batchReady <- mkReg(False);
 
-    Reg#(Vector#(NGramLanes, Maybe#(NgramOut))) stageBuf <- mkRegU;
-    Reg#(Bool) stageValid <- mkReg(False);
+    Reg#(Vector#(NGramLanes, Maybe#(NgramOut))) stageBuf   <- mkRegU;
+    Reg#(Bool)                                  stageValid <- mkReg(False);
 
+    // Process one batch: extract up to NGramLanes 3-grams.
+    // Lane i covers bytes [i-2, i-1, i] within the batch (carry bytes fill i-2, i-1
+    // when i < 2).  carryOk gates lanes that need bytes from the previous batch.
+    // This prevents anchor underflow: on the very first batch (hasCarry=False),
+    // lanes 0 and 1 are suppressed because they would need bytes that don't exist yet.
     rule processBatch(batchReady && !stageValid);
         let ibuf = batchBuf;
         let cnt  = batchCount;
@@ -59,12 +66,14 @@ module mkNgramExtracter(NgramExtracterIfc);
                              ibuf[fromInteger(i - 1)]);
                 Bit#(8) b2 = foldCase(ibuf[fromInteger(i)]);
 
-                Bit#(24) g24 = {b0, b1, b2};
-                Bit#(32) g32 = zeroExtend(g24);
+                // anchor = payload position of the first byte of this 3-gram.
+                // i=2 → anchor = base+0 (first gram of batch, no underflow).
+                // i=0,1 with carry → anchor = base-2, base-1 (cross-batch grams).
+                Bit#(32) anchor = base + fromInteger(i) - 2;
 
                 result[fromInteger(i)] = tagged Valid (NgramOut {
-                    gram:   g32,
-                    anchor: base + fromInteger(i) - 2
+                    gram:   zeroExtend({b0, b1, b2}),
+                    anchor: anchor
                 });
             end
         end
@@ -73,6 +82,7 @@ module mkNgramExtracter(NgramExtracterIfc);
         stageValid <= True;
         batchReady <= False;
 
+        // Update carry for the next batch.
         if (batchLast) begin
             carry0   <= 0;
             carry1   <= 0;
@@ -84,6 +94,7 @@ module mkNgramExtracter(NgramExtracterIfc);
             hasCarry <= True;
             basePos  <= base + zeroExtend(cnt);
         end else begin
+            // cnt == 1: slide carry window by one.
             carry0   <= carry1;
             carry1   <= ibuf[0];
             hasCarry <= hasCarry;
@@ -96,6 +107,7 @@ module mkNgramExtracter(NgramExtracterIfc);
         stageValid <= False;
     endrule
 
+    // Extract bytes from the AXI word starting at startByte into the flat batch buffer.
     method Action putBytes(Bit#(512) word, Bit#(7) startByte,
                            Bit#(7) count, Bool last) if (!batchReady);
         Vector#(NGramLanes, Bit#(8)) bytes = replicate(0);
@@ -114,8 +126,7 @@ module mkNgramExtracter(NgramExtracterIfc);
 
     method ActionValue#(Vector#(NBitmapLanes, Maybe#(NgramOut))) getGrams
             if (outQ.notEmpty);
-        let v = outQ.first;
-        outQ.deq;
+        let v = outQ.first; outQ.deq;
         return v;
     endmethod
 
