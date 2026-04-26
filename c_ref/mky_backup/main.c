@@ -222,7 +222,7 @@ int main(int argc, char *argv[])
     for (int i = 0; i < max_stage - 1; i++)
         printf("verify-%d grams      : %d\n", i + 1, bitmap_count_bits(bm_verifier_arr + i));
     printf("bitmap grams total  : %d\n", stage_bits_total + verifier_bits_total);
-    printf("bitmap size         : %d bytes per bitmap (256KB)\n", (int)BITMAP_BYTES);
+    printf("bitmap size         : %d bytes per bitmap (32KB)\n", (int)BITMAP_BYTES);
     printf("bitmap size total   : %zu bytes total\n",
            ((size_t)max_stage + (size_t)(max_stage - 1)) * sizeof(Bitmap));
     printf("verify              : %s\n", verify_ok ? "OK" : "FAIL");
