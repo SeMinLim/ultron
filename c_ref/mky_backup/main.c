@@ -176,14 +176,26 @@ int main(int argc, char *argv[])
     for (int i=0; i < max_stage; i ++)
         bitmap_clear(bm_arr + i);
 
+    uint8_t *min_stage_at_gram = malloc(BITMAP_BITS);
+    memset(min_stage_at_gram, 0xff, BITMAP_BITS);
+    for (int i = 0; i < sr->count; i++) {
+        uint32_t gidx = bitmap_idx(sr->assigns[i].gram);
+        int s = sr->assigns[i].stage;
+        if (s < min_stage_at_gram[gidx])
+            min_stage_at_gram[gidx] = (uint8_t)(s > 255 ? 255 : s);
+    }
+
     for (int i = 0; i < sr->count; i++) {
         uint8_t* gram = sr->assigns[i].gram;
         int stage = sr->assigns[i].stage;
+        uint32_t gidx = bitmap_idx(gram);
         bitmap_set_gram(bm_arr, gram);
 
         for (int cur_stage = 1; cur_stage < stage; cur_stage++) {
-            Bitmap* current_verifier = bm_verifier_arr + (cur_stage-1);
-            bitmap_set_gram(current_verifier, gram);
+            if (min_stage_at_gram[gidx] > cur_stage) {
+                Bitmap* current_verifier = bm_verifier_arr + (cur_stage-1);
+                bitmap_set_gram(current_verifier, gram);
+            }
 
             uint8_t next_gram[N];
             memcpy(
@@ -195,6 +207,7 @@ int main(int argc, char *argv[])
             bitmap_set_gram(current_stage, next_gram);
         }
     }
+    free(min_stage_at_gram);
 
 
     int verify_ok = 1;
@@ -267,6 +280,8 @@ int main(int argc, char *argv[])
             int n_bm_pkts = 0;
             int n_exact_pkts = 0;
             int bitmap_hits_gram_cnt = 0, total_ngram_cnt = 0;
+            StageStat agg_stage[MATCH_MAX_STAGES] = {0};
+            StageStat agg_ht = {0}, agg_cand = {0}, agg_exact = {0}, agg_pom = {0};
 
             typedef struct { int frame; int ids[256]; int n; } PmRecord;
             PmRecord *pm_log = malloc(16384 * sizeof(PmRecord));
@@ -296,14 +311,26 @@ int main(int argc, char *argv[])
                                             &candidates, &candidate_cap, max_stage);
                 if (mc.nc > 0) n_bm_pkts++;
                 if (mc.ngram_hit > 0) bitmap_hits_gram_cnt += mc.ngram_hit;
+                for (int si = 0; si < mc.n_stages; si++) {
+                    agg_stage[si].total += mc.stage[si].total;
+                    agg_stage[si].hit   += mc.stage[si].hit;
+                }
+                agg_ht.total   += mc.ht_total;
+                agg_ht.hit     += mc.ht_hit;
+                agg_cand.total += mc.cand_total;
+                agg_cand.hit   += mc.cand_hit;
 
                 int nm = exact_match(folded, (int)flen,
                                      candidates, mc.nc,
                                      rs, matches, 256);
                 if (nm > 0) n_exact_pkts++;
+                agg_exact.total += mc.nc;
+                agg_exact.hit   += nm;
 
                 MatchResult filtered[256];
                 int nf = port_offset_match(matches, nm, rs, &pkt, filtered, 256);
+                agg_pom.total += nm;
+                agg_pom.hit   += nf;
                 priority_sort(filtered, nf, rs);
                 if (nf > 0) {
                     n_matched_pkts++;
@@ -341,6 +368,28 @@ int main(int argc, char *argv[])
                    n_matched_pkts, n_parsed,
                    n_parsed ? 100.0 * n_matched_pkts / n_parsed : 0.0);
 
+            printf("\n=== per-stage gram filter ===\n");
+            printf("%-10s  %12s  %12s  %12s  %7s\n",
+                   "stage", "total", "hit", "miss", "pass%");
+            for (int si = 0; si < max_stage && si < MATCH_MAX_STAGES; si++) {
+                int t = agg_stage[si].total;
+                int h = agg_stage[si].hit;
+                printf("bitmap-%-3d  %12d  %12d  %12d  %6.2f%%\n",
+                       si + 1, t, h, t - h, t ? 100.0 * h / t : 0.0);
+            }
+            printf("%-10s  %12d  %12d  %12d  %6.2f%%\n",
+                   "hashtable", agg_ht.total, agg_ht.hit, agg_ht.total - agg_ht.hit,
+                   agg_ht.total ? 100.0 * agg_ht.hit / agg_ht.total : 0.0);
+            printf("%-10s  %12d  %12d  %12d  %6.2f%%\n",
+                   "candidate", agg_cand.total, agg_cand.hit, agg_cand.total - agg_cand.hit,
+                   agg_cand.total ? 100.0 * agg_cand.hit / agg_cand.total : 0.0);
+            printf("%-10s  %12d  %12d  %12d  %6.2f%%\n",
+                   "exact", agg_exact.total, agg_exact.hit, agg_exact.total - agg_exact.hit,
+                   agg_exact.total ? 100.0 * agg_exact.hit / agg_exact.total : 0.0);
+            printf("%-10s  %12d  %12d  %12d  %6.2f%%\n",
+                   "pom", agg_pom.total, agg_pom.hit, agg_pom.total - agg_pom.hit,
+                   agg_pom.total ? 100.0 * agg_pom.hit / agg_pom.total : 0.0);
+
             if (verbose > 1) {
                 printf("\n=== pm output ===\n");
                 printf("%-8s  %s\n", "frame", "rule ids");
@@ -356,6 +405,8 @@ int main(int argc, char *argv[])
         }
     } else {
         int fn = 0, total_bm = 0, total_exact = 0;
+        StageStat agg_stage[MATCH_MAX_STAGES] = {0};
+        StageStat agg_ht = {0}, agg_cand = {0}, agg_exact = {0};
         for (int i = 0; i < rs->count; i++) {
             const Rule *r = &rs->rules[i];
             if (r->pat_len < 3) continue;
@@ -364,11 +415,21 @@ int main(int argc, char *argv[])
                                         bm_arr, bm_verifier_arr,
                                         &candidates, &candidate_cap, max_stage);
             total_bm += mc.nc;
+            for (int si = 0; si < mc.n_stages; si++) {
+                agg_stage[si].total += mc.stage[si].total;
+                agg_stage[si].hit   += mc.stage[si].hit;
+            }
+            agg_ht.total   += mc.ht_total;
+            agg_ht.hit     += mc.ht_hit;
+            agg_cand.total += mc.cand_total;
+            agg_cand.hit   += mc.cand_hit;
 
             int nm = exact_match((const uint8_t *)r->pattern, r->pat_len,
                                  candidates, mc.nc,
                                  rs, matches, 256);
             total_exact += nm;
+            agg_exact.total += mc.nc;
+            agg_exact.hit   += nm;
 
             int found = 0;
             for (int j = 0; j < nm; j++)
@@ -379,6 +440,25 @@ int main(int argc, char *argv[])
         printf("bitmap hits     : %d  (potential match candidates)\n", total_bm);
         printf("exact matches   : %d\n", total_exact);
         printf("false negatives : %d\n", fn);
+
+        printf("\n=== per-stage gram filter ===\n");
+        printf("%-10s  %12s  %12s  %12s  %7s\n",
+               "stage", "total", "hit", "miss", "pass%");
+        for (int si = 0; si < max_stage && si < MATCH_MAX_STAGES; si++) {
+            int t = agg_stage[si].total;
+            int h = agg_stage[si].hit;
+            printf("bitmap-%-3d  %12d  %12d  %12d  %6.2f%%\n",
+                   si + 1, t, h, t - h, t ? 100.0 * h / t : 0.0);
+        }
+        printf("%-10s  %12d  %12d  %12d  %6.2f%%\n",
+               "hashtable", agg_ht.total, agg_ht.hit, agg_ht.total - agg_ht.hit,
+               agg_ht.total ? 100.0 * agg_ht.hit / agg_ht.total : 0.0);
+        printf("%-10s  %12d  %12d  %12d  %6.2f%%\n",
+               "candidate", agg_cand.total, agg_cand.hit, agg_cand.total - agg_cand.hit,
+               agg_cand.total ? 100.0 * agg_cand.hit / agg_cand.total : 0.0);
+        printf("%-10s  %12d  %12d  %12d  %6.2f%%\n",
+               "exact", agg_exact.total, agg_exact.hit, agg_exact.total - agg_exact.hit,
+               agg_exact.total ? 100.0 * agg_exact.hit / agg_exact.total : 0.0);
 
         printf("\nSample self-matches (first 5 eligible rules):\n");
         printf("  %-6s  %-6s  %-8s  %s\n", "ruleid", "anchor", "gram", "pattern (first 20 bytes)");

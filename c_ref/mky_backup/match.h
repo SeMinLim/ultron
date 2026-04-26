@@ -11,9 +11,22 @@ typedef struct {
     SingletonResult *sr;
 } MatchCtx;
 
+#define MATCH_MAX_STAGES 8
+
+typedef struct {
+    int total;
+    int hit;
+} StageStat;
+
 typedef struct {
     int       ngram_hit;
     int       nc;
+    int       n_stages;
+    StageStat stage[MATCH_MAX_STAGES];
+    int       ht_total;
+    int       ht_hit;
+    int       cand_total;
+    int       cand_hit;
 } MatchCount;
 
 typedef struct {
