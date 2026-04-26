@@ -16,20 +16,42 @@ void match_init(MatchCtx *ctx, SingletonResult *sr)
     qsort(sr->assigns, sr->count, sizeof(GramAssign), cmp_by_gram_idx);
 
     ctx->sr = sr;
-    ctx->ht = ht_create(sr->count * 2);
 
+    int per_bank[HT_BANKS] = {0};
     for (int i = 0; i < sr->count; i++) {
-        int gidx = (int)sr->assigns[i].gram_idx;
-        int existing;
-        if (!ht_lookup(ctx->ht, gidx, &existing))
-            ht_insert(ctx->ht, gidx, i);
+        if (i > 0 && sr->assigns[i].gram_idx == sr->assigns[i - 1].gram_idx)
+            continue;
+        per_bank[sr->assigns[i].gram_idx & HT_BANK_MASK]++;
+    }
+
+    for (int b = 0; b < HT_BANKS; b++) {
+        int cap = per_bank[b] * 2;
+        if (cap < 16) cap = 16;
+
+        for (int attempt = 0; attempt < 8; attempt++) {
+            ctx->banks[b] = ht_create(cap);
+            int ok = 1;
+            for (int i = 0; i < sr->count; i++) {
+                int gidx = (int)sr->assigns[i].gram_idx;
+                if ((gidx & HT_BANK_MASK) != b) continue;
+                int subkey = gidx >> 2;
+                int existing;
+                if (ht_lookup(ctx->banks[b], subkey, &existing)) continue;
+                if (!ht_insert(ctx->banks[b], subkey, i)) { ok = 0; break; }
+            }
+            if (ok) break;
+            ht_destroy(ctx->banks[b]);
+            cap *= 2;
+        }
     }
 }
 
 void match_destroy(MatchCtx *ctx)
 {
-    ht_destroy(ctx->ht);
-    ctx->ht = NULL;
+    for (int b = 0; b < HT_BANKS; b++) {
+        ht_destroy(ctx->banks[b]);
+        ctx->banks[b] = NULL;
+    }
     ctx->sr = NULL;
 }
 
@@ -72,11 +94,15 @@ MatchCount match_scan(const MatchCtx *ctx,
             continue;
 
         int gidx = (int)bitmap_idx(gram);
+        int bank = gidx & HT_BANK_MASK;
+        int subkey = gidx >> 2;
         int base;
         res.ht_total++;
-        if (!ht_lookup(ctx->ht, gidx, &base))
+        res.bank_lookups[bank]++;
+        if (!ht_lookup(ctx->banks[bank], subkey, &base))
             continue;
         res.ht_hit++;
+        res.bank_hits[bank]++;
 
         int anchor_hit = 0;
         for (int j = base;

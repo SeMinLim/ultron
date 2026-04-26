@@ -6,8 +6,11 @@
 #include "singleton.h"
 #include "hashtable.h"
 
+#define HT_BANKS 4
+#define HT_BANK_MASK (HT_BANKS - 1)
+
 typedef struct {
-    HashTable       *ht;
+    HashTable       *banks[HT_BANKS];
     SingletonResult *sr;
 } MatchCtx;
 
@@ -27,6 +30,8 @@ typedef struct {
     int       ht_hit;
     int       cand_total;
     int       cand_hit;
+    int       bank_lookups[HT_BANKS];
+    int       bank_hits[HT_BANKS];
 } MatchCount;
 
 typedef struct {
