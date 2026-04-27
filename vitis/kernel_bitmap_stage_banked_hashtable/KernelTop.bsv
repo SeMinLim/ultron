@@ -9,7 +9,6 @@ import Clocks :: *;
 
 import KernelMain::*;
 
-
 interface KernelTopIfc;
 	(* always_ready *)
 	interface Axi4MemoryMasterPinsIfc#(64,512) db;
@@ -83,7 +82,6 @@ module kernel (KernelTopIfc);
 			kernelMain.mem[i].readWord(d);
 		endrule
 	end
-
 
 	interface db = axi4mem[0].pins;
 	interface pkt = axi4mem[1].pins;

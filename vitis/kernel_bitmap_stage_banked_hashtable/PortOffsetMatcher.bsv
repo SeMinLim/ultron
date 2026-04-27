@@ -35,7 +35,6 @@ typedef struct {
     Bit#(32) offset;
 } PomResult deriving (Bits, Eq, FShow);
 
-// PomEntry (32-bit): [0]=valid [1]=isBig [15:2]=offset[13:0] [31:16]=matchKey
 typedef Bit#(32) PomEntry;
 
 function Bool     pomValid(PomEntry e)    = (e[0:0] != 0);

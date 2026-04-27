@@ -45,4 +45,4 @@ module mkBramHashTable(BramHashTableIfc#(keySz, logSz))
 	endmethod
 endmodule
 
-endpackage // BramHashTable
+endpackage

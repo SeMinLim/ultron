@@ -1,15 +1,5 @@
 package ResultWriter;
 
-// Streams per-packet match results to HBM[2] (port "result") as each packet
-// finishes.  No per-packet FIFO: the only buffer is the 16-entry AXI line
-// register pktBuf.  On every line boundary (or the last packet) a 64B burst
-// is issued.  After all packets complete, startWrite emits a separate 128B
-// burst at the base address holding the summary counters.
-//
-// Result buffer layout (unchanged from host's point of view):
-//   [0..128)              128B summary: 32 x u32 counters
-//   [128..128+pktCount*4) per-packet: {matched[1], reserved[15], ruleId[16]} per packet
-
 import FIFOF::*;
 import Vector::*;
 
@@ -39,11 +29,20 @@ typedef struct {
     Bit#(32) noMatchPkts;
     Bit#(32) stage2Checked;
     Bit#(32) stage2Passed;
+
+    Bit#(32) dataLoaderE2E;
+    Bit#(32) packetReaderE2E;
+    Bit#(32) payloadFeedE2E;
+    Bit#(32) ngramE2E;
+    Bit#(32) bitmapE2E;
+    Bit#(32) gramE2E;
+    Bit#(32) exactE2E;
+    Bit#(32) pomE2E;
+    Bit#(32) resultWriterE2E;
 } ResultSummary deriving (Bits, Eq, FShow);
 
 interface ResultWriterIfc;
-    // Must be called before the first addResult: latches resultBase + pktCount
-    // and resets the internal state.
+
     method Action configure(Bit#(64) resultBase, Bit#(32) pktCount);
     method Action addResult(Bool matched, Bit#(16) ruleId);
     method Action startWrite(ResultSummary summary);
@@ -69,11 +68,10 @@ module mkResultWriter(ResultWriterIfc);
     Reg#(Vector#(16, Bit#(32))) pktBuf  <- mkReg(replicate(0));
     Reg#(Bit#(5))               pktBufN <- mkReg(0);
 
-    // Summary emission is a small 2-step state machine.  Separating it from
-    // startWrite avoids enqueueing two words into writeWordQ in a single action
-    // (which would need writeWordQ.notFull to guarantee 2 slots, not 1).
     Reg#(Bit#(2))       sumPhase <- mkReg(0);
     Reg#(ResultSummary) summaryR <- mkReg(unpack(0));
+
+    Reg#(Bit#(8)) drainTicks <- mkReg(0);
 
     function Bit#(512) packSummary0(ResultSummary s,
                                     Bit#(32) matched, Bit#(32) processed);
@@ -113,16 +111,40 @@ module mkResultWriter(ResultWriterIfc);
         return w;
     endfunction
 
+    function Bit#(512) packSummary2(ResultSummary s);
+        Bit#(512) w = 0;
+        w[31:0]    = s.dataLoaderE2E;
+        w[63:32]   = s.packetReaderE2E;
+        w[95:64]   = s.payloadFeedE2E;
+        w[127:96]  = s.ngramE2E;
+        w[159:128] = s.bitmapE2E;
+        w[191:160] = s.gramE2E;
+        w[223:192] = s.exactE2E;
+        w[255:224] = s.pomE2E;
+        w[287:256] = s.resultWriterE2E;
+        return w;
+    endfunction
+
     rule emitSummary0(sumPhase == 1);
-        writeReqQ.enq(tuple2(resultBase_r, 128));
+        writeReqQ.enq(tuple2(resultBase_r, 192));
         writeWordQ.enq(packSummary0(summaryR, matchedCount, processedCount));
         sumPhase <= 2;
     endrule
 
     rule emitSummary1(sumPhase == 2);
         writeWordQ.enq(packSummary1(summaryR));
-        sumPhase <= 0;
-        done     <= True;
+        sumPhase <= 3;
+    endrule
+
+    rule emitSummary2(sumPhase == 3);
+        writeWordQ.enq(packSummary2(summaryR));
+        sumPhase   <= 0;
+        drainTicks <= 128;
+    endrule
+
+    rule countDrain(drainTicks > 0 && !done);
+        drainTicks <= drainTicks - 1;
+        if (drainTicks == 1) done <= True;
     endrule
 
     method Action configure(Bit#(64) resultBase, Bit#(32) pktCount);
@@ -136,11 +158,9 @@ module mkResultWriter(ResultWriterIfc);
         pktBuf         <= replicate(0);
         pktBufN        <= 0;
         sumPhase       <= 0;
+        drainTicks     <= 0;
     endmethod
 
-    // Streams one result into pktBuf; flushes a 64B AXI beat on line boundary
-    // or on the last packet.  Guard conservatively requires both mem queues to
-    // have a free slot so a flush never stalls mid-action.
     method Action addResult(Bool matched, Bit#(16) ruleId)
             if (pktsDone < pktTotal &&
                 writeReqQ.notFull && writeWordQ.notFull);
@@ -156,7 +176,7 @@ module mkResultWriter(ResultWriterIfc);
 
         if (flushLine) begin
             writeReqQ.enq(tuple2(
-                resultBase_r + 128 + zeroExtend(lineIdx) * 64, 64));
+                resultBase_r + 192 + zeroExtend(lineIdx) * 64, 64));
             writeWordQ.enq(pack(v));
             pktBuf  <= replicate(0);
             pktBufN <= 0;
@@ -168,8 +188,6 @@ module mkResultWriter(ResultWriterIfc);
         pktsDone <= pktsDone + 1;
     endmethod
 
-    // Only arms the summary emission once every per-packet line has been
-    // flushed.  The two emitSummary rules then drive the actual burst.
     method Action startWrite(ResultSummary summary)
             if (!done && sumPhase == 0 &&
                 pktsDone == pktTotal && pktBufN == 0);

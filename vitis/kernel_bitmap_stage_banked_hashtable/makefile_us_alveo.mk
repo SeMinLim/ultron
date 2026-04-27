@@ -74,9 +74,9 @@ XCLBIN_ABS_PATH := $(CURDIR)/$(BUILD_DIR)/kernel.xclbin
 DB_BLOB  ?= $(HOSTDIR)/db.bin
 PCAP     ?= $(HOSTDIR)/full.pcap
 
-$(DB_BLOB):
-	cd $(HOSTDIR)/gen && cc -O2 -std=c17 -o bitmap_stage_db_gen bitmap_stage_db_gen.c
-	$(HOSTDIR)/gen/bitmap_stage_db_gen $(HOSTDIR)/rule.txt $(DB_BLOB)
+$(DB_BLOB): $(HOSTDIR)/gen/ngram_db_gen.c $(HOSTDIR)/rule.txt
+	cd $(HOSTDIR)/gen && cc -O2 -std=c17 -o ngram_db_gen ngram_db_gen.c
+	$(HOSTDIR)/gen/ngram_db_gen $(HOSTDIR)/rule.txt $(DB_BLOB)
 
 run: $(DB_BLOB)
 ifeq ($(TARGET),hw_emu)
