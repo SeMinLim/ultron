@@ -42,14 +42,19 @@ typedef enum { KIdle, KInit, KProcess, KWritePrep, KWrite, KDone } KState derivi
 module mkKernelMain(KernelMainIfc);
 
     ExactPatternTableIfc  patternTable <- mkExactPatternTable;
-    BitmapUramIfc         bitmap0      <- mkBitmapUram;
-    BitmapUramIfc         bitmap1      <- mkBitmapUram;  // stage-2: next-gram bitmap
+    // bm0 is split per-stage so the cuckoo lookup can be gated on bm1 for
+    // long rules without first paying for a cuckoo cycle.  Mirrors the PDF
+    // multi-stage bitmap design (bm0_s1 = "directly to hashtable",
+    // bm0_s2 = "must check bm1 first").
+    BitmapUramIfc         bm0_s1       <- mkBitmapUram;  // stage-1 first grams
+    BitmapUramIfc         bm0_s2       <- mkBitmapUram;  // stage-2 first grams
+    BitmapUramIfc         bm1          <- mkBitmapUram;  // stage-2 next grams (anchor+3)
     GramMatcherIfc        gram         <- mkGramMatcher;
     NgramExtracterIfc     ngram        <- mkNgramExtracter;
     PacketMetaIfc         pktMeta      <- mkPacketMeta;
     ExactMatchIfc         exactMatch   <- mkExactMatch(patternTable);
     PortOffsetMatcherIfc  portMatch    <- mkPortOffsetMatcher;
-    DataLoaderIfc         dataLoader   <- mkDataLoader(bitmap0, bitmap1, gram, patternTable, portMatch);
+    DataLoaderIfc         dataLoader   <- mkDataLoader(bm0_s1, bm0_s2, bm1, gram, patternTable, portMatch);
     PacketReaderIfc       pktReader    <- mkPacketReader;
     ResultWriterIfc       resultWriter <- mkResultWriter;
 
@@ -90,6 +95,20 @@ module mkKernelMain(KernelMainIfc);
     Reg#(Bit#(32)) exactCycles        <- mkReg(0);
     Reg#(Bit#(32)) pomCycles          <- mkReg(0);
     Reg#(Bit#(32)) resultWriterCycles <- mkReg(0);
+
+    // Per-module end-to-end span: cycle of last activity - cycle of first
+    // activity, idle gaps included. Counterpart to the active-cycle counters
+    // above (which report utilization rather than duration).
+    E2ESpanIfc dataLoaderSpan   <- mkE2ESpan;
+    E2ESpanIfc packetReaderSpan <- mkE2ESpan;
+    E2ESpanIfc payloadFeedSpan  <- mkE2ESpan;
+    E2ESpanIfc ngramSpan        <- mkE2ESpan;
+    E2ESpanIfc bitmapSpan       <- mkE2ESpan;
+    E2ESpanIfc gramSpan         <- mkE2ESpan;
+    E2ESpanIfc exactSpan        <- mkE2ESpan;
+    E2ESpanIfc pomSpan          <- mkE2ESpan;
+    E2ESpanIfc resultWriterSpan <- mkE2ESpan;
+
     Reg#(Bit#(32)) gramsExtracted     <- mkReg(0);
     Reg#(Bit#(32)) bitmapPassed       <- mkReg(0);
     Reg#(Bit#(32)) gramLookups        <- mkReg(0);
@@ -161,33 +180,53 @@ module mkKernelMain(KernelMainIfc);
         (state == KProcess && !pktReader.allDone) ||
         (state == KDone && !resultWriter.writeDone)
     );
-        if (state == KInit && !dataLoader.loadDone)
+        Bit#(32) now = timerTotal.value;
+
+        if (state == KInit && !dataLoader.loadDone) begin
             dataLoaderCycles <= dataLoaderCycles + 1;
+            dataLoaderSpan.mark(now);
+        end
 
         if (state == KProcess && !pktReader.allDone) begin
             // pktReader.busy excludes the PRFeedPkt-with-bytesLeft=0 drain
             // window, so this number reflects time the reader is actually
             // making progress rather than waiting on the back-end pipeline.
-            if (pktReader.busy)
+            if (pktReader.busy) begin
                 packetReaderCycles <= packetReaderCycles + 1;
+                packetReaderSpan.mark(now);
+            end
             // Cycle in which feedPayloadWord could fire (= a payload word is
             // being injected into ngram).  Excludes pktDone wait window.
-            if (pktReader.pktReady && metaReady)
+            if (pktReader.pktReady && metaReady) begin
                 payloadFeedCycles <= payloadFeedCycles + 1;
-            if (!ngram.idle)
+                payloadFeedSpan.mark(now);
+            end
+            if (!ngram.idle) begin
                 ngramCycles <= ngramCycles + 1;
-            if (!bitmap0.idle || !bitmap1.idle)
+                ngramSpan.mark(now);
+            end
+            if (!bm0_s1.idle || !bm0_s2.idle || !bm1.idle) begin
                 bitmapCycles <= bitmapCycles + 1;
-            if (!gram.idle)
+                bitmapSpan.mark(now);
+            end
+            if (!gram.idle) begin
                 gramCycles <= gramCycles + 1;
-            if (exactMatch.inputPending || exactMatch.notEmpty)
+                gramSpan.mark(now);
+            end
+            if (exactMatch.inputPending || exactMatch.notEmpty) begin
                 exactCycles <= exactCycles + 1;
-            if (portMatch.processing)
+                exactSpan.mark(now);
+            end
+            if (portMatch.processing) begin
                 pomCycles <= pomCycles + 1;
+                pomSpan.mark(now);
+            end
         end
 
-        if (state == KDone && !resultWriter.writeDone)
+        if (state == KDone && !resultWriter.writeDone) begin
             resultWriterCycles <= resultWriterCycles + 1;
+            resultWriterSpan.mark(now);
+        end
     endrule
 
     // Load the current packet's metadata (ip proto, ports, icmp fields) into
@@ -291,8 +330,9 @@ module mkKernelMain(KernelMainIfc);
         let cur <- ngram.getGrams;
         let prev = prevBatch;
         match { .bm0K, .bm1K, .bm1V } = buildKeys(prev, cur, True);
-        bitmap0.lookup(bm0K);
-        bitmap1.lookup(bm1K);
+        bm0_s1.lookup(bm0K);
+        bm0_s2.lookup(bm0K);
+        bm1.lookup(bm1K);
         gramSideQ.enq(tuple2(prev, bm1V));
         gramsExtracted <= gramsExtracted + countValidGrams(prev);
         prevBatch <= cur;
@@ -303,8 +343,9 @@ module mkKernelMain(KernelMainIfc);
     rule flushTail(state == KProcess && hasPrev && ngram.idle && pktReader.pktDone);
         let prev = prevBatch;
         match { .bm0K, .bm1K, .bm1V } = buildKeys(prev, prev, False);
-        bitmap0.lookup(bm0K);
-        bitmap1.lookup(bm1K);
+        bm0_s1.lookup(bm0K);
+        bm0_s2.lookup(bm0K);
+        bm1.lookup(bm1K);
         gramSideQ.enq(tuple2(prev, bm1V));
         gramsExtracted <= gramsExtracted + countValidGrams(prev);
         hasPrev <= False;
@@ -546,7 +587,16 @@ module mkKernelMain(KernelMainIfc);
             pomMisses:          pomMisses,
             noMatchPkts:        noMatchPkts,
             stage2Checked:      stage2Checked,
-            stage2Passed:       stage2Passed
+            stage2Passed:       stage2Passed,
+            dataLoaderE2E:      dataLoaderSpan.elapsed,
+            packetReaderE2E:    packetReaderSpan.elapsed,
+            payloadFeedE2E:     payloadFeedSpan.elapsed,
+            ngramE2E:           ngramSpan.elapsed,
+            bitmapE2E:          bitmapSpan.elapsed,
+            gramE2E:            gramSpan.elapsed,
+            exactE2E:           exactSpan.elapsed,
+            pomE2E:             pomSpan.elapsed,
+            resultWriterE2E:    resultWriterSpan.elapsed
         };
         resultSummary <= summary;
         state <= KWrite;
@@ -611,6 +661,15 @@ module mkKernelMain(KernelMainIfc);
         stage2Checked      <= 0;
         stage2Passed       <= 0;
         resultSummary      <= unpack(0);
+        dataLoaderSpan.reset_;
+        packetReaderSpan.reset_;
+        payloadFeedSpan.reset_;
+        ngramSpan.reset_;
+        bitmapSpan.reset_;
+        gramSpan.reset_;
+        exactSpan.reset_;
+        pomSpan.reset_;
+        resultWriterSpan.reset_;
         payTotalLen        <= 0;
         payOff             <= 0;
         metaReady          <= False;

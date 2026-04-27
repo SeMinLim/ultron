@@ -186,8 +186,8 @@ static std::vector<uint8_t> build_pkt_blob(const std::vector<PcapPkt> &pkts)
 }
 
 // result:
-// [0..128)            summary: 32 x u32 counters
-// [128..128+N*4)      per-packet: {matched[1], reserved[15], ruleId[16]}
+// [0..192)            summary: 48 x u32 counters (3 x 64B lines)
+// [192..192+N*4)      per-packet: {matched[1], reserved[15], ruleId[16]}
 static void print_results(const uint8_t *res, uint32_t pkt_count)
 {
     uint32_t matched, processed, db_cyc, pkt_cyc, total_cyc;
@@ -195,6 +195,7 @@ static void print_results(const uint8_t *res, uint32_t pkt_count)
     uint32_t grams_extracted, bitmap_passed, gram_lookups, gram_hits;
     uint32_t exact_checks, exact_hits, exact_misses, pom_checks, pom_hits, pom_misses, no_match_pkts;
     uint32_t stage2_checked, stage2_passed;
+    uint32_t dl_e2e, pr_e2e, pp_e2e, ng_e2e, bm_e2e, gm_e2e, ex_e2e, pom_e2e, rw_e2e;
     memcpy(&matched,   res +  0, 4);
     memcpy(&processed, res +  4, 4);
     memcpy(&db_cyc,    res +  8, 4);
@@ -222,11 +223,22 @@ static void print_results(const uint8_t *res, uint32_t pkt_count)
     memcpy(&no_match_pkts,   res + 96, 4);
     memcpy(&stage2_checked,  res + 100, 4);
     memcpy(&stage2_passed,   res + 104, 4);
+    memcpy(&dl_e2e,  res + 128, 4);
+    memcpy(&pr_e2e,  res + 132, 4);
+    memcpy(&pp_e2e,  res + 136, 4);
+    memcpy(&ng_e2e,  res + 140, 4);
+    memcpy(&bm_e2e,  res + 144, 4);
+    memcpy(&gm_e2e,  res + 148, 4);
+    memcpy(&ex_e2e,  res + 152, 4);
+    memcpy(&pom_e2e, res + 156, 4);
+    memcpy(&rw_e2e,  res + 160, 4);
     printf("matched=%u  processed=%u\n", matched, processed);
     printf("cycles: db_load=%u  pkt_proc=%u  total=%u\n",
            db_cyc, pkt_cyc, total_cyc);
-    printf("module_cycles: data_loader=%u  pkt_reader=%u  payload_feed=%u  ngram=%u  bitmap=%u  gram=%u  exact=%u  pom=%u  result_writer=%u\n",
+    printf("module_cycles (active): data_loader=%u  pkt_reader=%u  payload_feed=%u  ngram=%u  bitmap=%u  gram=%u  exact=%u  pom=%u  result_writer=%u\n",
            dl_cyc, pr_cyc, pp_cyc, ng_cyc, bm_cyc, gm_cyc, ex_cyc, pom_cyc, rw_cyc);
+    printf("module_cycles (e2e):    data_loader=%u  pkt_reader=%u  payload_feed=%u  ngram=%u  bitmap=%u  gram=%u  exact=%u  pom=%u  result_writer=%u\n",
+           dl_e2e, pr_e2e, pp_e2e, ng_e2e, bm_e2e, gm_e2e, ex_e2e, pom_e2e, rw_e2e);
     // Per-stage gram filter — same shape as c_ref/mky_backup main.c so
     // numbers can be diffed line-for-line against the C reference.
     //
@@ -257,7 +269,7 @@ static void print_results(const uint8_t *res, uint32_t pkt_count)
 
     for (uint32_t i = 0; i < pkt_count; i++) {
         uint32_t entry;
-        memcpy(&entry, res + 128 + i * 4, 4);
+        memcpy(&entry, res + 192 + i * 4, 4);
         bool hit = (entry >> 31) & 1;
         uint16_t rule_id = entry & 0xFFFF;
         printf("  pkt[%u]: %s  ruleId=%u\n", i, hit ? "MATCH" : "miss", rule_id);
@@ -293,7 +305,7 @@ int main(int argc, char **argv)
     uint32_t pkt_count = (uint32_t)pkts.size();
     uint32_t db_bytes  = (uint32_t)db_size;
 
-    size_t res_size = 128 + ((pkt_count * 4 + 63) & ~63u);
+    size_t res_size = 192 + ((pkt_count * 4 + 63) & ~63u);
 
     xrt::device device{0u};
     xrt::uuid   uuid = device.load_xclbin(xclbin_path);

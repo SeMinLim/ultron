@@ -9,8 +9,9 @@ import PortOffsetMatcher::*;
 typedef enum {
     DLIdle,
     DLHeader,
-    DLBitmap,
-    DLBitmap1,      // second stage bitmap (b_arr[1]: next-grams of stage-2 rules)
+    DLBm0S1,        // bm0_s1: first grams of stage-1 rules (pat_len < 6)
+    DLBm0S2,        // bm0_s2: first grams of stage-2 rules (pat_len >= 6)
+    DLBm1,          // bm1:    next-grams of stage-2 rules
     DLGhtFetch,
     DLGhtUnpack,
     DLGhtAck,
@@ -31,8 +32,9 @@ interface DataLoaderIfc;
 endinterface
 
 module mkDataLoader#(
-    BitmapUramIfc        bitmap0,
-    BitmapUramIfc        bitmap1,
+    BitmapUramIfc        bm0_s1,
+    BitmapUramIfc        bm0_s2,
+    BitmapUramIfc        bm1,
     GramMatcherIfc       gram,
     ExactPatternTableIfc patTable,
     PortOffsetMatcherIfc portMatcher
@@ -86,34 +88,47 @@ module mkDataLoader#(
         portlocOff <= w[223:192];
         $display("DL header ght=%0d pat=%0d ruledbOff=%0d portlocOff=%0d",
                  w[127:96], w[159:128], w[191:160], w[223:192]);
-        // DB layout: header(64B) | bitmap0(32KB) | bitmap1(32KB) | GHT | patterns | ports
+        // DB layout: header(64B) | bm0_s1(32KB) | bm0_s2(32KB) | bm1(32KB) | GHT | patterns | ports
         // (18-bit gram keys → 2^18 / 8 = 32768 bytes per bitmap = 512 × 64B lines)
         readReqQ.enq(tuple2(baseAddr + 64, 32 * 1024));
         wordIdx <= 0;
-        state   <= DLBitmap;
+        state   <= DLBm0S1;
     endrule
 
-    rule doBitmap(state == DLBitmap && wordQ.notEmpty);
+    rule doBm0S1(state == DLBm0S1 && wordQ.notEmpty);
         let w = wordQ.first; wordQ.deq;
-        bitmap0.writeWord(truncate(wordIdx), w);
+        bm0_s1.writeWord(truncate(wordIdx), w);
         if (wordIdx == 511) begin
-            $display("DL bitmap0 done");
+            $display("DL bm0_s1 done");
             readReqQ.enq(tuple2(baseAddr + 64 + 32*1024, 32*1024));
             wordIdx <= 0;
-            state   <= DLBitmap1;
+            state   <= DLBm0S2;
         end else begin
             wordIdx <= wordIdx + 1;
         end
     endrule
 
-    rule doBitmap1(state == DLBitmap1 && wordQ.notEmpty);
+    rule doBm0S2(state == DLBm0S2 && wordQ.notEmpty);
         let w = wordQ.first; wordQ.deq;
-        bitmap1.writeWord(truncate(wordIdx), w);
+        bm0_s2.writeWord(truncate(wordIdx), w);
         if (wordIdx == 511) begin
-            $display("DL bitmap1 done");
-            // GHT starts after header(64B) + bitmap0(32KB) + bitmap1(32KB)
+            $display("DL bm0_s2 done");
+            readReqQ.enq(tuple2(baseAddr + 64 + 64*1024, 32*1024));
+            wordIdx <= 0;
+            state   <= DLBm1;
+        end else begin
+            wordIdx <= wordIdx + 1;
+        end
+    endrule
+
+    rule doBm1(state == DLBm1 && wordQ.notEmpty);
+        let w = wordQ.first; wordQ.deq;
+        bm1.writeWord(truncate(wordIdx), w);
+        if (wordIdx == 511) begin
+            $display("DL bm1 done");
+            // GHT starts after header(64B) + 3 × 32KB bitmaps = 64 + 96KB
             Bit#(64) ghtBytes = zeroExtend((ghtCount + 3) / 4) * 64;
-            readReqQ.enq(tuple2(baseAddr + 64 + 64*1024, ghtBytes));
+            readReqQ.enq(tuple2(baseAddr + 64 + 96*1024, ghtBytes));
             wordIdx <= 0;
             ghtDone <= 0;
             subIdx  <= 0;

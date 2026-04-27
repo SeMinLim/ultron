@@ -6,9 +6,9 @@ package ResultWriter;
 // is issued.  After all packets complete, startWrite emits a separate 128B
 // burst at the base address holding the summary counters.
 //
-// Result buffer layout (unchanged from host's point of view):
-//   [0..128)              128B summary: 32 x u32 counters
-//   [128..128+pktCount*4) per-packet: {matched[1], reserved[15], ruleId[16]} per packet
+// Result buffer layout:
+//   [0..192)              192B summary: 48 x u32 counters (3 x 64B lines)
+//   [192..192+pktCount*4) per-packet: {matched[1], reserved[15], ruleId[16]} per packet
 
 import FIFOF::*;
 import Vector::*;
@@ -39,6 +39,16 @@ typedef struct {
     Bit#(32) noMatchPkts;
     Bit#(32) stage2Checked;
     Bit#(32) stage2Passed;
+    // End-to-end span (last-active - first-active) per module.
+    Bit#(32) dataLoaderE2E;
+    Bit#(32) packetReaderE2E;
+    Bit#(32) payloadFeedE2E;
+    Bit#(32) ngramE2E;
+    Bit#(32) bitmapE2E;
+    Bit#(32) gramE2E;
+    Bit#(32) exactE2E;
+    Bit#(32) pomE2E;
+    Bit#(32) resultWriterE2E;
 } ResultSummary deriving (Bits, Eq, FShow);
 
 interface ResultWriterIfc;
@@ -74,6 +84,13 @@ module mkResultWriter(ResultWriterIfc);
     // (which would need writeWordQ.notFull to guarantee 2 slots, not 1).
     Reg#(Bit#(2))       sumPhase <- mkReg(0);
     Reg#(ResultSummary) summaryR <- mkReg(unpack(0));
+    // After the last summary word is enqueued, hold off `done` long enough
+    // for the AXI write to drain through ResultWriter -> KernelMain -> AXI
+    // master -> DDR. With a 3-beat summary burst the prior 2-beat-burst race
+    // window is exposed: kernel signaled done while the last beats were still
+    // in flight, host synced FROM_DEVICE before bvalid arrived, summary read
+    // back as zeros even though per-packet bursts (already complete) were OK.
+    Reg#(Bit#(8)) drainTicks <- mkReg(0);
 
     function Bit#(512) packSummary0(ResultSummary s,
                                     Bit#(32) matched, Bit#(32) processed);
@@ -113,16 +130,40 @@ module mkResultWriter(ResultWriterIfc);
         return w;
     endfunction
 
+    function Bit#(512) packSummary2(ResultSummary s);
+        Bit#(512) w = 0;
+        w[31:0]    = s.dataLoaderE2E;
+        w[63:32]   = s.packetReaderE2E;
+        w[95:64]   = s.payloadFeedE2E;
+        w[127:96]  = s.ngramE2E;
+        w[159:128] = s.bitmapE2E;
+        w[191:160] = s.gramE2E;
+        w[223:192] = s.exactE2E;
+        w[255:224] = s.pomE2E;
+        w[287:256] = s.resultWriterE2E;
+        return w;
+    endfunction
+
     rule emitSummary0(sumPhase == 1);
-        writeReqQ.enq(tuple2(resultBase_r, 128));
+        writeReqQ.enq(tuple2(resultBase_r, 192));
         writeWordQ.enq(packSummary0(summaryR, matchedCount, processedCount));
         sumPhase <= 2;
     endrule
 
     rule emitSummary1(sumPhase == 2);
         writeWordQ.enq(packSummary1(summaryR));
-        sumPhase <= 0;
-        done     <= True;
+        sumPhase <= 3;
+    endrule
+
+    rule emitSummary2(sumPhase == 3);
+        writeWordQ.enq(packSummary2(summaryR));
+        sumPhase   <= 0;
+        drainTicks <= 128;
+    endrule
+
+    rule countDrain(drainTicks > 0 && !done);
+        drainTicks <= drainTicks - 1;
+        if (drainTicks == 1) done <= True;
     endrule
 
     method Action configure(Bit#(64) resultBase, Bit#(32) pktCount);
@@ -136,6 +177,7 @@ module mkResultWriter(ResultWriterIfc);
         pktBuf         <= replicate(0);
         pktBufN        <= 0;
         sumPhase       <= 0;
+        drainTicks     <= 0;
     endmethod
 
     // Streams one result into pktBuf; flushes a 64B AXI beat on line boundary
@@ -156,7 +198,7 @@ module mkResultWriter(ResultWriterIfc);
 
         if (flushLine) begin
             writeReqQ.enq(tuple2(
-                resultBase_r + 128 + zeroExtend(lineIdx) * 64, 64));
+                resultBase_r + 192 + zeroExtend(lineIdx) * 64, 64));
             writeWordQ.enq(pack(v));
             pktBuf  <= replicate(0);
             pktBufN <= 0;
