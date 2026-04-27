@@ -1,0 +1,53 @@
+package GramIdTable;
+
+import CuckooHash::*;
+
+typedef struct {
+    Bit#(16) ruleId;
+    Int#(8)  pre;
+    Int#(8)  post;
+    Bit#(8)  len;
+} RuleInfo deriving (Bits, Eq, FShow);
+
+interface GramIdTableIfc;
+    method Action insert(Bit#(32) gram, RuleInfo info);
+    method ActionValue#(Bool) insertAck;
+    method Bool notBusy;
+    method Action lookupReq(Bit#(32) gram);
+    method ActionValue#(Maybe#(RuleInfo)) getResult;
+endinterface
+
+(* synthesize *)
+module mkGramIdTable(GramIdTableIfc);
+
+    // Single 16K-entry table replaces the previous 16x 1K-entry shards.
+    // Total capacity is identical (16K grams) but lookup is a single round-trip
+    // instead of broadcasting to 16 shards and draining a priority encoder.
+    CuckooHashIfc#(32, 40, 14) ht <- mkCuckooHash;
+
+    method Action insert(Bit#(32) gram, RuleInfo info);
+        ht.insert(gram, pack(info));
+    endmethod
+
+    method ActionValue#(Bool) insertAck = ht.insertAck;
+
+    // htState == HT_IDLE is always true during the lookup phase since inserts
+    // are complete before packets are processed.  Pending-lookup tracking is
+    // handled by GramMatcher's ctxQ, so this signal is sufficient.
+    method Bool notBusy = ht.notBusy;
+
+    method Action lookupReq(Bit#(32) gram);
+        ht.lookupReq(gram);
+    endmethod
+
+    method ActionValue#(Maybe#(RuleInfo)) getResult;
+        let v <- ht.lookupResp;
+        return case (v) matches
+            tagged Valid .b: tagged Valid unpack(b);
+            tagged Invalid:  tagged Invalid;
+        endcase;
+    endmethod
+
+endmodule
+
+endpackage
