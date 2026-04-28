@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <malloc.h>
+#include <limits.h>
 #include "rule_loader.h"
 #include "ngram_extract.h"
 #include "singleton.h"
@@ -41,21 +42,29 @@ static void print_hash_table_usage(const MatchCtx *ctx)
 {
     int total_entries = 0, total_slots = 0;
     size_t total_occ = 0, total_req = 0, total_run = 0;
-    printf("hash banks         : %d\n", HT_BANKS);
-    printf("  %-4s  %-8s  %-8s  %-7s\n", "bank", "entries", "slots", "load%");
+    int min_e = INT_MAX, max_e = 0, used_banks = 0;
+    int min_s = INT_MAX, max_s = 0;
     for (int b = 0; b < HT_BANKS; b++) {
         const HashTable *ht = ctx->banks[b];
         int slots = ht_total_slots(ht);
-        double load = slots ? (double)ht->count / (double)slots : 0.0;
-        printf("  %-4d  %-8d  %-8d  %6.2f%%\n",
-               b, ht->count, slots, load * 100.0);
         total_entries += ht->count;
         total_slots   += slots;
         total_occ     += ht_occupied_entry_bytes(ht);
         total_req     += ht_memory_usage_bytes(ht);
         total_run     += ht_runtime_memory_usage_bytes(ht);
+        if (ht->count > 0) used_banks++;
+        if (ht->count < min_e) min_e = ht->count;
+        if (ht->count > max_e) max_e = ht->count;
+        if (slots < min_s) min_s = slots;
+        if (slots > max_s) max_s = slots;
     }
     double load = total_slots ? (double)total_entries / (double)total_slots : 0.0;
+    double avg_e = (double)total_entries / HT_BANKS;
+    printf("hash banks         : %d (%d non-empty)\n", HT_BANKS, used_banks);
+    printf("hash entries/bank  : min=%d  max=%d  avg=%.1f\n",
+           min_e == INT_MAX ? 0 : min_e, max_e, avg_e);
+    printf("hash slots/bank    : min=%d  max=%d\n",
+           min_s == INT_MAX ? 0 : min_s, max_s);
     printf("hash inserted      : %d entries\n", total_entries);
     printf("hash capacity      : %d total slots\n", total_slots);
     printf("hash load factor   : %.2f%%\n", load * 100.0);
@@ -411,12 +420,21 @@ int main(int argc, char *argv[])
                    "pom", agg_pom.total, agg_pom.hit, agg_pom.total - agg_pom.hit,
                    agg_pom.total ? 100.0 * agg_pom.hit / agg_pom.total : 0.0);
 
-            printf("\n=== hashtable bank traffic ===\n");
-            printf("%-4s  %12s  %12s  %7s\n", "bank", "lookups", "hits", "share%");
-            for (int bi = 0; bi < HT_BANKS; bi++) {
-                printf("%-4d  %12d  %12d  %6.2f%%\n",
-                       bi, agg_bank_lookups[bi], agg_bank_hits[bi],
-                       agg_ht.total ? 100.0 * agg_bank_lookups[bi] / agg_ht.total : 0.0);
+            {
+                int min_l = INT_MAX, max_l = 0, used = 0, hot_b = 0;
+                for (int bi = 0; bi < HT_BANKS; bi++) {
+                    int l = agg_bank_lookups[bi];
+                    if (l > 0) used++;
+                    if (l < min_l) min_l = l;
+                    if (l > max_l) { max_l = l; hot_b = bi; }
+                }
+                double avg_l = (double)agg_ht.total / HT_BANKS;
+                double ideal = avg_l > 0 ? (double)max_l / avg_l : 0.0;
+                printf("\n=== hashtable bank traffic ===\n");
+                printf("banks active : %d / %d\n", used, HT_BANKS);
+                printf("lookups/bank : min=%d  max=%d (bank %d)  avg=%.1f\n",
+                       min_l == INT_MAX ? 0 : min_l, max_l, hot_b, avg_l);
+                printf("skew (max/avg): %.2fx  (1.00 = perfect, >2.0 = hot bank)\n", ideal);
             }
 
             if (verbose > 1) {
@@ -494,12 +512,21 @@ int main(int argc, char *argv[])
                "exact", agg_exact.total, agg_exact.hit, agg_exact.total - agg_exact.hit,
                agg_exact.total ? 100.0 * agg_exact.hit / agg_exact.total : 0.0);
 
-        printf("\n=== hashtable bank traffic ===\n");
-        printf("%-4s  %12s  %12s  %7s\n", "bank", "lookups", "hits", "share%");
-        for (int bi = 0; bi < HT_BANKS; bi++) {
-            printf("%-4d  %12d  %12d  %6.2f%%\n",
-                   bi, agg_bank_lookups[bi], agg_bank_hits[bi],
-                   agg_ht.total ? 100.0 * agg_bank_lookups[bi] / agg_ht.total : 0.0);
+        {
+            int min_l = INT_MAX, max_l = 0, used = 0, hot_b = 0;
+            for (int bi = 0; bi < HT_BANKS; bi++) {
+                int l = agg_bank_lookups[bi];
+                if (l > 0) used++;
+                if (l < min_l) min_l = l;
+                if (l > max_l) { max_l = l; hot_b = bi; }
+            }
+            double avg_l = (double)agg_ht.total / HT_BANKS;
+            double ideal = avg_l > 0 ? (double)max_l / avg_l : 0.0;
+            printf("\n=== hashtable bank traffic ===\n");
+            printf("banks active : %d / %d\n", used, HT_BANKS);
+            printf("lookups/bank : min=%d  max=%d (bank %d)  avg=%.1f\n",
+                   min_l == INT_MAX ? 0 : min_l, max_l, hot_b, avg_l);
+            printf("skew (max/avg): %.2fx  (1.00 = perfect, >2.0 = hot bank)\n", ideal);
         }
 
         printf("\nSample self-matches (first 5 eligible rules):\n");

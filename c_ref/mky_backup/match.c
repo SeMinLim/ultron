@@ -34,7 +34,7 @@ void match_init(MatchCtx *ctx, SingletonResult *sr)
             for (int i = 0; i < sr->count; i++) {
                 int gidx = (int)sr->assigns[i].gram_idx;
                 if ((gidx & HT_BANK_MASK) != b) continue;
-                int subkey = gidx >> 2;
+                int subkey = gidx >> HT_BANK_SHIFT;
                 int existing;
                 if (ht_lookup(ctx->banks[b], subkey, &existing)) continue;
                 if (!ht_insert(ctx->banks[b], subkey, i)) { ok = 0; break; }
@@ -95,7 +95,7 @@ MatchCount match_scan(const MatchCtx *ctx,
 
         int gidx = (int)bitmap_idx(gram);
         int bank = gidx & HT_BANK_MASK;
-        int subkey = gidx >> 2;
+        int subkey = gidx >> HT_BANK_SHIFT;
         int base;
         res.ht_total++;
         res.bank_lookups[bank]++;

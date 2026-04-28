@@ -6,8 +6,9 @@
 #include "singleton.h"
 #include "hashtable.h"
 
-#define HT_BANKS 4
+#define HT_BANKS 64
 #define HT_BANK_MASK (HT_BANKS - 1)
+#define HT_BANK_SHIFT 6
 
 typedef struct {
     HashTable       *banks[HT_BANKS];
