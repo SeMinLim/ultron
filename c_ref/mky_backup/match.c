@@ -1,6 +1,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "match.h"
+#include "xor_filter.h"
 
 static int cmp_by_gram_idx(const void *a, const void *b)
 {
@@ -21,7 +22,7 @@ void match_init(MatchCtx *ctx, SingletonResult *sr)
     for (int i = 0; i < sr->count; i++) {
         if (i > 0 && sr->assigns[i].gram_idx == sr->assigns[i - 1].gram_idx)
             continue;
-        per_bank[sr->assigns[i].gram_idx & HT_BANK_MASK]++;
+        per_bank[(uint32_t)xor_murmur64(sr->assigns[i].gram_idx) & HT_BANK_MASK]++;
     }
 
     for (int b = 0; b < HT_BANKS; b++) {
@@ -32,9 +33,10 @@ void match_init(MatchCtx *ctx, SingletonResult *sr)
             ctx->banks[b] = ht_create(cap);
             int ok = 1;
             for (int i = 0; i < sr->count; i++) {
-                int gidx = (int)sr->assigns[i].gram_idx;
-                if ((gidx & HT_BANK_MASK) != b) continue;
-                int subkey = gidx >> HT_BANK_SHIFT;
+                int gidx   = (int)sr->assigns[i].gram_idx;
+                int hashed = (int)(uint32_t)xor_murmur64((uint32_t)gidx);
+                if ((hashed & HT_BANK_MASK) != b) continue;
+                int subkey = hashed >> HT_BANK_SHIFT;
                 int existing;
                 if (ht_lookup(ctx->banks[b], subkey, &existing)) continue;
                 if (!ht_insert(ctx->banks[b], subkey, i)) { ok = 0; break; }
@@ -71,7 +73,6 @@ MatchCount match_scan(const MatchCtx *ctx,
             continue;
         res.stage[0].hit++;
 
-        int viable_stage = 1;
         int chain_broke = 0;
         for (int s = 0; s < max_stage - 1 && s + 1 < MATCH_MAX_STAGES; s++) {
             res.stage[s + 1].total++;
@@ -87,15 +88,15 @@ MatchCount match_scan(const MatchCtx *ctx,
                 break;
             }
             res.stage[s + 1].hit++;
-            viable_stage = s + 2;
         }
 
         if (chain_broke)
             continue;
 
-        int gidx = (int)bitmap_idx(gram);
-        int bank = gidx & HT_BANK_MASK;
-        int subkey = gidx >> HT_BANK_SHIFT;
+        int gidx   = (int)bitmap_idx(gram);
+        int hashed = (int)(uint32_t)xor_murmur64((uint32_t)gidx);
+        int bank   = hashed & HT_BANK_MASK;
+        int subkey = hashed >> HT_BANK_SHIFT;
         int base;
         res.ht_total++;
         res.bank_lookups[bank]++;
@@ -109,8 +110,6 @@ MatchCount match_scan(const MatchCtx *ctx,
              j < ctx->sr->count && ctx->sr->assigns[j].gram_idx == (uint32_t)gidx;
              j++) {
             res.cand_total++;
-            if (ctx->sr->assigns[j].stage > viable_stage)
-                continue;
             res.cand_hit++;
             anchor_hit = 1;
             if (res.nc < out_max)

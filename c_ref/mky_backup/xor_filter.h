@@ -14,6 +14,8 @@ typedef struct {
     uint8_t *fp;
 } XorFilter8;
 
+uint64_t xor_murmur64(uint64_t h);
+
 bool xor8_build(XorFilter8 *f, uint64_t *keys, uint32_t n);
 bool xor8_contain(const XorFilter8 *f, uint64_t key);
 void xor8_free(XorFilter8 *f);
