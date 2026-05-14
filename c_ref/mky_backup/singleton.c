@@ -29,6 +29,7 @@ static int vec_has(const U32Vec *v, uint32_t x)
 typedef struct {
     uint32_t gram_idx;
     int     *rule_ids;
+    int     *positions;
     int      count;
     int      cap;
     int      degree;
@@ -72,25 +73,30 @@ static GNode *ght_insert(GHT *ht, uint32_t idx)
 {
     GNode *n = ght_slot(ht, idx);
     if (n->gram_idx == HT_EMPTY)
-        *n = (GNode){ idx, NULL, 0, 0, 0, 0 };
+        *n = (GNode){ idx, NULL, NULL, 0, 0, 0, 0, 0 };
     return n;
 }
 
-static void gnode_add_rule(GNode *n, int rid)
+static void gnode_add_rule(GNode *n, int rid, int pos)
 {
     if (n->count == n->cap) {
-        n->cap      = n->cap ? n->cap * 2 : 4;
-        n->rule_ids = realloc(n->rule_ids, n->cap * sizeof(int));
+        n->cap       = n->cap ? n->cap * 2 : 4;
+        n->rule_ids  = realloc(n->rule_ids,  n->cap * sizeof(int));
+        n->positions = realloc(n->positions, n->cap * sizeof(int));
     }
-    n->rule_ids[n->count++] = rid;
+    n->rule_ids[n->count]  = rid;
+    n->positions[n->count] = pos;
+    n->count++;
     n->degree++;
 }
 
 static void ght_free(GHT *ht)
 {
     for (int i = 0; i < ht->size; i++)
-        if (ht->slots[i].gram_idx != HT_EMPTY)
+        if (ht->slots[i].gram_idx != HT_EMPTY) {
             free(ht->slots[i].rule_ids);
+            free(ht->slots[i].positions);
+        }
     free(ht->slots);
     free(ht);
 }
@@ -116,7 +122,7 @@ SingletonResult *singleton_build(const RuleSet *rs, int max_stage)
             uint32_t idx = bitmap_idx((const uint8_t *)r->pattern + i);
             if (vec_has(&rule_grams[rid], idx)) continue;
             vec_push(&rule_grams[rid], idx);
-            gnode_add_rule(ght_insert(ht, idx), rid);
+            gnode_add_rule(ght_insert(ht, idx), rid, i);
         }
     }
 
@@ -124,35 +130,40 @@ SingletonResult *singleton_build(const RuleSet *rs, int max_stage)
     for (int i = 0; i < nr; i++)
         if (rs->rules[i].pat_len >= 3) n_uncov++;
 
-    int       qcap  = est * 2 + ht->size + 1;
-    uint32_t *queue = malloc(qcap * sizeof(uint32_t));
-    int       qhead = 0, qtail = 0;
-
-    for (int i = 0; i < ht->size; i++) {
-        GNode *n = &ht->slots[i];
-        if (n->gram_idx != HT_EMPTY && n->degree == 1)
-            queue[qtail++] = n->gram_idx;
-    }
-
     while (n_uncov > 0) {
-        GNode   *sel  = NULL;
-        uint32_t sidx = 0;
+        GNode   *sel           = NULL;
+        uint32_t sidx          = 0;
+        int      best_degree   = INT_MAX;
+        int      best_len_left = -1;
 
-        while (qhead < qtail) {
-            uint32_t gi = queue[qhead++];
-            GNode   *n  = ght_find(ht, gi);
-            if (n && !n->gone && n->degree > 0) { sel = n; sidx = gi; break; }
-        }
+        for (int i = 0; i < ht->size; i++) {
+            GNode *n = &ht->slots[i];
+            if (n->gram_idx == HT_EMPTY || n->gone || n->degree == 0) continue;
 
-        if (!sel) {
-            int best = INT_MAX;
-            for (int i = 0; i < ht->size; i++) {
-                GNode *n = &ht->slots[i];
-                if (n->gram_idx == HT_EMPTY || n->gone || n->degree == 0) continue;
-                if (n->degree < best) { best = n->degree; sel = n; sidx = n->gram_idx; }
+            int max_len = -1;
+            for (int j = 0; j < n->count; j++) {
+                int rid = n->rule_ids[j];
+                if (rule_cov[rid]) continue;
+                int len = rs->rules[rid].pat_len - n->positions[j];
+                if (len > max_len) max_len = len;
             }
-            if (!sel) break;
+            if (max_len < 0) continue;
+
+            int better = 0;
+            if (n->degree < best_degree) better = 1;
+            else if (n->degree == best_degree) {
+                if (max_len > best_len_left) better = 1;
+                else if (max_len == best_len_left && n->gram_idx < sidx) better = 1;
+            }
+            if (better) {
+                best_degree   = n->degree;
+                best_len_left = max_len;
+                sel           = n;
+                sidx          = n->gram_idx;
+            }
         }
+
+        if (!sel) break;
 
         sel->gone = 1;
 
@@ -170,8 +181,6 @@ SingletonResult *singleton_build(const RuleSet *rs, int max_stage)
                 GNode *on = ght_find(ht, other);
                 if (!on || on->gone) continue;
                 on->degree--;
-                if (on->degree == 1 && qtail < qcap)
-                    queue[qtail++] = other;
             }
         }
     }
@@ -225,7 +234,6 @@ SingletonResult *singleton_build(const RuleSet *rs, int max_stage)
     free(rule_grams);
     free(rule_sel);
     free(rule_cov);
-    free(queue);
     ght_free(ht);
 
     return res;
