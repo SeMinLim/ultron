@@ -1,14 +1,8 @@
 package PacketMeta;
 
-// Holds per-packet metadata (ip proto, L4 ports, icmp type/code, and the
-// isTcp/isUdp/isIcmp selector flags) that used to come out of PacketParser
-// walking the frame byte-by-byte. In the host-parsed design, PacketReader
-// pulls these fields from the 32B descriptor and loads them here once per
-// packet, well before the first payload word reaches the match pipeline.
-
 typedef struct {
     Bit#(8)  ipProto;
-    Bit#(8)  flags;     // bit0 isTcp, bit1 isUdp, bit2 isIcmp
+    Bit#(8)  flags;
     Bit#(16) srcPort;
     Bit#(16) dstPort;
     Bit#(8)  icmpType;

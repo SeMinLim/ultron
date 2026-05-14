@@ -1,15 +1,5 @@
 package ResultWriter;
 
-// Streams per-packet match results to HBM[2] (port "result") as each packet
-// finishes.  No per-packet FIFO: the only buffer is the 16-entry AXI line
-// register pktBuf.  On every line boundary (or the last packet) a 64B burst
-// is issued.  After all packets complete, startWrite emits a separate 128B
-// burst at the base address holding the summary counters.
-//
-// Result buffer layout:
-//   [0..192)              192B summary: 48 x u32 counters (3 x 64B lines)
-//   [192..192+pktCount*4) per-packet: {matched[1], reserved[15], ruleId[16]} per packet
-
 import FIFOF::*;
 import Vector::*;
 
@@ -39,7 +29,7 @@ typedef struct {
     Bit#(32) noMatchPkts;
     Bit#(32) stage2Checked;
     Bit#(32) stage2Passed;
-    // End-to-end span (last-active - first-active) per module.
+
     Bit#(32) dataLoaderE2E;
     Bit#(32) packetReaderE2E;
     Bit#(32) payloadFeedE2E;
@@ -52,8 +42,7 @@ typedef struct {
 } ResultSummary deriving (Bits, Eq, FShow);
 
 interface ResultWriterIfc;
-    // Must be called before the first addResult: latches resultBase + pktCount
-    // and resets the internal state.
+
     method Action configure(Bit#(64) resultBase, Bit#(32) pktCount);
     method Action addResult(Bool matched, Bit#(16) ruleId);
     method Action startWrite(ResultSummary summary);
@@ -79,17 +68,9 @@ module mkResultWriter(ResultWriterIfc);
     Reg#(Vector#(16, Bit#(32))) pktBuf  <- mkReg(replicate(0));
     Reg#(Bit#(5))               pktBufN <- mkReg(0);
 
-    // Summary emission is a small 2-step state machine.  Separating it from
-    // startWrite avoids enqueueing two words into writeWordQ in a single action
-    // (which would need writeWordQ.notFull to guarantee 2 slots, not 1).
     Reg#(Bit#(2))       sumPhase <- mkReg(0);
     Reg#(ResultSummary) summaryR <- mkReg(unpack(0));
-    // After the last summary word is enqueued, hold off `done` long enough
-    // for the AXI write to drain through ResultWriter -> KernelMain -> AXI
-    // master -> DDR. With a 3-beat summary burst the prior 2-beat-burst race
-    // window is exposed: kernel signaled done while the last beats were still
-    // in flight, host synced FROM_DEVICE before bvalid arrived, summary read
-    // back as zeros even though per-packet bursts (already complete) were OK.
+
     Reg#(Bit#(8)) drainTicks <- mkReg(0);
 
     function Bit#(512) packSummary0(ResultSummary s,
@@ -180,9 +161,6 @@ module mkResultWriter(ResultWriterIfc);
         drainTicks     <= 0;
     endmethod
 
-    // Streams one result into pktBuf; flushes a 64B AXI beat on line boundary
-    // or on the last packet.  Guard conservatively requires both mem queues to
-    // have a free slot so a flush never stalls mid-action.
     method Action addResult(Bool matched, Bit#(16) ruleId)
             if (pktsDone < pktTotal &&
                 writeReqQ.notFull && writeWordQ.notFull);
@@ -210,8 +188,6 @@ module mkResultWriter(ResultWriterIfc);
         pktsDone <= pktsDone + 1;
     endmethod
 
-    // Only arms the summary emission once every per-packet line has been
-    // flushed.  The two emitSummary rules then drive the actual burst.
     method Action startWrite(ResultSummary summary)
             if (!done && sumPhase == 0 &&
                 pktsDone == pktTotal && pktBufN == 0);

@@ -1,19 +1,5 @@
 package PacketReader;
 
-// Reads packet blob from HBM[1] (port "pkt") and serializes payload bytes one
-// AXI word per cycle. Host-parsed design: each descriptor is 32B and carries
-// per-packet metadata (ip proto, ports, icmp type/code, flags) alongside the
-// payload offset/length. Two descriptors fit per 64B AXI word.
-//
-// Packet blob layout:
-//   [0..64)                 64B header: magic, pkt_count, blob_bytes, reserved
-//   [64..64+pktCount*32)    descriptor array: PktDesc per pkt (32B)
-//   [descs_end..)           match-start payload bytes, each 64B-aligned
-//
-// The host pre-aligns each payload so that payload byte 0 always lands at
-// byte 0 of the first AXI word. lineByteOffset therefore always returns 0,
-// but the method is kept for interface compatibility with ExactMatch.
-
 import FIFO::*;
 import FIFOF::*;
 
@@ -43,7 +29,7 @@ interface PacketReaderIfc;
     method Bit#(8)  getByte;
     method Action   advanceByte;
     method Bit#(512) getLine;
-    method Bit#(6)   lineByteOffset;    // always 0: host aligns payload to 64B
+    method Bit#(6)   lineByteOffset;
     method Bit#(7)   lineValidBytes;
     method Bool      lineIsLast;
     method Action    advanceLine;
@@ -55,9 +41,6 @@ interface PacketReaderIfc;
     method ActionValue#(Tuple2#(Bit#(64), Bit#(64))) readReq;
     method Action   readWord(Bit#(512) word);
 
-    // Side-channel: per-packet metadata. One entry is enqueued each time a
-    // new packet's payload read is kicked off; KernelMain drains it into
-    // PacketMeta before the first payload word is consumed.
     method Bool                        metaAvailable;
     method ActionValue#(PktMetaFields) nextMeta;
 endinterface
@@ -76,7 +59,7 @@ module mkPacketReader(PacketReaderIfc);
     FIFOF#(PktMetaFields) metaFifo <- mkSizedFIFOF(32);
 
     Reg#(Bit#(512)) descBuf   <- mkRegU;
-    Reg#(Bit#(1))   descSub   <- mkReg(0);     // 0 or 1: two 256-bit slots per AXI word
+    Reg#(Bit#(1))   descSub   <- mkReg(0);
     Reg#(Bit#(32))  descTotal <- mkReg(0);
 
     Reg#(Bit#(512)) curLine    <- mkRegU;
@@ -84,17 +67,6 @@ module mkPacketReader(PacketReaderIfc);
     Reg#(Bit#(32))  bytesLeft  <- mkReg(0);
     Reg#(Bool)      lineValid  <- mkReg(False);
 
-    // Unpack one 256-bit slot from descBuf into a PktDescEntry. The 32B
-    // PktDesc layout on the host side (little-endian, packed):
-    //   [0..4)   payload_offset   u32
-    //   [4..8)   payload_len      u32
-    //   [8]      ip_proto         u8
-    //   [9]      flags            u8
-    //   [10..12) src_port         u16 (little-endian host write)
-    //   [12..14) dst_port         u16
-    //   [14]     icmp_type        u8
-    //   [15]     icmp_code        u8
-    //   [16..32) reserved
     function PktDescEntry unpackDesc(Bit#(256) d);
         Bit#(32)  off      = d[31:0];
         Bit#(32)  len      = d[63:32];
@@ -133,7 +105,7 @@ module mkPacketReader(PacketReaderIfc);
     endrule
 
     rule doDescsUnpack(state == PRDescsUnpack && descFifo.notFull);
-        Bit#(9)   sh   = zeroExtend(descSub) << 8;          // descSub * 256
+        Bit#(9)   sh   = zeroExtend(descSub) << 8;
         Bit#(256) d256 = truncate(descBuf >> sh);
         let entry = unpackDesc(d256);
 
@@ -208,9 +180,6 @@ module mkPacketReader(PacketReaderIfc);
         return curLine;
     endmethod
 
-    // Host-aligned: payload byte 0 always lives at byte 0 of line 0, so this
-    // is constant 0 for every packet. Kept only so ExactMatch's interface
-    // doesn't need to change in this patch.
     method Bit#(6) lineByteOffset if (lineValid && bytesLeft > 0);
         return 0;
     endmethod
@@ -246,11 +215,6 @@ module mkPacketReader(PacketReaderIfc);
 
     method Bool allDone = (state == PRDone);
 
-    // True iff pktReader's internal state machine is actively making
-    // progress: descriptors being fetched/unpacked, a packet being kicked
-    // off, or payload bytes being fed.  PRFeedPkt with bytesLeft=0 means
-    // "waiting for KernelMain to retire this packet" — that idle window is
-    // explicitly excluded so the metric isn't inflated by drain stalls.
     method Bool busy =
         (state == PRHeader)      ||
         (state == PRDescsFetch)  ||

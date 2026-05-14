@@ -7,7 +7,7 @@
 
 #define XOR_MAX_TRIES 100
 
-static inline uint64_t xor_murmur64(uint64_t h)
+uint64_t xor_murmur64(uint64_t h)
 {
     h ^= h >> 33U;
     h *= UINT64_C(0xff51afd7ed558ccd);

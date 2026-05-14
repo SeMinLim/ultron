@@ -1,7 +1,5 @@
 package CuckooHash;
 
-// ref: https://www.geeksforgeeks.org/dsa/cuckoo-hashing/
-
 import FIFO::*;
 import FIFOF::*;
 import RegFile::*;
@@ -36,7 +34,7 @@ module mkCuckooHash(CuckooHashIfc#(keySz, valSz, logSz))
 	Reg#(HtState)     htState  <- mkReg(HT_CLEAR);
 	Reg#(Bit#(keySz)) pendKey  <- mkReg(0);
 	Reg#(Bit#(valSz)) pendVal  <- mkReg(0);
-	Reg#(Bool)        useAlt   <- mkReg(False);
+	Reg#(Bool)        useAlt   <- mkReg(False);  // False=table0/h0, True=table1/h1; toggled each eviction
 	Reg#(UInt#(5))    evictCnt <- mkReg(0);
 
 	Reg#(Bit#(logSz)) clearIdx <- mkReg(0);
@@ -107,7 +105,7 @@ module mkCuckooHash(CuckooHashIfc#(keySz, valSz, logSz))
 			useAlt   <= !useAlt;
 			evictCnt <= evictCnt + 1;
 		end else begin
-			insertAckQ.enq(False);
+			insertAckQ.enq(False);  // eviction chain hit MaxEvictions; caller must handle failed insert
 			htState  <= HT_IDLE;
 			evictCnt <= 0;
 		end

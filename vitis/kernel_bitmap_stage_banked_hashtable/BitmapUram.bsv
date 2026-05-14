@@ -6,20 +6,6 @@ import Vector::*;
 
 typedef 64 NLanes;
 
-// 18-bit gram key bitmap, 2^18 = 262144 bits per lane.
-// Reshape from (512 lines x 512 wide) to (4096 lines x 64 wide) so each
-// lane fits in a single UltraRAM (URAM = 4096 x 72 native).  Vivado infers
-// URAM automatically from the depth=4096 / width=64 shape; if the synth
-// report ever shows it falling back to BRAM, add a (* ram_style = "ultra" *)
-// attribute on the generated mem array via a wrapper.
-//
-// External writeWord still takes a 9-bit "512-line" address and a full
-// 512-bit word (so DataLoader is unchanged).  Internally we unspool each
-// 512-bit write into 8 sequential 64-bit URAM writes.  Writes happen only
-// during DB load, so the 8x slowdown is irrelevant.
-//
-// Address split for lookup:
-//   key[17:6] = URAM line, key[5:0] = bit position within the 64-bit line.
 interface BitmapUramIfc;
     method Action writeWord(Bit#(9) lineAddr, Bit#(512) data);
     method Action lookup(Vector#(NLanes, Bit#(18)) keys);
@@ -38,9 +24,6 @@ module mkBitmapUram(BitmapUramIfc);
     FIFOF#(Vector#(NLanes, Bit#(6))) keyQ    <- mkSizedFIFOF(4);
     FIFOF#(Vector#(NLanes, Bool))    resultQ <- mkSizedFIFOF(4);
 
-    // Write-side unspool state: when wrCnt != 0, we are mid-way through emitting
-    // the 8 sub-writes for a 512-bit incoming word.  wrCnt counts the next chunk
-    // index (1..7 for sub-writes 1..7); chunk 0 is emitted directly in writeWord.
     Reg#(Bit#(4))      wrCnt   <- mkReg(0);
     Reg#(Bit#(9))      wrLine  <- mkRegU;
     Reg#(Bit#(512))    wrData  <- mkRegU;

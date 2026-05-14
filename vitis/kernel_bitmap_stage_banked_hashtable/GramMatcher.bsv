@@ -5,22 +5,8 @@ import FIFO::*;
 import FIFOF::*;
 import Vector::*;
 
-// 64-bank cuckoo hash table — mirrors c_ref/mky_backup/match.c HT_BANKS=64.
-//
-// 18-bit gram key splits into:
-//   bank   = key[5:0]      (low 6 bits)              -> selects one of 64 banks
-//   subkey = key[17:6]     (high 12 bits)            -> stored inside the bank
-//
-// Banking trades a single big cuckoo for 64 small ones.  Storage is the same
-// or smaller (each bank holds ~500/64 ≈ 8 keys; sized to 64 slots per table
-// per bank for headroom), and we keep a clean path to multi-lane parallel
-// lookups in the future (one lookup per bank per cycle).  Today the public
-// interface is still single-lane: every lookupReq routes to one bank, and a
-// FIFO of pending bank ids tells the response rule which bank's lookupResp
-// to pull next so order is preserved.
 typedef 64 NHtBanks;
 
-// Width of the per-bank subkey (= 18-bit gram key minus the 6-bit bank id).
 typedef 12 SubKeyBits;
 
 typedef struct {
@@ -29,8 +15,8 @@ typedef struct {
     Int#(8)  post;
     Bit#(8)  len;
     Bool     stage2;
-    Bit#(18) nextGramKey;  // 18-bit gram key (matches c_ref bitmap_idx)
-    Bit#(5)  pad;          // keeps total at 64 bits = CuckooHash value width
+    Bit#(18) nextGramKey;
+    Bit#(5)  pad;          // pads RuleInfo to exactly 64 bits = CuckooHash valSz
 } RuleInfo deriving (Bits, Eq, FShow);
 
 typedef struct {
@@ -71,29 +57,26 @@ endinterface
 
 (* synthesize *)
 module mkGramMatcher(GramMatcherIfc);
-    // 64 banks × CuckooHash#(SubKeyBits=12, valSz=64, logSz=5)
-    //   logSz=5 → 32 entries per RegFile × 2 tables × 64 banks
-    //   = 4096 cuckoo slots total (vs single-bank 32K before).
-    //   Per-bank capacity (=64) is ~8× the expected 500/64 load — c_ref's
-    //   match_init also sizes per-bank to "max(per_bank*2, 16)" so this is
-    //   the same headroom band.
     Vector#(NHtBanks, CuckooHashIfc#(SubKeyBits, 64, 5)) banks
         <- replicateM(mkCuckooHash);
 
-    // Pending bank ids — kept in lookup-issue order.  forwardResult pulls
-    // the next response from the bank named at the head of this queue.
+    // pendBankQ records which bank each lookup was sent to, preserving issue order for responses.
     FIFOF#(Bit#(6))    pendBankQ <- mkSizedFIFOF(64);
     FIFOF#(GramCtx)    ctxQ      <- mkSizedFIFOF(64);
     FIFOF#(GramResult) outQ      <- mkSizedFIFOF(64);
 
-    // Insert is also bank-routed.  DataLoader calls insertAck after every
-    // insert, so we forward the chosen bank's ack one at a time.  Track
-    // which bank fired the latest insert so insertAck pulls from the same.
     FIFOF#(Bit#(6)) pendInsertBankQ <- mkSizedFIFOF(8);
     FIFOF#(Bool)    ackQ            <- mkSizedFIFOF(8);
 
-    function Bit#(6) bankOf(Bit#(32) key)   = key[5:0];
-    function Bit#(SubKeyBits) subKeyOf(Bit#(32) key) = key[17:6];
+    function Bit#(18) mix18(Bit#(18) k);
+        Bit#(18) x = k ^ (k >> 6);
+        x = x ^ (x >> 7);
+        x = x ^ (x << 11);
+        return x;
+    endfunction
+    // 18-bit gram key after mixing: low 6 bits → bank selector, high 12 bits → per-bank subkey.
+    function Bit#(6) bankOf(Bit#(32) key)            = mix18(key[17:0])[5:0];
+    function Bit#(SubKeyBits) subKeyOf(Bit#(32) key) = mix18(key[17:0])[17:6];
 
     rule forwardResult (pendBankQ.notEmpty && ctxQ.notEmpty);
         let bank = pendBankQ.first;

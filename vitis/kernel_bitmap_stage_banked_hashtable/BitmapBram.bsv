@@ -1,6 +1,5 @@
-// Archived BRAM-mapped implementation (renamed from the old BitmapUram.bsv).
-// Depth=512 with mkBRAM2Server mapped to RAMB36 and over-utilized the U50 BRAM
-// budget.  Kept for reference only -- not (* synthesize *)d, not used by the build.
+
+
 package BitmapBram;
 
 import BRAM::*;
@@ -9,8 +8,6 @@ import Vector::*;
 
 typedef 64 NLanes;
 
-// 18-bit gram key → 2^18 / 512-bit-per-line = 512 lines.
-// Line address is 9 bits, bit index within the line is 9 bits.
 interface BitmapBramIfc;
     method Action writeWord(Bit#(9) lineAddr, Bit#(512) data);
     method Action lookup(Vector#(NLanes, Bit#(18)) keys);
@@ -45,6 +42,7 @@ module mkBitmapBram(BitmapBramIfc);
                 address: lineAddr, datain: data });
     endmethod
 
+    // 18-bit key layout: [17:9] = BRAM line address (512 lines × 512 bits), [8:0] = bit index within line.
     method Action lookup(Vector#(NLanes, Bit#(18)) keys) if (keyQ.notFull);
         Vector#(NLanes, Bit#(9)) bitIdxs = newVector;
         for (Integer i = 0; i < valueOf(NLanes); i = i + 1) begin

@@ -9,9 +9,9 @@ import PortOffsetMatcher::*;
 typedef enum {
     DLIdle,
     DLHeader,
-    DLBm0S1,        // bm0_s1: first grams of stage-1 rules (pat_len < 6)
-    DLBm0S2,        // bm0_s2: first grams of stage-2 rules (pat_len >= 6)
-    DLBm1,          // bm1:    next-grams of stage-2 rules
+    DLBm0S1,
+    DLBm0S2,
+    DLBm1,
     DLGhtFetch,
     DLGhtUnpack,
     DLGhtAck,
@@ -31,6 +31,14 @@ interface DataLoaderIfc;
     method Action readWord(Bit#(512) word);
 endinterface
 
+// DB memory layout at dbBase:
+//   +0       64 B   header  (ghtCount[127:96], patCount[159:128], ruledbOff[191:160], portlocOff[223:192])
+//   +64      32 KB  bm0_s1  (512 × 512-bit BRAM words)
+//   +32K+64  32 KB  bm0_s2
+//   +64K+64  32 KB  bm1
+//   +96K+64  var    GHT entries, 4 × 128-bit records packed per 512-bit word
+//   +ruledbOff      exact-match patterns, one 512-bit word per entry
+//   +portlocOff     port-location tables (bitmap 512 words, windows 256 words, ip_proto+icmp 32 words)
 module mkDataLoader#(
     BitmapUramIfc        bm0_s1,
     BitmapUramIfc        bm0_s2,
@@ -59,15 +67,6 @@ module mkDataLoader#(
     Reg#(Bit#(32)) portWord  <- mkReg(0);
     Reg#(Bit#(4))  portSubIdx<- mkReg(0);
 
-    // GHT entry bit layout (128 bits per entry, 4 entries per 512-bit word):
-    //   [31: 0]  gram32 key (18-bit key zero-padded to 32)
-    //   [47:32]  ruleId
-    //   [55:48]  pre (signed)
-    //   [63:56]  post (signed)
-    //   [71:64]  len
-    //   [72]     stage2 flag
-    //   [90:73]  nextGramKey (18 bits, valid when stage2=1)
-    //   [127:91] padding
     function RuleInfo unpackRuleInfo(Bit#(128) raw);
         return RuleInfo {
             ruleId:      raw[47:32],
@@ -88,8 +87,6 @@ module mkDataLoader#(
         portlocOff <= w[223:192];
         $display("DL header ght=%0d pat=%0d ruledbOff=%0d portlocOff=%0d",
                  w[127:96], w[159:128], w[191:160], w[223:192]);
-        // DB layout: header(64B) | bm0_s1(32KB) | bm0_s2(32KB) | bm1(32KB) | GHT | patterns | ports
-        // (18-bit gram keys → 2^18 / 8 = 32768 bytes per bitmap = 512 × 64B lines)
         readReqQ.enq(tuple2(baseAddr + 64, 32 * 1024));
         wordIdx <= 0;
         state   <= DLBm0S1;
@@ -126,7 +123,6 @@ module mkDataLoader#(
         bm1.writeWord(truncate(wordIdx), w);
         if (wordIdx == 511) begin
             $display("DL bm1 done");
-            // GHT starts after header(64B) + 3 × 32KB bitmaps = 64 + 96KB
             Bit#(64) ghtBytes = zeroExtend((ghtCount + 3) / 4) * 64;
             readReqQ.enq(tuple2(baseAddr + 64 + 96*1024, ghtBytes));
             wordIdx <= 0;

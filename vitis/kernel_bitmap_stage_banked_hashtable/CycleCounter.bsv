@@ -6,7 +6,7 @@ interface CycleCounterIfc;
     method Action   markDone;
     method Bit#(32) getStart;
     method Bit#(32) getDone;
-    method Bit#(32) elapsed;   // getDone - getStart
+    method Bit#(32) elapsed;
 endinterface
 
 (* synthesize *)
@@ -33,11 +33,6 @@ module mkCycleCounter(CycleCounterIfc);
     endmethod
 endmodule
 
-// Tracks the end-to-end span of a module's activity: cycles between the
-// first time `mark` was called and the last time it was called. Unlike
-// counting "active cycles" (which sums every active cycle and skips idle
-// gaps), this gives the real wall-clock duration the module spent reaching
-// completion, including stalls and bubbles.
 interface E2ESpanIfc;
     method Action mark(Bit#(32) nowCycle);
     method Bit#(32) elapsed;
