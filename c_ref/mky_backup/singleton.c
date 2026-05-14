@@ -33,6 +33,7 @@ typedef struct {
     int      count;
     int      cap;
     int      degree;
+    int      freq;
     int      gone;
     int      n_assigned;
 } GNode;
@@ -73,7 +74,7 @@ static GNode *ght_insert(GHT *ht, uint32_t idx)
 {
     GNode *n = ght_slot(ht, idx);
     if (n->gram_idx == HT_EMPTY)
-        *n = (GNode){ idx, NULL, NULL, 0, 0, 0, 0, 0 };
+        *n = (GNode){ idx, NULL, NULL, 0, 0, 0, 0, 0, 0 };
     return n;
 }
 
@@ -120,9 +121,11 @@ SingletonResult *singleton_build(const RuleSet *rs, int max_stage)
         if (r->pat_len < 3) continue;
         for (int i = 0; i <= r->pat_len - 3; i++) {
             uint32_t idx = bitmap_idx((const uint8_t *)r->pattern + i);
+            GNode   *gn  = ght_insert(ht, idx);
+            gn->freq++;
             if (vec_has(&rule_grams[rid], idx)) continue;
             vec_push(&rule_grams[rid], idx);
-            gnode_add_rule(ght_insert(ht, idx), rid, i);
+            gnode_add_rule(gn, rid, i);
         }
     }
 
@@ -135,6 +138,7 @@ SingletonResult *singleton_build(const RuleSet *rs, int max_stage)
         uint32_t sidx          = 0;
         int      best_degree   = INT_MAX;
         int      best_len_left = -1;
+        int      best_freq     = INT_MAX;
 
         for (int i = 0; i < ht->size; i++) {
             GNode *n = &ht->slots[i];
@@ -153,11 +157,15 @@ SingletonResult *singleton_build(const RuleSet *rs, int max_stage)
             if (n->degree < best_degree) better = 1;
             else if (n->degree == best_degree) {
                 if (max_len > best_len_left) better = 1;
-                else if (max_len == best_len_left && n->gram_idx < sidx) better = 1;
+                else if (max_len == best_len_left) {
+                    if (n->freq < best_freq) better = 1;
+                    else if (n->freq == best_freq && n->gram_idx < sidx) better = 1;
+                }
             }
             if (better) {
                 best_degree   = n->degree;
                 best_len_left = max_len;
+                best_freq     = n->freq;
                 sel           = n;
                 sidx          = n->gram_idx;
             }
