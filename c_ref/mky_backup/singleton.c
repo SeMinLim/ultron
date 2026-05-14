@@ -134,40 +134,31 @@ SingletonResult *singleton_build(const RuleSet *rs, int max_stage)
         if (rs->rules[i].pat_len >= 3) n_uncov++;
 
     while (n_uncov > 0) {
-        GNode   *sel           = NULL;
-        uint32_t sidx          = 0;
-        int      best_degree   = INT_MAX;
-        int      best_len_left = -1;
-        int      best_freq     = INT_MAX;
+        GNode   *sel             = NULL;
+        uint32_t sidx            = 0;
+        int      best_degree     = INT_MAX;
+        int      best_total_deg  = INT_MAX;
+        int      best_freq       = INT_MAX;
 
         for (int i = 0; i < ht->size; i++) {
             GNode *n = &ht->slots[i];
             if (n->gram_idx == HT_EMPTY || n->gone || n->degree == 0) continue;
 
-            int max_len = -1;
-            for (int j = 0; j < n->count; j++) {
-                int rid = n->rule_ids[j];
-                if (rule_cov[rid]) continue;
-                int len = rs->rules[rid].pat_len - n->positions[j];
-                if (len > max_len) max_len = len;
-            }
-            if (max_len < 0) continue;
-
             int better = 0;
             if (n->degree < best_degree) better = 1;
             else if (n->degree == best_degree) {
-                if (max_len > best_len_left) better = 1;
-                else if (max_len == best_len_left) {
+                if (n->count < best_total_deg) better = 1;
+                else if (n->count == best_total_deg) {
                     if (n->freq < best_freq) better = 1;
                     else if (n->freq == best_freq && n->gram_idx < sidx) better = 1;
                 }
             }
             if (better) {
-                best_degree   = n->degree;
-                best_len_left = max_len;
-                best_freq     = n->freq;
-                sel           = n;
-                sidx          = n->gram_idx;
+                best_degree    = n->degree;
+                best_total_deg = n->count;
+                best_freq      = n->freq;
+                sel            = n;
+                sidx           = n->gram_idx;
             }
         }
 
@@ -218,8 +209,18 @@ SingletonResult *singleton_build(const RuleSet *rs, int max_stage)
             }
         }
 
+        // If the picked gram sits too close to the pattern end to leave room
+        // for a second 3-gram (stage>=2), shift one 3-gram back so this rule
+        // can participate in multi-stage filtering instead of forcing stage=1.
+        // Mirrors resolve_assignment_ngram() in the Python reference.
+        if (max_stage > 1
+            && gram_pos + 2 * 3 > r->pat_len
+            && gram_pos >= 3) {
+            gram_pos -= 3;
+        }
+
         GramAssign *a  = &res->assigns[res->count++];
-        a->gram_idx    = gi;
+        a->gram_idx    = bitmap_idx((const uint8_t *)r->pattern + gram_pos);
         memcpy(a->gram, r->pattern + gram_pos, sizeof(a->gram));
         a->rule_id     = r->id;
         a->gram_pos    = gram_pos;
