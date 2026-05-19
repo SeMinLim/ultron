@@ -29,9 +29,11 @@ static int vec_has(const U32Vec *v, uint32_t x)
 typedef struct {
     uint32_t gram_idx;
     int     *rule_ids;
+    int     *positions;
     int      count;
     int      cap;
     int      degree;
+    int      freq;
     int      gone;
     int      n_assigned;
 } GNode;
@@ -72,25 +74,30 @@ static GNode *ght_insert(GHT *ht, uint32_t idx)
 {
     GNode *n = ght_slot(ht, idx);
     if (n->gram_idx == HT_EMPTY)
-        *n = (GNode){ idx, NULL, 0, 0, 0, 0 };
+        *n = (GNode){ idx, NULL, NULL, 0, 0, 0, 0, 0, 0 };
     return n;
 }
 
-static void gnode_add_rule(GNode *n, int rid)
+static void gnode_add_rule(GNode *n, int rid, int pos)
 {
     if (n->count == n->cap) {
-        n->cap      = n->cap ? n->cap * 2 : 4;
-        n->rule_ids = realloc(n->rule_ids, n->cap * sizeof(int));
+        n->cap       = n->cap ? n->cap * 2 : 4;
+        n->rule_ids  = realloc(n->rule_ids,  n->cap * sizeof(int));
+        n->positions = realloc(n->positions, n->cap * sizeof(int));
     }
-    n->rule_ids[n->count++] = rid;
+    n->rule_ids[n->count]  = rid;
+    n->positions[n->count] = pos;
+    n->count++;
     n->degree++;
 }
 
 static void ght_free(GHT *ht)
 {
     for (int i = 0; i < ht->size; i++)
-        if (ht->slots[i].gram_idx != HT_EMPTY)
+        if (ht->slots[i].gram_idx != HT_EMPTY) {
             free(ht->slots[i].rule_ids);
+            free(ht->slots[i].positions);
+        }
     free(ht->slots);
     free(ht);
 }
@@ -114,9 +121,11 @@ SingletonResult *singleton_build(const RuleSet *rs, int max_stage)
         if (r->pat_len < 3) continue;
         for (int i = 0; i <= r->pat_len - 3; i++) {
             uint32_t idx = bitmap_idx((const uint8_t *)r->pattern + i);
+            GNode   *gn  = ght_insert(ht, idx);
+            gn->freq++;
             if (vec_has(&rule_grams[rid], idx)) continue;
             vec_push(&rule_grams[rid], idx);
-            gnode_add_rule(ght_insert(ht, idx), rid);
+            gnode_add_rule(gn, rid, i);
         }
     }
 
@@ -124,35 +133,36 @@ SingletonResult *singleton_build(const RuleSet *rs, int max_stage)
     for (int i = 0; i < nr; i++)
         if (rs->rules[i].pat_len >= 3) n_uncov++;
 
-    int       qcap  = est * 2 + ht->size + 1;
-    uint32_t *queue = malloc(qcap * sizeof(uint32_t));
-    int       qhead = 0, qtail = 0;
-
-    for (int i = 0; i < ht->size; i++) {
-        GNode *n = &ht->slots[i];
-        if (n->gram_idx != HT_EMPTY && n->degree == 1)
-            queue[qtail++] = n->gram_idx;
-    }
-
     while (n_uncov > 0) {
-        GNode   *sel  = NULL;
-        uint32_t sidx = 0;
+        GNode   *sel             = NULL;
+        uint32_t sidx            = 0;
+        int      best_degree     = INT_MAX;
+        int      best_total_deg  = INT_MAX;
+        int      best_freq       = INT_MAX;
 
-        while (qhead < qtail) {
-            uint32_t gi = queue[qhead++];
-            GNode   *n  = ght_find(ht, gi);
-            if (n && !n->gone && n->degree > 0) { sel = n; sidx = gi; break; }
-        }
+        for (int i = 0; i < ht->size; i++) {
+            GNode *n = &ht->slots[i];
+            if (n->gram_idx == HT_EMPTY || n->gone || n->degree == 0) continue;
 
-        if (!sel) {
-            int best = INT_MAX;
-            for (int i = 0; i < ht->size; i++) {
-                GNode *n = &ht->slots[i];
-                if (n->gram_idx == HT_EMPTY || n->gone || n->degree == 0) continue;
-                if (n->degree < best) { best = n->degree; sel = n; sidx = n->gram_idx; }
+            int better = 0;
+            if (n->degree < best_degree) better = 1;
+            else if (n->degree == best_degree) {
+                if (n->count < best_total_deg) better = 1;
+                else if (n->count == best_total_deg) {
+                    if (n->freq < best_freq) better = 1;
+                    else if (n->freq == best_freq && n->gram_idx < sidx) better = 1;
+                }
             }
-            if (!sel) break;
+            if (better) {
+                best_degree    = n->degree;
+                best_total_deg = n->count;
+                best_freq      = n->freq;
+                sel            = n;
+                sidx           = n->gram_idx;
+            }
         }
+
+        if (!sel) break;
 
         sel->gone = 1;
 
@@ -170,8 +180,6 @@ SingletonResult *singleton_build(const RuleSet *rs, int max_stage)
                 GNode *on = ght_find(ht, other);
                 if (!on || on->gone) continue;
                 on->degree--;
-                if (on->degree == 1 && qtail < qcap)
-                    queue[qtail++] = other;
             }
         }
     }
@@ -201,8 +209,18 @@ SingletonResult *singleton_build(const RuleSet *rs, int max_stage)
             }
         }
 
+        // If the picked gram sits too close to the pattern end to leave room
+        // for a second 3-gram (stage>=2), shift one 3-gram back so this rule
+        // can participate in multi-stage filtering instead of forcing stage=1.
+        // Mirrors resolve_assignment_ngram() in the Python reference.
+        if (max_stage > 1
+            && gram_pos + 2 * 3 > r->pat_len
+            && gram_pos >= 3) {
+            gram_pos -= 3;
+        }
+
         GramAssign *a  = &res->assigns[res->count++];
-        a->gram_idx    = gi;
+        a->gram_idx    = bitmap_idx((const uint8_t *)r->pattern + gram_pos);
         memcpy(a->gram, r->pattern + gram_pos, sizeof(a->gram));
         a->rule_id     = r->id;
         a->gram_pos    = gram_pos;
@@ -225,7 +243,6 @@ SingletonResult *singleton_build(const RuleSet *rs, int max_stage)
     free(rule_grams);
     free(rule_sel);
     free(rule_cov);
-    free(queue);
     ght_free(ht);
 
     return res;
