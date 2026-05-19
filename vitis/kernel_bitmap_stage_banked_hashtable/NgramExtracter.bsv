@@ -50,7 +50,6 @@ module mkNgramExtracter(NgramExtracterIfc);
 
         for (Integer i = 0; i < valueOf(NGramLanes); i = i + 1) begin
             Bool validPos = (fromInteger(i) < cnt);
-            // Suppress lanes 0,1 on first batch (hasCarry=False): they need bytes from a nonexistent prior batch.
             Bool carryOk  = (fromInteger(i) >= 2) || hasCarry;
             if (validPos && carryOk) begin
                 Bit#(8) b0 = foldCase((i == 0) ? carry0 :
@@ -60,7 +59,6 @@ module mkNgramExtracter(NgramExtracterIfc);
                              ibuf[fromInteger(i - 1)]);
                 Bit#(8) b2 = foldCase(ibuf[fromInteger(i)]);
 
-                // Lane i=2 → anchor=base+0 (first in-batch gram). i=0,1 with carry → cross-batch grams at base-2, base-1.
                 Bit#(32) anchor = base + fromInteger(i) - 2;
 
                 result[fromInteger(i)] = tagged Valid (NgramOut {
@@ -85,7 +83,7 @@ module mkNgramExtracter(NgramExtracterIfc);
             hasCarry <= True;
             basePos  <= base + zeroExtend(cnt);
         end else if (cnt == 1) begin
-            carry0   <= carry1;  // slide window; cnt==0 leaves carry and basePos unchanged
+            carry0   <= carry1;
             carry1   <= ibuf[0];
             hasCarry <= hasCarry;
             basePos  <= base + 1;

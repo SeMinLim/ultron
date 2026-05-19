@@ -5,6 +5,7 @@ import BitmapUram::*;
 import GramMatcher::*;
 import ExactPatternTable::*;
 import PortOffsetMatcher::*;
+import Priority::*;
 
 typedef enum {
     DLIdle,
@@ -21,6 +22,8 @@ typedef enum {
     DLPortWinUnpack,
     DLPortSmallFetch,
     DLPortSmallUnpack,
+    DLPriorityFetch,
+    DLPriorityUnpack,
     DLDone
 } DLState deriving (Bits, Eq, FShow);
 
@@ -31,21 +34,14 @@ interface DataLoaderIfc;
     method Action readWord(Bit#(512) word);
 endinterface
 
-// DB memory layout at dbBase:
-//   +0       64 B   header  (ghtCount[127:96], patCount[159:128], ruledbOff[191:160], portlocOff[223:192])
-//   +64      32 KB  bm0_s1  (512 × 512-bit BRAM words)
-//   +32K+64  32 KB  bm0_s2
-//   +64K+64  32 KB  bm1
-//   +96K+64  var    GHT entries, 4 × 128-bit records packed per 512-bit word
-//   +ruledbOff      exact-match patterns, one 512-bit word per entry
-//   +portlocOff     port-location tables (bitmap 512 words, windows 256 words, ip_proto+icmp 32 words)
 module mkDataLoader#(
     BitmapUramIfc        bm0_s1,
     BitmapUramIfc        bm0_s2,
     BitmapUramIfc        bm1,
     GramMatcherIfc       gram,
     ExactPatternTableIfc patTable,
-    PortOffsetMatcherIfc portMatcher
+    PortOffsetMatcherIfc portMatcher,
+    PriorityIfc          prioStage
 )(DataLoaderIfc);
 
     FIFOF#(Tuple2#(Bit#(64), Bit#(64))) readReqQ <- mkFIFOF;
@@ -57,6 +53,7 @@ module mkDataLoader#(
     Reg#(Bit#(32)) ghtCount   <- mkReg(0);
     Reg#(Bit#(32)) ruledbOff  <- mkReg(0);
     Reg#(Bit#(32)) portlocOff <- mkReg(0);
+    Reg#(Bit#(32)) priorityOff<- mkReg(0);
     Reg#(Bit#(32)) wordIdx    <- mkReg(0);
     Reg#(Bool)     done       <- mkReg(False);
 
@@ -66,7 +63,12 @@ module mkDataLoader#(
 
     Reg#(Bit#(32)) portWord  <- mkReg(0);
     Reg#(Bit#(4))  portSubIdx<- mkReg(0);
+    Reg#(Bit#(32)) prioDone  <- mkReg(0);
+    Reg#(Bit#(6))  prioSubIdx<- mkReg(0);
 
+    // GHT entry layout: gram[31:0], ruleId[47:32], pre[55:48],
+    // post[63:56], len[71:64], stage2[72], nextGram[90:73],
+    // anchorGram[114:91], isFirst[120], isLast[121].
     function RuleInfo unpackRuleInfo(Bit#(128) raw);
         return RuleInfo {
             ruleId:      raw[47:32],
@@ -75,6 +77,7 @@ module mkDataLoader#(
             len:         raw[71:64],
             stage2:      (raw[72] == 1),
             nextGramKey: raw[90:73],
+            anchorGram:  raw[114:91],
             pad:         0
         };
     endfunction
@@ -85,8 +88,9 @@ module mkDataLoader#(
         patCount   <= w[159:128];
         ruledbOff  <= w[191:160];
         portlocOff <= w[223:192];
-        $display("DL header ght=%0d pat=%0d ruledbOff=%0d portlocOff=%0d",
-                 w[127:96], w[159:128], w[191:160], w[223:192]);
+        priorityOff<= w[255:224];
+        $display("DL header ght=%0d pat=%0d ruledbOff=%0d portlocOff=%0d priorityOff=%0d",
+                 w[127:96], w[159:128], w[191:160], w[223:192], w[255:224]);
         readReqQ.enq(tuple2(baseAddr + 64, 32 * 1024));
         wordIdx <= 0;
         state   <= DLBm0S1;
@@ -143,9 +147,11 @@ module mkDataLoader#(
 
     rule doGhtUnpack(state == DLGhtUnpack);
         if (ghtDone < ghtCount) begin
-            RuleInfo info   = unpackRuleInfo(curWord[127:0]);
-            Bit#(32) gram32 = curWord[31:0];
-            gram.insert(gram32, info);
+            RuleInfo info    = unpackRuleInfo(curWord[127:0]);
+            Bit#(32) gram32  = curWord[31:0];
+            Bool     isFirst = (curWord[120] == 1);
+            Bool     isLast  = (curWord[121] == 1);
+            gram.loadEntry(gram32, truncate(ghtDone), info, isFirst, isLast);
             state <= DLGhtAck;
         end else begin
             Bit#(64) patOff = zeroExtend(ruledbOff);
@@ -254,14 +260,49 @@ module mkDataLoader#(
             portWord   <= portWord + 1;
             portSubIdx <= 0;
             if (portWord == 31) begin
-                $display("DL done");
-                done  <= True;
-                state <= DLDone;
+                if (priorityOff != 0 && patCount != 0) begin
+                    Bit#(64) prioBytes = zeroExtend(((patCount + 63) >> 6) << 6);
+                    readReqQ.enq(tuple2(baseAddr + zeroExtend(priorityOff), prioBytes));
+                    prioDone   <= 0;
+                    state      <= DLPriorityFetch;
+                end else begin
+                    $display("DL done");
+                    done  <= True;
+                    state <= DLDone;
+                end
             end else begin
                 state <= DLPortSmallFetch;
             end
         end else begin
             portSubIdx <= portSubIdx + 1;
+        end
+    endrule
+
+    rule doPriorityFetch(state == DLPriorityFetch && wordQ.notEmpty && prioDone < patCount);
+        let w = wordQ.first; wordQ.deq;
+        curWord    <= w;
+        prioSubIdx <= 0;
+        state      <= DLPriorityUnpack;
+    endrule
+
+    rule doPriorityUnpack(state == DLPriorityUnpack);
+        Bit#(2) prio = curWord[1:0];
+        prioStage.writePriority(truncate(prioDone), prio);
+        curWord <= curWord >> 8;
+
+        if (prioSubIdx == 63 || prioDone + 1 >= patCount) begin
+            prioDone <= prioDone + 1;
+            prioSubIdx <= 0;
+            if (prioDone + 1 < patCount) begin
+                state <= DLPriorityFetch;
+            end else begin
+                $display("DL priority done");
+                done  <= True;
+                state <= DLDone;
+            end
+        end else begin
+            prioDone   <= prioDone + 1;
+            prioSubIdx <= prioSubIdx + 1;
         end
     endrule
 

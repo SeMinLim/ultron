@@ -11,7 +11,7 @@ endif
 endif
 
 PLATFORM ?= xilinx_u50_gen3x16_xdma_5_202210_1
-PROJECT := bitmap_stage_banked_hashtable
+PROJECT := neo_bitmap_fix
 
 include makefile_us_alveo.mk
 # kernel_ngram_filter and host_ngram_filter are symlinks inside bluevitis/ but live as

@@ -1,5 +1,4 @@
-
-
+// Archived BRAM bitmap implementation, not used by the build.
 package BitmapBram;
 
 import BRAM::*;
@@ -8,6 +7,7 @@ import Vector::*;
 
 typedef 64 NLanes;
 
+// 18-bit key: 9-bit line address, 9-bit bit index.
 interface BitmapBramIfc;
     method Action writeWord(Bit#(9) lineAddr, Bit#(512) data);
     method Action lookup(Vector#(NLanes, Bit#(18)) keys);
@@ -42,7 +42,6 @@ module mkBitmapBram(BitmapBramIfc);
                 address: lineAddr, datain: data });
     endmethod
 
-    // 18-bit key layout: [17:9] = BRAM line address (512 lines × 512 bits), [8:0] = bit index within line.
     method Action lookup(Vector#(NLanes, Bit#(18)) keys) if (keyQ.notFull);
         Vector#(NLanes, Bit#(9)) bitIdxs = newVector;
         for (Integer i = 0; i < valueOf(NLanes); i = i + 1) begin

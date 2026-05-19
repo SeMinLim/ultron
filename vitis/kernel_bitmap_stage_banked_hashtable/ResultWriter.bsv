@@ -1,7 +1,8 @@
 package ResultWriter;
 
+// Result buffer: [0..192) summary, 48 x u32 counters.
+
 import FIFOF::*;
-import Vector::*;
 
 typedef struct {
     Bit#(32) dbCycles;
@@ -29,7 +30,18 @@ typedef struct {
     Bit#(32) noMatchPkts;
     Bit#(32) stage2Checked;
     Bit#(32) stage2Passed;
-
+    Bit#(32) gapBackend;
+    Bit#(32) gapHbm;
+    Bit#(32) gapReaderOther;
+    Bit#(32) gapMetaWait;
+    Bit#(32) gapNextStart;
+    Bit#(32) readerDescCycles;
+    Bit#(32) readerStartCycles;
+    Bit#(32) readerFirstLineWaitCycles;
+    Bit#(32) readerRespCycles;
+    Bit#(32) epochFullCycles;
+    Bit#(32) resultAcceptBlockCycles;
+    Bit#(32) exactInputBlockCycles;
     Bit#(32) dataLoaderE2E;
     Bit#(32) packetReaderE2E;
     Bit#(32) payloadFeedE2E;
@@ -42,9 +54,9 @@ typedef struct {
 } ResultSummary deriving (Bits, Eq, FShow);
 
 interface ResultWriterIfc;
-
     method Action configure(Bit#(64) resultBase, Bit#(32) pktCount);
-    method Action addResult(Bool matched, Bit#(16) ruleId);
+    method Bool canAccept(Bit#(32) pktIdx);
+    method Action addResult(Bit#(32) pktIdx, Bool matched, Bit#(16) ruleId);
     method Action startWrite(ResultSummary summary);
     method Bool   writeDone;
     method ActionValue#(Tuple2#(Bit#(64), Bit#(64))) writeReq;
@@ -62,15 +74,10 @@ module mkResultWriter(ResultWriterIfc);
     Reg#(Bool)     done           <- mkReg(False);
     Reg#(Bit#(64)) resultBase_r   <- mkReg(0);
     Reg#(Bit#(32)) pktTotal       <- mkReg(0);
-    Reg#(Bit#(32)) pktsDone       <- mkReg(0);
-    Reg#(Bit#(32)) lineIdx        <- mkReg(0);
-
-    Reg#(Vector#(16, Bit#(32))) pktBuf  <- mkReg(replicate(0));
-    Reg#(Bit#(5))               pktBufN <- mkReg(0);
 
     Reg#(Bit#(2))       sumPhase <- mkReg(0);
     Reg#(ResultSummary) summaryR <- mkReg(unpack(0));
-
+    // Done is delayed until the summary burst has drained to DDR.
     Reg#(Bit#(8)) drainTicks <- mkReg(0);
 
     function Bit#(512) packSummary0(ResultSummary s,
@@ -108,6 +115,11 @@ module mkResultWriter(ResultWriterIfc);
         w[287:256] = s.noMatchPkts;
         w[319:288] = s.stage2Checked;
         w[351:320] = s.stage2Passed;
+        w[383:352] = s.gapBackend;
+        w[415:384] = s.gapHbm;
+        w[447:416] = s.gapReaderOther;
+        w[479:448] = s.gapMetaWait;
+        w[511:480] = s.gapNextStart;
         return w;
     endfunction
 
@@ -122,6 +134,13 @@ module mkResultWriter(ResultWriterIfc);
         w[223:192] = s.exactE2E;
         w[255:224] = s.pomE2E;
         w[287:256] = s.resultWriterE2E;
+        w[319:288] = s.readerDescCycles;
+        w[351:320] = s.readerStartCycles;
+        w[383:352] = s.readerFirstLineWaitCycles;
+        w[415:384] = s.readerRespCycles;
+        w[447:416] = s.epochFullCycles;
+        w[479:448] = s.resultAcceptBlockCycles;
+        w[511:480] = s.exactInputBlockCycles;
         return w;
     endfunction
 
@@ -153,44 +172,22 @@ module mkResultWriter(ResultWriterIfc);
         matchedCount   <= 0;
         processedCount <= 0;
         done           <= False;
-        pktsDone       <= 0;
-        lineIdx        <= 0;
-        pktBuf         <= replicate(0);
-        pktBufN        <= 0;
         sumPhase       <= 0;
         drainTicks     <= 0;
     endmethod
 
-    method Action addResult(Bool matched, Bit#(16) ruleId)
-            if (pktsDone < pktTotal &&
-                writeReqQ.notFull && writeWordQ.notFull);
-        Bit#(32) entry = {pack(matched), 15'b0, ruleId};
-        Vector#(16, Bit#(32)) v = pktBuf;
-        v[pktBufN] = entry;
+    method Bool canAccept(Bit#(32) pktIdx);
+        return True;
+    endmethod
 
+    method Action addResult(Bit#(32) pktIdx, Bool matched, Bit#(16) ruleId);
         processedCount <= processedCount + 1;
-        if (matched) matchedCount <= matchedCount + 1;
-
-        Bool isLastPkt = (pktsDone + 1 == pktTotal);
-        Bool flushLine = (pktBufN == 15) || isLastPkt;
-
-        if (flushLine) begin
-            writeReqQ.enq(tuple2(
-                resultBase_r + 192 + zeroExtend(lineIdx) * 64, 64));
-            writeWordQ.enq(pack(v));
-            pktBuf  <= replicate(0);
-            pktBufN <= 0;
-            lineIdx <= lineIdx + 1;
-        end else begin
-            pktBuf  <= v;
-            pktBufN <= pktBufN + 1;
-        end
-        pktsDone <= pktsDone + 1;
+        if (matched)
+            matchedCount <= matchedCount + 1;
     endmethod
 
     method Action startWrite(ResultSummary summary)
-            if (!done && sumPhase == 0 &&
-                pktsDone == pktTotal && pktBufN == 0);
+            if (!done && sumPhase == 0 && processedCount == pktTotal);
         summaryR <= summary;
         sumPhase <= 1;
     endmethod

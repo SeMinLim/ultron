@@ -1,5 +1,7 @@
 package PacketMeta;
 
+import Vector::*;
+
 typedef struct {
     Bit#(8)  ipProto;
     Bit#(8)  flags;
@@ -10,32 +12,32 @@ typedef struct {
 } PktMetaFields deriving (Bits, Eq, FShow);
 
 interface PacketMetaIfc;
-    method Action   put(PktMetaFields m);
-    method Bit#(8)  getProto;
-    method Bit#(16) getSrcPort;
-    method Bit#(16) getDstPort;
-    method Bit#(8)  getIcmpType;
-    method Bit#(8)  getIcmpCode;
-    method Bool     isTcp;
-    method Bool     isUdp;
-    method Bool     isIcmp;
+    method Action   put(Bit#(3) epoch, PktMetaFields m);
+    method Bit#(8)  getProto(Bit#(3) epoch);
+    method Bit#(16) getSrcPort(Bit#(3) epoch);
+    method Bit#(16) getDstPort(Bit#(3) epoch);
+    method Bit#(8)  getIcmpType(Bit#(3) epoch);
+    method Bit#(8)  getIcmpCode(Bit#(3) epoch);
+    method Bool     isTcp(Bit#(3) epoch);
+    method Bool     isUdp(Bit#(3) epoch);
+    method Bool     isIcmp(Bit#(3) epoch);
 endinterface
 
 module mkPacketMeta(PacketMetaIfc);
-    Reg#(PktMetaFields) cur <- mkReg(unpack(0));
+    Vector#(8, Reg#(PktMetaFields)) cur <- replicateM(mkReg(unpack(0)));
 
-    method Action put(PktMetaFields m);
-        cur <= m;
+    method Action put(Bit#(3) epoch, PktMetaFields m);
+        cur[epoch] <= m;
     endmethod
 
-    method Bit#(8)  getProto    = cur.ipProto;
-    method Bit#(16) getSrcPort  = cur.srcPort;
-    method Bit#(16) getDstPort  = cur.dstPort;
-    method Bit#(8)  getIcmpType = cur.icmpType;
-    method Bit#(8)  getIcmpCode = cur.icmpCode;
-    method Bool     isTcp       = (cur.flags[0] == 1'b1);
-    method Bool     isUdp       = (cur.flags[1] == 1'b1);
-    method Bool     isIcmp      = (cur.flags[2] == 1'b1);
+    method Bit#(8)  getProto(Bit#(3) epoch)    = cur[epoch].ipProto;
+    method Bit#(16) getSrcPort(Bit#(3) epoch)  = cur[epoch].srcPort;
+    method Bit#(16) getDstPort(Bit#(3) epoch)  = cur[epoch].dstPort;
+    method Bit#(8)  getIcmpType(Bit#(3) epoch) = cur[epoch].icmpType;
+    method Bit#(8)  getIcmpCode(Bit#(3) epoch) = cur[epoch].icmpCode;
+    method Bool     isTcp(Bit#(3) epoch)       = (cur[epoch].flags[1] == 1'b1);
+    method Bool     isUdp(Bit#(3) epoch)       = (cur[epoch].flags[2] == 1'b1);
+    method Bool     isIcmp(Bit#(3) epoch)      = (cur[epoch].flags[3] == 1'b1);
 endmodule
 
 endpackage

@@ -4,7 +4,6 @@ import FIFO::*;
 import FIFOF::*;
 
 interface Axi4MemoryMasterPinsIfc#(numeric type addrSz, numeric type dataSz);
-
 	(* always_ready, result="awvalid" *)
 	method Bool awvalid;
 	(* always_ready, always_enabled, prefix = "" *)
@@ -13,6 +12,7 @@ interface Axi4MemoryMasterPinsIfc#(numeric type addrSz, numeric type dataSz);
 	method Bit#(addrSz) awaddr;
 	(* always_ready, result="awlen" *)
 	method Bit#(8) awlen;
+
 
 	(* always_ready, result="wvalid" *)
 	method Bool wvalid;
@@ -25,12 +25,12 @@ interface Axi4MemoryMasterPinsIfc#(numeric type addrSz, numeric type dataSz);
 	(* always_ready, result="wlast" *)
 	method Bool wlast;
 
+
 	(* always_ready, always_enabled, prefix = "" *)
 	method Action write_resp_valid ((* port="bvalid" *)  Bool bvalid);
 	(* always_ready, result="bready" *)
 	method Bool bready;
 	
-
 	(* always_ready, result="arvalid" *)
 	method Bool arvalid;
 	(* always_ready, always_enabled, prefix = "" *)
@@ -39,6 +39,7 @@ interface Axi4MemoryMasterPinsIfc#(numeric type addrSz, numeric type dataSz);
 	method Bit#(addrSz) araddr;
 	(* always_ready, result="arlen" *)
 	method Bit#(8) arlen;
+
 
 	(* always_ready, always_enabled, prefix = "" *)
 	method Action read_data_valid ((* port="rvalid" *)  Bool rvalid);
@@ -55,14 +56,10 @@ interface Axi4MemoryMasterIfc#(numeric type addrSz, numeric type dataSz);
 	interface Axi4MemoryMasterPinsIfc#(addrSz,dataSz) pins;
   
 	method Action readReq(Bit#(addrSz) addr, Bit#(addrSz) size);
-
 	method ActionValue#(Bit#(dataSz)) read;
 
 	method Action writeReq(Bit#(addrSz) addr, Bit#(addrSz) size);
 	method Action write(Bit#(dataSz) data);
-  
-
-  
 endinterface
 
 (* synthesize *)
@@ -79,6 +76,7 @@ module mkAxi4MemoryMaster (Axi4MemoryMasterIfc#(addrSz,dataSz))
 	Reg#(Bit#(16)) writeWordInflightDn <- mkReg(0);
 	FIFOF#(Tuple2#(Bit#(addrSz), Bit#(addrSz))) writeBurstReqQ <- mkFIFOF;
 	FIFOF#(Bit#(dataSz)) writeWordQ <- mkFIFOF;
+
 
 	Integer maxBurstWords = min(256, (4096/(valueOf(dataSz)/8)));
 	Integer maxBurstBytes = maxBurstWords*(valueOf(dataSz)/8);
@@ -130,6 +128,7 @@ module mkAxi4MemoryMaster (Axi4MemoryMasterIfc#(addrSz,dataSz))
 		end
 	endrule
 
+
 	RWire#(Tuple2#(Bit#(dataSz),Bool)) dataWriteW <- mkRWire;
 	PulseWire dataWriteReadyW <- mkPulseWire;
 	Reg#(Bit#(8)) curBurstLeft <- mkReg(0);
@@ -179,6 +178,7 @@ module mkAxi4MemoryMaster (Axi4MemoryMasterIfc#(addrSz,dataSz))
 		end
 	endrule
 
+	// AXI4 requires arvalid to stay asserted until arready.
 	PulseWire         readAddressReadyW <- mkPulseWire;
 	Reg#(Bool)        readAddrValid     <- mkReg(False);
 	Reg#(Bit#(addrSz)) readAddrAddr    <- mkRegU;
@@ -205,7 +205,6 @@ module mkAxi4MemoryMaster (Axi4MemoryMasterIfc#(addrSz,dataSz))
 			readDataReadyW.send;
 
 			if ( readDataValidW ) begin
-
 				readWordQ.enq(fromMaybe(?,readDataWordW.wget));
 			end
 		end
@@ -252,7 +251,6 @@ module mkAxi4MemoryMaster (Axi4MemoryMasterIfc#(addrSz,dataSz))
 			return True;
 		endmethod
 	
-
 		method Bool arvalid;
 			return readAddrValid;
 		endmethod
@@ -265,6 +263,7 @@ module mkAxi4MemoryMaster (Axi4MemoryMasterIfc#(addrSz,dataSz))
 		method Bit#(8) arlen;
 			return readAddrLen;
 		endmethod
+
 
 		method Action read_data_valid ( Bool rvalid);
 			if ( rvalid ) readDataValidW.send;
@@ -294,5 +293,6 @@ module mkAxi4MemoryMaster (Axi4MemoryMasterIfc#(addrSz,dataSz))
 		writeWordQ.enq(data);
 	endmethod
 endmodule
+
 
 endpackage

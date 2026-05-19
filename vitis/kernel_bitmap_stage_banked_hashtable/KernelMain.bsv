@@ -12,6 +12,7 @@ import NgramExtracter::*;
 import PacketMeta::*;
 import ExactMatch::*;
 import PortOffsetMatcher::*;
+import Priority::*;
 import DataLoader::*;
 import PacketReader::*;
 import ResultWriter::*;
@@ -36,8 +37,21 @@ interface KernelMainIfc;
 endinterface
 
 typedef 3 MemPortCnt;
+typedef 8 NEpoch;
+typedef Bit#(3) Epoch;
 
 typedef enum { KIdle, KInit, KProcess, KWritePrep, KWrite, KDone } KState deriving (Bits, Eq, FShow);
+
+typedef struct {
+    Epoch    epoch;
+    Bit#(32) pktIdx;
+} PomCtx deriving (Bits, Eq, FShow);
+
+typedef struct {
+    Bit#(32) pktIdx;
+    Bool     hit;
+    Bit#(16) ruleId;
+} RetireResult deriving (Bits, Eq, FShow);
 
 module mkKernelMain(KernelMainIfc);
 
@@ -50,7 +64,8 @@ module mkKernelMain(KernelMainIfc);
     PacketMetaIfc         pktMeta      <- mkPacketMeta;
     ExactMatchIfc         exactMatch   <- mkExactMatch(patternTable);
     PortOffsetMatcherIfc  portMatch    <- mkPortOffsetMatcher;
-    DataLoaderIfc         dataLoader   <- mkDataLoader(bm0_s1, bm0_s2, bm1, gram, patternTable, portMatch);
+    PriorityIfc           prioStage    <- mkPriority;
+    DataLoaderIfc         dataLoader   <- mkDataLoader(bm0_s1, bm0_s2, bm1, gram, patternTable, portMatch, prioStage);
     PacketReaderIfc       pktReader    <- mkPacketReader;
     ResultWriterIfc       resultWriter <- mkResultWriter;
 
@@ -70,14 +85,51 @@ module mkKernelMain(KernelMainIfc);
     Reg#(Bit#(64)) rPktBase    <- mkRegU;
     Reg#(Bit#(64)) rResultBase <- mkRegU;
 
-    Reg#(Bit#(32))  payTotalLen  <- mkReg(0);
     Reg#(Bit#(6))   payOff       <- mkReg(0);
-    Reg#(Bit#(1))   payEpoch     <- mkReg(0);
-    Reg#(Bit#(1))   payWriteEpoch <- mkRegU;
+    Reg#(Epoch)     curEpoch     <- mkReg(0);
+    Reg#(Bit#(32))  curPktIdx    <- mkReg(0);
     Reg#(Bool)      metaReady    <- mkReg(False);
 
-    Reg#(Bool)               pktHitSent <- mkReg(False);
-    Reg#(Maybe#(PomPktMeta)) pomPending  <- mkReg(tagged Invalid);
+    Vector#(NEpoch, Reg#(Bool))     epochInUse    <- replicateM(mkReg(False));
+    Vector#(NEpoch, Reg#(Bit#(32))) epochPktIdx    <- replicateM(mkReg(0));
+    Vector#(NEpoch, Reg#(Bit#(32))) payTotalLen    <- replicateM(mkReg(0));
+    Vector#(NEpoch, Reg#(Bool))     feedDone       <- replicateM(mkReg(False));
+    Vector#(NEpoch, Reg#(Bool))     priorityFinishSent <- replicateM(mkReg(False));
+    Vector#(NEpoch, Reg#(Bool))     priorityDone       <- replicateM(mkReg(False));
+    Vector#(NEpoch, Reg#(Bool))     priorityResultHit  <- replicateM(mkReg(False));
+    Vector#(NEpoch, Reg#(Bit#(16))) priorityResultRule <- replicateM(mkReg(0));
+    Vector#(NEpoch, Reg#(Bit#(16))) inFlightNgram  <- replicateM(mkReg(0));
+    Vector#(NEpoch, Reg#(Bit#(16))) inFlightBitmap <- replicateM(mkReg(0));
+    Vector#(NEpoch, Reg#(Bit#(16))) inFlightScan   <- replicateM(mkReg(0));
+    Vector#(NEpoch, Reg#(Bit#(16))) inFlightGram   <- replicateM(mkReg(0));
+    Vector#(NEpoch, Reg#(Bit#(16))) inFlightRoute  <- replicateM(mkReg(0));
+    Vector#(NEpoch, Reg#(Bit#(16))) inFlightExact  <- replicateM(mkReg(0));
+    Vector#(NEpoch, Reg#(Bit#(16))) inFlightPom    <- replicateM(mkReg(0));
+    RWire#(Epoch) ngramIncr  <- mkRWire;
+    RWire#(Epoch) ngramDecr  <- mkRWire;
+    RWire#(Epoch) bitmapIncr <- mkRWire;
+    RWire#(Epoch) bitmapDecr <- mkRWire;
+    RWire#(Epoch) scanIncr   <- mkRWire;
+    RWire#(Epoch) scanDecr   <- mkRWire;
+    RWire#(Epoch) gramIncr   <- mkRWire;
+    RWire#(Epoch) gramDecr   <- mkRWire;
+    RWire#(Epoch) pomIncr    <- mkRWire;
+    RWire#(Epoch) pomDecr    <- mkRWire;
+
+    // Keeps exactMatch draining independent from POM readiness.
+    FIFOF#(Tuple2#(Epoch, PomPktMeta))   pomPendingQ <- mkSizedFIFOF(32);
+    FIFOF#(PomCtx)                      pomCtxQ     <- mkSizedFIFOF(32);
+    FIFOF#(RetireResult)                retireQ     <- mkSizedFIFOF(8);
+
+    FIFOF#(Tuple4#(Epoch,
+                   Vector#(NBitmapLanes, Maybe#(NgramOut)),
+                   Vector#(NBitmapLanes, Bool),
+                   Vector#(NBitmapLanes, Bit#(18))))        gramSideQ  <- mkSizedFIFOF(16);
+    FIFOF#(Tuple4#(Epoch,
+                   Vector#(NBitmapLanes, Bool),
+                   Vector#(NBitmapLanes, Maybe#(NgramOut)),
+                   Vector#(NBitmapLanes, Bit#(18))))        hitPairQ   <- mkSizedFIFOF(16);
+    FIFOF#(GramResult)                                      gramRouteQ <- mkSizedFIFOF(16);
 
     Reg#(Bit#(32)) dataLoaderCycles   <- mkReg(0);
     Reg#(Bit#(32)) packetReaderCycles <- mkReg(0);
@@ -112,6 +164,20 @@ module mkKernelMain(KernelMainIfc);
     Reg#(Bit#(32)) noMatchPkts        <- mkReg(0);
     Reg#(Bit#(32)) stage2Checked      <- mkReg(0);
     Reg#(Bit#(32)) stage2Passed       <- mkReg(0);
+    Reg#(Bit#(32)) gapBackend         <- mkReg(0);
+    Reg#(Bit#(32)) gapHbm             <- mkReg(0);
+    Reg#(Bit#(32)) gapReaderOther     <- mkReg(0);
+    Reg#(Bit#(32)) gapMetaWait        <- mkReg(0);
+    Reg#(Bit#(32)) gapNextStart       <- mkReg(0);
+    Reg#(Bit#(32)) readerDescCycles   <- mkReg(0);
+    Reg#(Bit#(32)) readerStartCycles  <- mkReg(0);
+    Reg#(Bit#(32)) readerFirstLineWaitCycles <- mkReg(0);
+    Reg#(Bit#(32)) readerRespCycles   <- mkReg(0);
+    Reg#(Bit#(32)) epochFullCycles    <- mkReg(0);
+    Reg#(Bit#(32)) resultAcceptBlockCycles <- mkReg(0);
+    Reg#(Bit#(32)) exactInputBlockCycles <- mkReg(0);
+    Reg#(Bit#(32)) lastNextCycle      <- mkReg(0);
+    Reg#(Bool)     awaitingFirstFeed  <- mkReg(False);
     Reg#(ResultSummary) resultSummary <- mkReg(unpack(0));
 
     rule dbReadReq;
@@ -144,6 +210,74 @@ module mkKernelMain(KernelMainIfc);
         return total;
     endfunction
 
+    function Bool anyFreeEpoch();
+        Bool any = False;
+        for (Integer i = 0; i < valueOf(NEpoch); i = i + 1)
+            any = any || !epochInUse[i];
+        return any;
+    endfunction
+
+    function Epoch chooseFreeEpoch();
+        Epoch chosen = 0;
+        Bool found = False;
+        for (Integer i = 0; i < valueOf(NEpoch); i = i + 1) begin
+            if (!found && !epochInUse[i]) begin
+                chosen = fromInteger(i);
+                found = True;
+            end
+        end
+        return chosen;
+    endfunction
+
+    function Bool anyEpochInUse();
+        Bool any = False;
+        for (Integer i = 0; i < valueOf(NEpoch); i = i + 1)
+            any = any || epochInUse[i];
+        return any;
+    endfunction
+
+    function Bool maybeEpochEq(Maybe#(Epoch) m, Epoch e);
+        Bool eq = False;
+        case (m) matches
+            tagged Valid .x: eq = (x == e);
+            tagged Invalid:  eq = False;
+        endcase
+        return eq;
+    endfunction
+
+    function Bit#(16) applyNgramDelta(Bit#(16) cur, Bool inc, Bool dec);
+        Bit#(16) next = cur;
+        if (inc && !dec)
+            next = cur + 1;
+        else if (!inc && dec)
+            next = cur - 1;
+        return next;
+    endfunction
+
+    function Rules mkCounterUpdate(Vector#(NEpoch, Reg#(Bit#(16))) cnts,
+                                   RWire#(Epoch) inc,
+                                   RWire#(Epoch) dec);
+        Rules rs = emptyRules;
+        for (Integer i = 0; i < valueOf(NEpoch); i = i + 1) begin
+            rs = rJoin(rs, (rules
+                rule updateInFlight(state == KProcess &&
+                                    (maybeEpochEq(inc.wget, fromInteger(i)) ||
+                                     maybeEpochEq(dec.wget, fromInteger(i))));
+                    cnts[i] <= applyNgramDelta(cnts[i],
+                                               maybeEpochEq(inc.wget, fromInteger(i)),
+                                               maybeEpochEq(dec.wget, fromInteger(i)));
+                endrule
+            endrules));
+        end
+        return rs;
+    endfunction
+
+    addRules(mkCounterUpdate(inFlightNgram,  ngramIncr,  ngramDecr));
+    addRules(mkCounterUpdate(inFlightGram,   gramIncr,   gramDecr));
+    addRules(mkCounterUpdate(inFlightPom,    pomIncr,    pomDecr));
+    addRules(mkCounterUpdate(inFlightBitmap, bitmapIncr, bitmapDecr));
+    addRules(mkCounterUpdate(inFlightScan,   scanIncr,   scanDecr));
+
     rule pktReadReq;
         let {addr, bytes} <- pktReader.readReq;
         rdReqQs[1].enq(MemReq { addr: addr, bytes: bytes });
@@ -175,36 +309,30 @@ module mkKernelMain(KernelMainIfc);
         end
 
         if (state == KProcess && !pktReader.allDone) begin
+            Bool bitmapInner = !bm0_s1.idle || !bm0_s2.idle || !bm1.idle;
+            Bool exactInner  = exactMatch.inputPending || exactMatch.notEmpty;
+            Bool pomInner    = portMatch.processing    || !prioStage.idle;
 
             if (pktReader.busy) begin
                 packetReaderCycles <= packetReaderCycles + 1;
                 packetReaderSpan.mark(now);
             end
-
-            if (pktReader.pktReady && metaReady) begin
-                payloadFeedCycles <= payloadFeedCycles + 1;
-                payloadFeedSpan.mark(now);
-            end
             if (!ngram.idle) begin
                 ngramCycles <= ngramCycles + 1;
                 ngramSpan.mark(now);
             end
-            if (!bm0_s1.idle || !bm0_s2.idle || !bm1.idle) begin
-                bitmapCycles <= bitmapCycles + 1;
+            if (bitmapInner) bitmapCycles <= bitmapCycles + 1;
+            if (bitmapInner || gramSideQ.notEmpty || !ngram.idle)
                 bitmapSpan.mark(now);
-            end
-            if (!gram.idle) begin
-                gramCycles <= gramCycles + 1;
+            if (!gram.idle) gramCycles <= gramCycles + 1;
+            if (!gram.idle || hitPairQ.notEmpty)
                 gramSpan.mark(now);
-            end
-            if (exactMatch.inputPending || exactMatch.notEmpty) begin
-                exactCycles <= exactCycles + 1;
+            if (exactInner) exactCycles <= exactCycles + 1;
+            if (exactInner || gramRouteQ.notEmpty)
                 exactSpan.mark(now);
-            end
-            if (portMatch.processing) begin
-                pomCycles <= pomCycles + 1;
+            if (pomInner) pomCycles <= pomCycles + 1;
+            if (pomInner || pomPendingQ.notEmpty || pomCtxQ.notEmpty)
                 pomSpan.mark(now);
-            end
         end
 
         if (state == KDone && !resultWriter.writeDone) begin
@@ -213,10 +341,46 @@ module mkKernelMain(KernelMainIfc);
         end
     endrule
 
-    rule latchMeta(state == KProcess && !metaReady && pktReader.metaAvailable);
+    rule countGaps(state == KProcess && !pktReader.allDone);
+        if (pktReader.pktDone)
+            gapBackend <= gapBackend + 1;
+        else if (pktReader.feedAwaitingLine)
+            gapHbm <= gapHbm + 1;
+        else if (pktReader.pktReady && !metaReady)
+            gapMetaWait <= gapMetaWait + 1;
+        else if (pktReader.busy && !pktReader.pktReady)
+            gapReaderOther <= gapReaderOther + 1;
+    endrule
+
+    rule countReaderBreakdown(state == KProcess && !pktReader.allDone);
+        if (pktReader.descBusy)
+            readerDescCycles <= readerDescCycles + 1;
+        if (pktReader.startBusy)
+            readerStartCycles <= readerStartCycles + 1;
+        if (pktReader.startAwaitingPayload)
+            readerFirstLineWaitCycles <= readerFirstLineWaitCycles + 1;
+        if (pktReader.payloadRespBusy)
+            readerRespCycles <= readerRespCycles + 1;
+    endrule
+
+    rule countBackpressure(state == KProcess);
+        if (pktReader.pktReady && !metaReady && pktReader.metaAvailable && !anyFreeEpoch)
+            epochFullCycles <= epochFullCycles + 1;
+        if (retireQ.notEmpty && !resultWriter.canAccept(retireQ.first.pktIdx))
+            resultAcceptBlockCycles <= resultAcceptBlockCycles + 1;
+    endrule
+
+    rule latchMeta(state == KProcess && !metaReady && pktReader.metaAvailable && anyFreeEpoch);
         let m <- pktReader.nextMeta;
-        pktMeta.put(m);
-        metaReady <= True;
+        Epoch e = chooseFreeEpoch;
+        pktMeta.put(e, m.meta);
+        curEpoch       <= e;
+        curPktIdx      <= m.pktIdx;
+        epochInUse[e]  <= True;
+        epochPktIdx[e] <= m.pktIdx;
+        payTotalLen[e] <= m.payloadLen;
+        feedDone[e]    <= (m.payloadLen == 0);
+        metaReady      <= (m.payloadLen != 0);
     endrule
 
     rule feedPayloadWord(state == KProcess && pktReader.pktReady && metaReady);
@@ -224,24 +388,85 @@ module mkKernelMain(KernelMainIfc);
         Bit#(7)   cnt  = pktReader.lineValidBytes;
         Bool      last = pktReader.lineIsLast;
 
-        if (payTotalLen == 0) begin
-            payTotalLen   <= pktReader.bytesRemaining;
-            payOff        <= 0;
-            payWriteEpoch <= payEpoch;
+        if (awaitingFirstFeed) begin
+            Bit#(32) now = timerTotal.value;
+            gapNextStart      <= gapNextStart + (now - lastNextCycle);
+            awaitingFirstFeed <= False;
         end
 
-        ngram.putBytes(word, 0, cnt, last);
-        exactMatch.putPayloadWord(word, last, payEpoch);
+        Epoch e = curEpoch;
 
-        pktReader.advanceLine;
+        payOff <= 0;
+        payloadFeedCycles <= payloadFeedCycles + 1;
+        payloadFeedSpan.mark(timerTotal.value);
 
-        if (last) begin
-            payEpoch <= payEpoch + 1;
+        ngram.putBytes(word, 0, cnt, last, e);
+        exactMatch.putPayloadWord(word, last, e);
+        ngramIncr.wset(e);
+
+        if (last && pktReader.nextAfterLineReady && anyFreeEpoch) begin
+            let m <- pktReader.advanceLineAndStartNextMeta;
+            Epoch ne = chooseFreeEpoch;
+            pktMeta.put(ne, m.meta);
+            curEpoch       <= ne;
+            curPktIdx      <= m.pktIdx;
+            epochInUse[ne] <= True;
+            epochPktIdx[ne] <= m.pktIdx;
+            payTotalLen[ne] <= m.payloadLen;
+            for (Integer i = 0; i < valueOf(NEpoch); i = i + 1) begin
+                Epoch ie = fromInteger(i);
+                if (ie == e)
+                    feedDone[i] <= True;
+                else if (ie == ne)
+                    feedDone[i] <= (m.payloadLen == 0);
+            end
+            metaReady      <= (m.payloadLen != 0);
+        end else begin
+            pktReader.advanceLine;
+            if (last)
+                metaReady <= False;
+        end
+
+        if (last && !(pktReader.nextAfterLineReady && anyFreeEpoch)) begin
+            feedDone[e] <= True;
         end
     endrule
 
-    Reg#(Bool)                                    hasPrev   <- mkReg(False);
-    Reg#(Vector#(NBitmapLanes, Maybe#(NgramOut))) prevBatch <- mkRegU;
+    // bm1 uses anchor+3, so lanes 61..63 need next-batch lookahead.
+    Vector#(NEpoch, Reg#(Bool)) hasPrev <- replicateM(mkReg(False));
+    Vector#(NEpoch, Reg#(Bool)) tailReady <- replicateM(mkReg(False));
+    Vector#(NEpoch, Reg#(Vector#(NBitmapLanes, Maybe#(NgramOut)))) prevBatch <- replicateM(mkRegU);
+
+    function Bool epochPipeDone(Epoch e);
+        return feedDone[e] &&
+               inFlightNgram[e] == 0 &&
+               !hasPrev[e] &&
+               !tailReady[e] &&
+               inFlightBitmap[e] == 0 &&
+               inFlightScan[e] == 0 &&
+               inFlightGram[e] == 0 &&
+               inFlightRoute[e] == 0 &&
+               inFlightExact[e] == 0;
+    endfunction
+
+    function Bool anyTailReady();
+        Bool any = False;
+        for (Integer i = 0; i < valueOf(NEpoch); i = i + 1)
+            any = any || tailReady[i];
+        return any;
+    endfunction
+
+    function Epoch chooseTailReady();
+        Epoch chosen = 0;
+        Bool found = False;
+        for (Integer i = 0; i < valueOf(NEpoch); i = i + 1) begin
+            if (!found && tailReady[i]) begin
+                chosen = fromInteger(i);
+                found = True;
+            end
+        end
+        return chosen;
+    endfunction
 
     function Bit#(18) makeKey18(NgramOut g) =
         {g.gram[21:16], g.gram[13:8], g.gram[5:0]};
@@ -273,47 +498,48 @@ module mkKernelMain(KernelMainIfc);
         return tuple3(bm0K, bm1K, bm1V);
     endfunction
 
-    FIFOF#(Tuple2#(Vector#(NBitmapLanes, Maybe#(NgramOut)),
-                   Vector#(NBitmapLanes, Bool)))            gramSideQ <- mkSizedFIFOF(4);
-
-    rule absorbFirst(state == KProcess && ngram.gramsReady && !hasPrev);
+    rule absorbNgramBatch(state == KProcess && ngram.gramsReady);
         let b <- ngram.getGrams;
-        prevBatch <= b;
-        hasPrev   <= True;
+        Epoch e = b.epoch;
+        ngramDecr.wset(e);
+        if (!hasPrev[e]) begin
+            prevBatch[e] <= b.grams;
+            hasPrev[e]   <= True;
+            tailReady[e] <= b.last;
+        end else begin
+            let prev = prevBatch[e];
+            match { .bm0K, .bm1K, .bm1V } = buildKeys(prev, b.grams, True);
+            bm0_s1.lookup(bm0K);
+            bm0_s2.lookup(bm0K);
+            bm1.lookup(bm1K);
+            gramSideQ.enq(tuple4(e, prev, bm1V, bm1K));
+            gramsExtracted <= gramsExtracted + countValidGrams(prev);
+            bitmapIncr.wset(e);
+            prevBatch[e] <= b.grams;
+            tailReady[e] <= b.last;
+        end
     endrule
 
-    rule absorbAndDispatch(state == KProcess && ngram.gramsReady && hasPrev);
-        let cur <- ngram.getGrams;
-        let prev = prevBatch;
-        match { .bm0K, .bm1K, .bm1V } = buildKeys(prev, cur, True);
-        bm0_s1.lookup(bm0K);
-        bm0_s2.lookup(bm0K);
-        bm1.lookup(bm1K);
-        gramSideQ.enq(tuple2(prev, bm1V));
-        gramsExtracted <= gramsExtracted + countValidGrams(prev);
-        prevBatch <= cur;
-    endrule
-
-    rule flushTail(state == KProcess && hasPrev && ngram.idle && pktReader.pktDone);
-        let prev = prevBatch;
+    rule flushTail(state == KProcess && anyTailReady);
+        Epoch e = chooseTailReady;
+        let prev = prevBatch[e];
         match { .bm0K, .bm1K, .bm1V } = buildKeys(prev, prev, False);
         bm0_s1.lookup(bm0K);
         bm0_s2.lookup(bm0K);
         bm1.lookup(bm1K);
-        gramSideQ.enq(tuple2(prev, bm1V));
+        gramSideQ.enq(tuple4(e, prev, bm1V, bm1K));
         gramsExtracted <= gramsExtracted + countValidGrams(prev);
-        hasPrev <= False;
+        bitmapIncr.wset(e);
+        hasPrev[e] <= False;
+        tailReady[e] <= False;
     endrule
 
-    FIFOF#(Tuple2#(Vector#(NBitmapLanes, Bool),
-                   Vector#(NBitmapLanes, Maybe#(NgramOut))))
-        hitPairQ <- mkSizedFIFOF(4);
-
+    // needCuckoo = bm0_s1[g] || (bm0_s2[g] && bm1_valid && bm1[g+3])
     rule pairBitmapResults;
         let hits_s1 <- bm0_s1.result;
         let hits_s2 <- bm0_s2.result;
         let hits_b1 <- bm1.result;
-        match { .grams, .bm1V } = gramSideQ.first; gramSideQ.deq;
+        match { .e, .grams, .bm1V, .bm1K } = gramSideQ.first; gramSideQ.deq;
 
         Vector#(NBitmapLanes, Bool) needCuckoo = newVector;
         Bit#(32) bm0Hits     = 0;
@@ -335,13 +561,17 @@ module mkKernelMain(KernelMainIfc);
         bitmapPassed  <= bitmapPassed  + bm0Hits;
         stage2Checked <= stage2Checked + bm0S2Hits;
         stage2Passed  <= stage2Passed  + bm0S2AndBm1;
-        hitPairQ.enq(tuple2(needCuckoo, grams));
+        bitmapDecr.wset(e);
+        scanIncr.wset(e);
+        hitPairQ.enq(tuple4(e, needCuckoo, grams, bm1K));
     endrule
 
     Reg#(Bool)                                    scanBusy   <- mkReg(False);
+    Reg#(Epoch)                                 scanEpoch  <- mkReg(0);
     Reg#(Bit#(7))                                 scanIdx    <- mkReg(0);
     Reg#(Vector#(NBitmapLanes, Bool))             scanNeed   <- mkRegU;
     Reg#(Vector#(NBitmapLanes, Maybe#(NgramOut))) scanGrams  <- mkRegU;
+    Reg#(Vector#(NBitmapLanes, Bit#(18)))         scanBm1K   <- mkRegU;
 
     function Maybe#(Bit#(7)) nextValidHit(
         Bit#(7) start,
@@ -358,9 +588,11 @@ module mkKernelMain(KernelMainIfc);
     endfunction
 
     rule startScan(!scanBusy && hitPairQ.notEmpty);
-        match { .need, .grams } = hitPairQ.first; hitPairQ.deq;
+        match { .e, .need, .grams, .bm1K } = hitPairQ.first; hitPairQ.deq;
+        scanEpoch <= e;
         scanNeed  <= need;
         scanGrams <= grams;
+        scanBm1K  <= bm1K;
         scanIdx   <= 0;
         scanBusy  <= True;
     endrule
@@ -370,118 +602,268 @@ module mkKernelMain(KernelMainIfc);
             tagged Valid .idx: begin
                 let g = validValue(scanGrams[idx]);
                 Bit#(32) key18 = zeroExtend(makeKey18(g));
-                gram.lookupReq(key18, g.anchor, payTotalLen, payWriteEpoch,
-                               payOff, True);
+                gram.lookupReq(key18, g.gram[23:0], scanBm1K[idx], g.anchor,
+                               payTotalLen[scanEpoch], scanEpoch, payOff, True);
                 gramLookups <= gramLookups + 1;
+                gramIncr.wset(scanEpoch);
                 scanIdx <= idx + 1;
             end
             tagged Invalid: begin
+                scanDecr.wset(scanEpoch);
                 scanBusy <= False;
             end
         endcase
     endrule
 
-    FIFOF#(GramResult) gramRouteQ <- mkSizedFIFOF(4);
+    rule countExactInputBackpressure(state == KProcess && gramRouteQ.notEmpty &&
+                                     !exactMatch.canAcceptRequest);
+        exactInputBlockCycles <= exactInputBlockCycles + 1;
+    endrule
 
     rule collectGramHits(state == KProcess);
         let gr <- gram.lookupResp;
-        gramHits <= gramHits + 1;
-        gramRouteQ.enq(gr);
+        if (gr.lastInChain)
+            gramDecr.wset(gr.epoch);
+        if (gr.hit) begin
+            gramHits <= gramHits + 1;
+            inFlightRoute[gr.epoch] <= inFlightRoute[gr.epoch] + 1;
+            gramRouteQ.enq(gr);
+        end
     endrule
 
     rule routeGramResult(state == KProcess && gramRouteQ.notEmpty);
         let gr = gramRouteQ.first; gramRouteQ.deq;
         exactChecks <= exactChecks + 1;
+        inFlightRoute[gr.epoch] <= inFlightRoute[gr.epoch] - 1;
+        inFlightExact[gr.epoch] <= inFlightExact[gr.epoch] + 1;
         exactMatch.putRequest(gr.vreq, gr.payLen, gr.epoch, gr.pay_off);
     endrule
 
     rule drainExact(state == KProcess && exactMatch.notEmpty);
         let r <- exactMatch.getResult;
+        inFlightExact[r.epoch] <= inFlightExact[r.epoch] - 1;
         if (r.hit) begin
             exactHits <= exactHits + 1;
-            if (!pktHitSent) begin
-                pktHitSent <= True;
-                pomChecks  <= pomChecks + 1;
-                pomPending <= tagged Valid PomPktMeta {
-                    ruleId:     r.ruleId,
-                    ipProto:    pktMeta.getProto,
-                    srcPort:    pktMeta.getSrcPort,
-                    dstPort:    pktMeta.getDstPort,
-                    icmpType:   pktMeta.getIcmpType,
-                    icmpCode:   pktMeta.getIcmpCode,
-                    isTcp:      pktMeta.isTcp,
-                    isUdp:      pktMeta.isUdp,
-                    isIcmp:     pktMeta.isIcmp,
-                    matchPos:   r.matchPos,
-                    payloadLen: r.payLen
-                };
-            end
+            pomChecks  <= pomChecks + 1;
+            pomIncr.wset(r.epoch);
+            pomPendingQ.enq(tuple2(r.epoch, PomPktMeta {
+                ruleId:     r.ruleId,
+                ipProto:    pktMeta.getProto(r.epoch),
+                srcPort:    pktMeta.getSrcPort(r.epoch),
+                dstPort:    pktMeta.getDstPort(r.epoch),
+                icmpType:   pktMeta.getIcmpType(r.epoch),
+                icmpCode:   pktMeta.getIcmpCode(r.epoch),
+                isTcp:      pktMeta.isTcp(r.epoch),
+                isUdp:      pktMeta.isUdp(r.epoch),
+                isIcmp:     pktMeta.isIcmp(r.epoch),
+                matchPos:   r.matchPos,
+                payloadLen: r.payLen
+            }));
         end else begin
             exactMisses <= exactMisses + 1;
         end
     endrule
 
-    rule sendToPom(pomPending matches tagged Valid .m);
+    rule sendToPom(pomPendingQ.notEmpty);
+        match { .e, .m } = pomPendingQ.first; pomPendingQ.deq;
         portMatch.putMeta(m);
-        pomPending <= tagged Invalid;
+        pomCtxQ.enq(PomCtx { epoch: e, pktIdx: epochPktIdx[e] });
     endrule
 
-    rule collectPortResult(state == KProcess &&
-                          gram.idle &&
-                          !gramRouteQ.notEmpty &&
-                          !exactMatch.inputPending && !exactMatch.notEmpty &&
-                          portMatch.outputReady);
+    rule collectPortResult(state == KProcess && portMatch.outputReady && pomCtxQ.notEmpty &&
+                           prioStage.inputReady);
         let pr <- portMatch.getResult;
+        let ctx = pomCtxQ.first; pomCtxQ.deq;
         if (pr.hit)
             pomHits <= pomHits + 1;
         else
             pomMisses <= pomMisses + 1;
-        resultWriter.addResult(pr.hit, pr.ruleId);
-        pktHitSent  <= False;
-        payTotalLen <= 0;
-        metaReady   <= False;
-        pktReader.nextPacket;
+        pomDecr.wset(ctx.epoch);
+        prioStage.putCandidate(PriorityCandidate {
+            epoch:  ctx.epoch,
+            pktIdx: ctx.pktIdx,
+            hit:    pr.hit,
+            ruleId: pr.ruleId
+        });
     endrule
 
-    Reg#(Bit#(32)) dbgStallCnt <- mkReg(0);
-    rule debugStall(state == KProcess && pktReader.pktDone);
-        dbgStallCnt <= dbgStallCnt + 1;
-        if (dbgStallCnt[16:0] == 0)
-            $display("KM stall#%0d ngm=%b s1=%b s2=%b b1=%b gram=%b grQ=%b sideQ=%b hitQ=%b prev=%b ex=%b/%b pmIdle=%b pmOut=%b",
-                dbgStallCnt >> 17,
-                ngram.idle, bm0_s1.idle, bm0_s2.idle, bm1.idle, gram.idle,
-                !gramRouteQ.notEmpty,
-                !gramSideQ.notEmpty, !hitPairQ.notEmpty, hasPrev,
-                !exactMatch.inputPending, !exactMatch.notEmpty,
-                portMatch.idle, portMatch.outputReady);
+    rule finishPriority0(state == KProcess && epochInUse[0] && epochPipeDone(0) &&
+                         inFlightPom[0] == 0 && !priorityFinishSent[0]);
+        prioStage.finishEpoch(0, epochPktIdx[0]);
+        priorityFinishSent[0] <= True;
     endrule
 
-    rule completePktNoMatch(
-        state == KProcess &&
-        pktReader.pktDone &&
-        ngram.idle &&
-        bm0_s1.idle &&
-        bm0_s2.idle &&
-        bm1.idle &&
-        gram.idle &&
-        !hasPrev &&
-        !gramSideQ.notEmpty &&
-        !hitPairQ.notEmpty &&
-        !scanBusy &&
-        !gramRouteQ.notEmpty &&
-        !exactMatch.inputPending &&
-        !exactMatch.notEmpty &&
-        portMatch.idle
-    );
-        noMatchPkts <= noMatchPkts + 1;
-        resultWriter.addResult(False, 0);
-        pktHitSent  <= False;
-        payTotalLen <= 0;
-        metaReady   <= False;
-        pktReader.nextPacket;
+    rule finishPriority1(state == KProcess && epochInUse[1] && epochPipeDone(1) &&
+                         inFlightPom[1] == 0 && !priorityFinishSent[1]);
+        prioStage.finishEpoch(1, epochPktIdx[1]);
+        priorityFinishSent[1] <= True;
     endrule
 
-    rule doProcDone(state == KProcess && pktReader.allDone);
+    rule finishPriority2(state == KProcess && epochInUse[2] && epochPipeDone(2) &&
+                         inFlightPom[2] == 0 && !priorityFinishSent[2]);
+        prioStage.finishEpoch(2, epochPktIdx[2]);
+        priorityFinishSent[2] <= True;
+    endrule
+
+    rule finishPriority3(state == KProcess && epochInUse[3] && epochPipeDone(3) &&
+                         inFlightPom[3] == 0 && !priorityFinishSent[3]);
+        prioStage.finishEpoch(3, epochPktIdx[3]);
+        priorityFinishSent[3] <= True;
+    endrule
+
+    rule finishPriority4(state == KProcess && epochInUse[4] && epochPipeDone(4) &&
+                         inFlightPom[4] == 0 && !priorityFinishSent[4]);
+        prioStage.finishEpoch(4, epochPktIdx[4]);
+        priorityFinishSent[4] <= True;
+    endrule
+
+    rule finishPriority5(state == KProcess && epochInUse[5] && epochPipeDone(5) &&
+                         inFlightPom[5] == 0 && !priorityFinishSent[5]);
+        prioStage.finishEpoch(5, epochPktIdx[5]);
+        priorityFinishSent[5] <= True;
+    endrule
+
+    rule finishPriority6(state == KProcess && epochInUse[6] && epochPipeDone(6) &&
+                         inFlightPom[6] == 0 && !priorityFinishSent[6]);
+        prioStage.finishEpoch(6, epochPktIdx[6]);
+        priorityFinishSent[6] <= True;
+    endrule
+
+    rule finishPriority7(state == KProcess && epochInUse[7] && epochPipeDone(7) &&
+                         inFlightPom[7] == 0 && !priorityFinishSent[7]);
+        prioStage.finishEpoch(7, epochPktIdx[7]);
+        priorityFinishSent[7] <= True;
+    endrule
+
+    rule collectPriorityResult(state == KProcess && prioStage.outputReady);
+        let r <- prioStage.getResult;
+        priorityDone[r.epoch]       <= True;
+        priorityResultHit[r.epoch]  <= r.hit;
+        priorityResultRule[r.epoch] <= r.ruleId;
+    endrule
+
+    rule retireEpoch0(state == KProcess && epochInUse[0] && epochPipeDone(0) &&
+                      priorityDone[0]);
+        if (!priorityResultHit[0]) noMatchPkts <= noMatchPkts + 1;
+        retireQ.enq(RetireResult { pktIdx: epochPktIdx[0],
+                                   hit: priorityResultHit[0],
+                                   ruleId: priorityResultHit[0] ? priorityResultRule[0] : 0 });
+        epochInUse[0] <= False;
+        payTotalLen[0] <= 0;
+        priorityFinishSent[0] <= False;
+        priorityDone[0] <= False;
+        priorityResultHit[0] <= False;
+        priorityResultRule[0] <= 0;
+    endrule
+
+    rule retireEpoch1(state == KProcess && epochInUse[1] && epochPipeDone(1) &&
+                      priorityDone[1]);
+        if (!priorityResultHit[1]) noMatchPkts <= noMatchPkts + 1;
+        retireQ.enq(RetireResult { pktIdx: epochPktIdx[1],
+                                   hit: priorityResultHit[1],
+                                   ruleId: priorityResultHit[1] ? priorityResultRule[1] : 0 });
+        epochInUse[1] <= False;
+        payTotalLen[1] <= 0;
+        priorityFinishSent[1] <= False;
+        priorityDone[1] <= False;
+        priorityResultHit[1] <= False;
+        priorityResultRule[1] <= 0;
+    endrule
+
+    rule retireEpoch2(state == KProcess && epochInUse[2] && epochPipeDone(2) &&
+                      priorityDone[2]);
+        if (!priorityResultHit[2]) noMatchPkts <= noMatchPkts + 1;
+        retireQ.enq(RetireResult { pktIdx: epochPktIdx[2],
+                                   hit: priorityResultHit[2],
+                                   ruleId: priorityResultHit[2] ? priorityResultRule[2] : 0 });
+        epochInUse[2] <= False;
+        payTotalLen[2] <= 0;
+        priorityFinishSent[2] <= False;
+        priorityDone[2] <= False;
+        priorityResultHit[2] <= False;
+        priorityResultRule[2] <= 0;
+    endrule
+
+    rule retireEpoch3(state == KProcess && epochInUse[3] && epochPipeDone(3) &&
+                      priorityDone[3]);
+        if (!priorityResultHit[3]) noMatchPkts <= noMatchPkts + 1;
+        retireQ.enq(RetireResult { pktIdx: epochPktIdx[3],
+                                   hit: priorityResultHit[3],
+                                   ruleId: priorityResultHit[3] ? priorityResultRule[3] : 0 });
+        epochInUse[3] <= False;
+        payTotalLen[3] <= 0;
+        priorityFinishSent[3] <= False;
+        priorityDone[3] <= False;
+        priorityResultHit[3] <= False;
+        priorityResultRule[3] <= 0;
+    endrule
+
+    rule retireEpoch4(state == KProcess && epochInUse[4] && epochPipeDone(4) &&
+                      priorityDone[4]);
+        if (!priorityResultHit[4]) noMatchPkts <= noMatchPkts + 1;
+        retireQ.enq(RetireResult { pktIdx: epochPktIdx[4],
+                                   hit: priorityResultHit[4],
+                                   ruleId: priorityResultHit[4] ? priorityResultRule[4] : 0 });
+        epochInUse[4] <= False;
+        payTotalLen[4] <= 0;
+        priorityFinishSent[4] <= False;
+        priorityDone[4] <= False;
+        priorityResultHit[4] <= False;
+        priorityResultRule[4] <= 0;
+    endrule
+
+    rule retireEpoch5(state == KProcess && epochInUse[5] && epochPipeDone(5) &&
+                      priorityDone[5]);
+        if (!priorityResultHit[5]) noMatchPkts <= noMatchPkts + 1;
+        retireQ.enq(RetireResult { pktIdx: epochPktIdx[5],
+                                   hit: priorityResultHit[5],
+                                   ruleId: priorityResultHit[5] ? priorityResultRule[5] : 0 });
+        epochInUse[5] <= False;
+        payTotalLen[5] <= 0;
+        priorityFinishSent[5] <= False;
+        priorityDone[5] <= False;
+        priorityResultHit[5] <= False;
+        priorityResultRule[5] <= 0;
+    endrule
+
+    rule retireEpoch6(state == KProcess && epochInUse[6] && epochPipeDone(6) &&
+                      priorityDone[6]);
+        if (!priorityResultHit[6]) noMatchPkts <= noMatchPkts + 1;
+        retireQ.enq(RetireResult { pktIdx: epochPktIdx[6],
+                                   hit: priorityResultHit[6],
+                                   ruleId: priorityResultHit[6] ? priorityResultRule[6] : 0 });
+        epochInUse[6] <= False;
+        payTotalLen[6] <= 0;
+        priorityFinishSent[6] <= False;
+        priorityDone[6] <= False;
+        priorityResultHit[6] <= False;
+        priorityResultRule[6] <= 0;
+    endrule
+
+    rule retireEpoch7(state == KProcess && epochInUse[7] && epochPipeDone(7) &&
+                      priorityDone[7]);
+        if (!priorityResultHit[7]) noMatchPkts <= noMatchPkts + 1;
+        retireQ.enq(RetireResult { pktIdx: epochPktIdx[7],
+                                   hit: priorityResultHit[7],
+                                   ruleId: priorityResultHit[7] ? priorityResultRule[7] : 0 });
+        epochInUse[7] <= False;
+        payTotalLen[7] <= 0;
+        priorityFinishSent[7] <= False;
+        priorityDone[7] <= False;
+        priorityResultHit[7] <= False;
+        priorityResultRule[7] <= 0;
+    endrule
+
+    rule writeRetiredResult(state == KProcess && retireQ.notEmpty &&
+                            resultWriter.canAccept(retireQ.first.pktIdx));
+        let r = retireQ.first; retireQ.deq;
+        resultWriter.addResult(r.pktIdx, r.hit, r.ruleId);
+    endrule
+
+    rule doProcDone(state == KProcess && pktReader.allDone &&
+                    !pktReader.metaAvailable && !metaReady &&
+                    !anyEpochInUse &&
+                    !retireQ.notEmpty);
         $display("KM process done");
         timerPkt.markDone;
         timerTotal.markDone;
@@ -523,6 +905,18 @@ module mkKernelMain(KernelMainIfc);
             noMatchPkts:        noMatchPkts,
             stage2Checked:      stage2Checked,
             stage2Passed:       stage2Passed,
+            gapBackend:         gapBackend,
+            gapHbm:             gapHbm,
+            gapReaderOther:     gapReaderOther,
+            gapMetaWait:        gapMetaWait,
+            gapNextStart:       gapNextStart,
+            readerDescCycles:   readerDescCycles,
+            readerStartCycles:  readerStartCycles,
+            readerFirstLineWaitCycles: readerFirstLineWaitCycles,
+            readerRespCycles:   readerRespCycles,
+            epochFullCycles:    epochFullCycles,
+            resultAcceptBlockCycles: resultAcceptBlockCycles,
+            exactInputBlockCycles: exactInputBlockCycles,
             dataLoaderE2E:      dataLoaderSpan.elapsed,
             packetReaderE2E:    packetReaderSpan.elapsed,
             payloadFeedE2E:     payloadFeedSpan.elapsed,
@@ -595,6 +989,20 @@ module mkKernelMain(KernelMainIfc);
         noMatchPkts        <= 0;
         stage2Checked      <= 0;
         stage2Passed       <= 0;
+        gapBackend         <= 0;
+        gapHbm             <= 0;
+        gapReaderOther     <= 0;
+        gapMetaWait        <= 0;
+        gapNextStart       <= 0;
+        readerDescCycles   <= 0;
+        readerStartCycles  <= 0;
+        readerFirstLineWaitCycles <= 0;
+        readerRespCycles   <= 0;
+        epochFullCycles    <= 0;
+        resultAcceptBlockCycles <= 0;
+        exactInputBlockCycles <= 0;
+        lastNextCycle      <= 0;
+        awaitingFirstFeed  <= False;
         resultSummary      <= unpack(0);
         dataLoaderSpan.reset_;
         packetReaderSpan.reset_;
@@ -605,11 +1013,29 @@ module mkKernelMain(KernelMainIfc);
         exactSpan.reset_;
         pomSpan.reset_;
         resultWriterSpan.reset_;
-        payTotalLen        <= 0;
         payOff             <= 0;
         metaReady          <= False;
-        pktHitSent         <= False;
-        pomPending         <= tagged Invalid;
+        curEpoch           <= 0;
+        curPktIdx          <= 0;
+        for (Integer i = 0; i < valueOf(NEpoch); i = i + 1) begin
+            epochInUse[i]    <= False;
+            epochPktIdx[i]    <= 0;
+            payTotalLen[i]    <= 0;
+            feedDone[i]       <= False;
+            priorityFinishSent[i] <= False;
+            priorityDone[i]       <= False;
+            priorityResultHit[i]  <= False;
+            priorityResultRule[i] <= 0;
+            inFlightNgram[i]  <= 0;
+            inFlightBitmap[i] <= 0;
+            inFlightScan[i]   <= 0;
+            inFlightGram[i]   <= 0;
+            inFlightRoute[i]  <= 0;
+            inFlightExact[i]  <= 0;
+            inFlightPom[i]    <= 0;
+            hasPrev[i]        <= False;
+            tailReady[i]      <= False;
+        end
         resultWriter.configure(resultBase, pktCount);
         timerTotal.markStart;
         timerDb.markStart;
