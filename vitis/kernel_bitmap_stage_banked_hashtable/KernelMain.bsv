@@ -62,7 +62,7 @@ module mkKernelMain(KernelMainIfc);
     GramMatcherIfc        gram         <- mkGramMatcher;
     NgramExtracterIfc     ngram        <- mkNgramExtracter;
     PacketMetaIfc         pktMeta      <- mkPacketMeta;
-    ExactMatchIfc         exactMatch   <- mkExactMatch(patternTable);
+    ExactMatchIfc         exactMatch   <- mkExactMatchParallel(patternTable);
     PortOffsetMatcherIfc  portMatch    <- mkPortOffsetMatcher;
     PriorityIfc           prioStage    <- mkPriority;
     DataLoaderIfc         dataLoader   <- mkDataLoader(bm0_s1, bm0_s2, bm1, gram, patternTable, portMatch, prioStage);
@@ -116,11 +116,16 @@ module mkKernelMain(KernelMainIfc);
     RWire#(Epoch) pomIncr    <- mkRWire;
     RWire#(Epoch) pomDecr    <- mkRWire;
 
-    // Keeps exactMatch draining independent from POM readiness.
+    // Exact hits are staged before POM so exactMatch draining does not inherit
+    // POM BRAM/FIFO readiness as an implicit condition.
     FIFOF#(Tuple2#(Epoch, PomPktMeta))   pomPendingQ <- mkSizedFIFOF(32);
     FIFOF#(PomCtx)                      pomCtxQ     <- mkSizedFIFOF(32);
     FIFOF#(RetireResult)                retireQ     <- mkSizedFIFOF(8);
 
+    // E2E span tracking includes queued inter-stage work.
+    //   gramSideQ : bitmap.lookup → pairBitmapResults (waits for bm results)
+    //   hitPairQ  : pairBitmapResults → startScan (bitmap → gram intake)
+    //   gramRouteQ: collectGramHits → routeGramResult (gram → exact intake)
     FIFOF#(Tuple4#(Epoch,
                    Vector#(NBitmapLanes, Maybe#(NgramOut)),
                    Vector#(NBitmapLanes, Bool),
@@ -141,6 +146,7 @@ module mkKernelMain(KernelMainIfc);
     Reg#(Bit#(32)) pomCycles          <- mkReg(0);
     Reg#(Bit#(32)) resultWriterCycles <- mkReg(0);
 
+    // Per-module wall-clock spans, including stalls and queueing.
     E2ESpanIfc dataLoaderSpan   <- mkE2ESpan;
     E2ESpanIfc packetReaderSpan <- mkE2ESpan;
     E2ESpanIfc payloadFeedSpan  <- mkE2ESpan;
@@ -200,6 +206,9 @@ module mkKernelMain(KernelMainIfc);
         return total;
     endfunction
 
+    // Only count bitmap hits on lanes that carried a real gram.  Padding
+    // lanes feed key=0 into the bitmap lookup and would otherwise inflate
+    // the counter without ever issuing a GHT lookup downstream.
     function Bit#(32) countHits(
         Vector#(NBitmapLanes, Bool) hits,
         Vector#(NBitmapLanes, Maybe#(NgramOut)) grams
@@ -309,6 +318,7 @@ module mkKernelMain(KernelMainIfc);
         end
 
         if (state == KProcess && !pktReader.allDone) begin
+            // E2E marks include inter-stage queues so spans stay ordered.
             Bool bitmapInner = !bm0_s1.idle || !bm0_s2.idle || !bm1.idle;
             Bool exactInner  = exactMatch.inputPending || exactMatch.notEmpty;
             Bool pomInner    = portMatch.processing    || !prioStage.idle;
@@ -432,7 +442,7 @@ module mkKernelMain(KernelMainIfc);
         end
     endrule
 
-    // bm1 uses anchor+3, so lanes 61..63 need next-batch lookahead.
+    // bm1 needs anchor+3 lookahead for lanes 61..63.
     Vector#(NEpoch, Reg#(Bool)) hasPrev <- replicateM(mkReg(False));
     Vector#(NEpoch, Reg#(Bool)) tailReady <- replicateM(mkReg(False));
     Vector#(NEpoch, Reg#(Vector#(NBitmapLanes, Maybe#(NgramOut)))) prevBatch <- replicateM(mkRegU);
@@ -534,7 +544,6 @@ module mkKernelMain(KernelMainIfc);
         tailReady[e] <= False;
     endrule
 
-    // needCuckoo = bm0_s1[g] || (bm0_s2[g] && bm1_valid && bm1[g+3])
     rule pairBitmapResults;
         let hits_s1 <- bm0_s1.result;
         let hits_s2 <- bm0_s2.result;
@@ -664,6 +673,7 @@ module mkKernelMain(KernelMainIfc);
         end
     endrule
 
+    // Keep POM backpressure out of drainExact's firing condition.
     rule sendToPom(pomPendingQ.notEmpty);
         match { .e, .m } = pomPendingQ.first; pomPendingQ.deq;
         portMatch.putMeta(m);

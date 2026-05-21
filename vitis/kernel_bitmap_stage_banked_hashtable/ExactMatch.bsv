@@ -2,6 +2,7 @@ package ExactMatch;
 
 import FIFOF::*;
 import BRAM::*;
+import Vector::*;
 import GramMatcher::*;
 import ExactPatternTable::*;
 
@@ -43,7 +44,7 @@ interface ExactMatchIfc;
     method Bool canAcceptRequest;
 endinterface
 
-module mkExactMatch#(ExactPatternTableIfc patTbl)(ExactMatchIfc);
+module mkExactMatch#(PatReadPortIfc patPort)(ExactMatchIfc);
     Integer linesPerEpoch = 256;
     Integer payloadLines = 2048;
 
@@ -51,7 +52,7 @@ module mkExactMatch#(ExactPatternTableIfc patTbl)(ExactMatchIfc);
     cfgPayload.memorySize = payloadLines;
     cfgPayload.latency    = 1;
 
-    // Eight 16 KB packet slots, selected by epoch.
+    // Eight 16KB epoch slots. Port A writes packet payload; port B verifies.
     BRAM2Port#(Bit#(11), Bit#(512)) payloadTbl <- mkBRAM2Server(cfgPayload);
 
     FIFOF#(ExactRequest)  inQ  <- mkSizedFIFOF(64);
@@ -85,7 +86,7 @@ module mkExactMatch#(ExactPatternTableIfc patTbl)(ExactMatchIfc);
                                      matchPos: 0, payLen: r.payload_len,
                                      epoch: r.epoch });
         end else begin
-            patTbl.readPattern(r.req.ruleId);
+            patPort.readPattern(r.req.ruleId);
             curReq   <= r;
             curStart <= startI;
             st       <= EXPatRsp;
@@ -93,7 +94,7 @@ module mkExactMatch#(ExactPatternTableIfc patTbl)(ExactMatchIfc);
     endrule
 
     rule doPatRsp (st == EXPatRsp);
-        let line <- patTbl.readResp;
+        let line <- patPort.readResp;
         patReg <= line;
         cmpPos <= 0;
         st     <= EXCmpReq;
@@ -155,6 +156,8 @@ module mkExactMatch#(ExactPatternTableIfc patTbl)(ExactMatchIfc);
         return ok;
     endfunction
 
+    // Single-line patterns use one BRAM read; cross-line patterns fall back to
+    // byte-at-a-time comparison.
     rule doCmpRsp (st == EXCmpRsp);
         let payLine <- payloadTbl.portB.response.get;
 
@@ -218,6 +221,46 @@ module mkExactMatch#(ExactPatternTableIfc patTbl)(ExactMatchIfc);
     method Bool notEmpty     = outQ.notEmpty;
     method Bool inputPending = inQ.notEmpty || (st != EXReady);
     method Bool canAcceptRequest = inQ.notFull;
+endmodule
+
+// Banked by ruleId[1:0]; each engine owns a pattern read port and payload copy.
+module mkExactMatchParallel#(ExactPatternTableIfc patTbl)(ExactMatchIfc);
+    ExactMatchIfc eng0 <- mkExactMatch(patTbl.rd[0]);
+    ExactMatchIfc eng1 <- mkExactMatch(patTbl.rd[1]);
+    ExactMatchIfc eng2 <- mkExactMatch(patTbl.rd[2]);
+    ExactMatchIfc eng3 <- mkExactMatch(patTbl.rd[3]);
+    Vector#(NReadPorts, ExactMatchIfc) eng =
+        cons(eng0, cons(eng1, cons(eng2, cons(eng3, nil))));
+
+    Reg#(Bit#(2)) rr <- mkReg(0);
+
+    method Action putPayloadWord(Bit#(512) word, Bool last, Bit#(3) epoch);
+        for (Integer g = 0; g < valueOf(NReadPorts); g = g + 1)
+            eng[g].putPayloadWord(word, last, epoch);
+    endmethod
+
+    method Action putRequest(VerifyReq r, Bit#(32) payload_len,
+                             Bit#(3) epoch, Bit#(6) pay_off);
+        eng[r.ruleId[1:0]].putRequest(r, payload_len, epoch, pay_off);
+    endmethod
+
+    method ActionValue#(ExMatchResult) getResult;
+        Bit#(2) sel = eng[rr].notEmpty     ? rr     :
+                      eng[rr+1].notEmpty   ? rr + 1 :
+                      eng[rr+2].notEmpty   ? rr + 2 : rr + 3;
+        let v <- eng[sel].getResult;
+        rr <= sel + 1;
+        return v;
+    endmethod
+
+    method Bool notEmpty = eng0.notEmpty || eng1.notEmpty
+                        || eng2.notEmpty || eng3.notEmpty;
+
+    method Bool inputPending = eng0.inputPending || eng1.inputPending
+                            || eng2.inputPending || eng3.inputPending;
+
+    method Bool canAcceptRequest = eng0.canAcceptRequest && eng1.canAcceptRequest
+                                && eng2.canAcceptRequest && eng3.canAcceptRequest;
 endmodule
 
 endpackage
