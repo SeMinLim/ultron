@@ -1,6 +1,8 @@
 package NgramExtracter;
 
+import FIFO::*;
 import FIFOF::*;
+import SpecialFIFOs::*;
 import Vector::*;
 
 typedef 64 NGramLanes;
@@ -11,10 +13,23 @@ typedef struct {
     Bit#(32) anchor;
 } NgramOut deriving (Bits, Eq, FShow);
 
+typedef struct {
+    Bit#(3) epoch;
+    Bool last;
+    Vector#(NBitmapLanes, Maybe#(NgramOut)) grams;
+} NgramBatch deriving (Bits, Eq, FShow);
+
+typedef struct {
+    Vector#(NGramLanes, Bit#(8)) bytes;
+    Bit#(7)  count;
+    Bool     last;
+    Bit#(3)  epoch;
+} ByteBatch deriving (Bits, Eq, FShow);
+
 interface NgramExtracterIfc;
-    method Action putBytes(Bit#(512) word, Bit#(7) startByte, Bit#(7) count, Bool last);
+    method Action putBytes(Bit#(512) word, Bit#(7) startByte, Bit#(7) count, Bool last, Bit#(3) epoch);
     method Bool   canPut;
-    method ActionValue#(Vector#(NBitmapLanes, Maybe#(NgramOut))) getGrams;
+    method ActionValue#(NgramBatch) getGrams;
     method Bool   gramsReady;
     method Bool   idle;
     method Bool   accumulating;
@@ -26,24 +41,22 @@ function Bit#(8) foldCase(Bit#(8) b) =
 (* synthesize *)
 module mkNgramExtracter(NgramExtracterIfc);
 
-    FIFOF#(Vector#(NBitmapLanes, Maybe#(NgramOut))) outQ <- mkSizedFIFOF(16);
+    // Pipeline FIFOs allow the method calls at the module boundary to overlap
+    // with the internal processBatch rule. With mkSizedFIFOF, BSC serialized
+    // processBatch against both putBytes and getGrams, recreating an II=2 path.
+    FIFO#(ByteBatch)    inQ  <- mkFIFO;
+    FIFOF#(NgramBatch)  outQ <- mkPipelineFIFOF;
 
     Reg#(Bit#(8))  carry0   <- mkReg(0);
     Reg#(Bit#(8))  carry1   <- mkReg(0);
     Reg#(Bool)     hasCarry <- mkReg(False);
     Reg#(Bit#(32)) basePos  <- mkReg(0);
 
-    Reg#(Vector#(NGramLanes, Bit#(8))) batchBuf   <- mkRegU;
-    Reg#(Bit#(7))                      batchCount <- mkReg(0);
-    Reg#(Bool)                         batchLast  <- mkReg(False);
-    Reg#(Bool)                         batchReady <- mkReg(False);
-
-    Reg#(Vector#(NGramLanes, Maybe#(NgramOut))) stageBuf   <- mkRegU;
-    Reg#(Bool)                                  stageValid <- mkReg(False);
-
-    rule processBatch(batchReady && !stageValid);
-        let ibuf = batchBuf;
-        let cnt  = batchCount;
+    // Carry gates lanes 0 and 1 on the first batch to avoid anchor underflow.
+    rule processBatch(outQ.notFull);
+        let b    = inQ.first;
+        let ibuf = b.bytes;
+        let cnt  = b.count;
         let base = basePos;
 
         Vector#(NGramLanes, Maybe#(NgramOut)) result = replicate(tagged Invalid);
@@ -68,11 +81,10 @@ module mkNgramExtracter(NgramExtracterIfc);
             end
         end
 
-        stageBuf   <= result;
-        stageValid <= True;
-        batchReady <= False;
+        outQ.enq(NgramBatch { epoch: b.epoch, last: b.last, grams: result });
+        inQ.deq;
 
-        if (batchLast) begin
+        if (b.last) begin
             carry0   <= 0;
             carry1   <= 0;
             hasCarry <= False;
@@ -90,36 +102,27 @@ module mkNgramExtracter(NgramExtracterIfc);
         end
     endrule
 
-    rule emitBatch(stageValid && outQ.notFull);
-        outQ.enq(stageBuf);
-        stageValid <= False;
-    endrule
-
     method Action putBytes(Bit#(512) word, Bit#(7) startByte,
-                           Bit#(7) count, Bool last) if (!batchReady);
+                           Bit#(7) count, Bool last, Bit#(3) epoch);
         Vector#(NGramLanes, Bit#(8)) bytes = replicate(0);
         for (Integer i = 0; i < valueOf(NGramLanes); i = i + 1) begin
             Bit#(7) pos = startByte + fromInteger(i);
             Bit#(9) sh  = zeroExtend(pos) << 3;
             bytes[fromInteger(i)] = truncate(word >> sh);
         end
-        batchBuf   <= bytes;
-        batchCount <= count;
-        batchLast  <= last;
-        batchReady <= True;
+        inQ.enq(ByteBatch { bytes: bytes, count: count, last: last, epoch: epoch });
     endmethod
 
-    method Bool canPut = !batchReady;
+    method Bool canPut = True;
 
-    method ActionValue#(Vector#(NBitmapLanes, Maybe#(NgramOut))) getGrams
-            if (outQ.notEmpty);
+    method ActionValue#(NgramBatch) getGrams if (outQ.notEmpty);
         let v = outQ.first; outQ.deq;
         return v;
     endmethod
 
     method Bool gramsReady   = outQ.notEmpty;
-    method Bool idle         = !batchReady && !stageValid && !outQ.notEmpty;
-    method Bool accumulating = batchReady || stageValid;
+    method Bool idle         = !outQ.notEmpty;
+    method Bool accumulating = False;
 endmodule
 
 endpackage
