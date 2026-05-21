@@ -122,10 +122,7 @@ module mkKernelMain(KernelMainIfc);
     FIFOF#(PomCtx)                      pomCtxQ     <- mkSizedFIFOF(32);
     FIFOF#(RetireResult)                retireQ     <- mkSizedFIFOF(8);
 
-    // E2E span tracking includes queued inter-stage work.
-    //   gramSideQ : bitmap.lookup → pairBitmapResults (waits for bm results)
-    //   hitPairQ  : pairBitmapResults → startScan (bitmap → gram intake)
-    //   gramRouteQ: collectGramHits → routeGramResult (gram → exact intake)
+    // Include inter-stage queues in E2E spans so queueing stalls are counted.
     FIFOF#(Tuple4#(Epoch,
                    Vector#(NBitmapLanes, Maybe#(NgramOut)),
                    Vector#(NBitmapLanes, Bool),
@@ -146,7 +143,6 @@ module mkKernelMain(KernelMainIfc);
     Reg#(Bit#(32)) pomCycles          <- mkReg(0);
     Reg#(Bit#(32)) resultWriterCycles <- mkReg(0);
 
-    // Per-module wall-clock spans, including stalls and queueing.
     E2ESpanIfc dataLoaderSpan   <- mkE2ESpan;
     E2ESpanIfc packetReaderSpan <- mkE2ESpan;
     E2ESpanIfc payloadFeedSpan  <- mkE2ESpan;
@@ -318,7 +314,6 @@ module mkKernelMain(KernelMainIfc);
         end
 
         if (state == KProcess && !pktReader.allDone) begin
-            // E2E marks include inter-stage queues so spans stay ordered.
             Bool bitmapInner = !bm0_s1.idle || !bm0_s2.idle || !bm1.idle;
             Bool exactInner  = exactMatch.inputPending || exactMatch.notEmpty;
             Bool pomInner    = portMatch.processing    || !prioStage.idle;
