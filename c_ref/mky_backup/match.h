@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include "bitmap.h"
+#include "bloomfilter.h"
 #include "singleton.h"
 #include "hashtable.h"
 
@@ -12,6 +13,7 @@
 
 typedef struct {
     HashTable       *banks[HT_BANKS];
+    BloomFilter     *bloom;
     SingletonResult *sr;
 } MatchCtx;
 
@@ -28,6 +30,7 @@ typedef struct {
     int       n_stages;
     StageStat stage[MATCH_MAX_STAGES];
     int       ht_total;
+    int       bloom_reject;
     int       ht_hit;
     int       cand_total;
     int       cand_hit;

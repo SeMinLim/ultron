@@ -22,8 +22,6 @@ static int bank_of(uint64_t key)
 
 void match_init(MatchCtx *ctx, SingletonResult *sr)
 {
-    // Step 1: compute min_stage per gram_idx across all rules sharing that gram.
-    // BITMAP_BITS = 2^18, one byte per possible gram_idx.
     uint8_t *min_stage = malloc(BITMAP_BITS);
     memset(min_stage, 0xff, BITMAP_BITS);
     for (int i = 0; i < sr->count; i++) {
@@ -33,11 +31,8 @@ void match_init(MatchCtx *ctx, SingletonResult *sr)
             min_stage[g] = (uint8_t)(s > 254 ? 254 : s);
     }
 
-    // Step 2: assign ht_key per rule.
-    //   pure stage2 group (min_stage >= 2): key = (gidx0 << 18) | gidx1
-    //   mixed/stage1 group (min_stage == 1): key = (gidx0 << 18) | 0
-    // This way rules in mixed groups are all reachable via the anchor-only path,
-    // while pure stage2 groups are split by their next gram for fewer candidates.
+    // Mixed groups must stay reachable via anchor-only lookups; pure stage2
+    // groups can include the next gram to reduce candidate fanout.
     for (int i = 0; i < sr->count; i++) {
         uint32_t gidx0 = sr->assigns[i].gram_idx;
         uint32_t gidx1 = 0;
@@ -47,12 +42,11 @@ void match_init(MatchCtx *ctx, SingletonResult *sr)
     }
     free(min_stage);
 
-    // Step 3: sort assigns by ht_key so the chain walk can stop on key change.
+    // match_scan walks contiguous equal-key assignments.
     qsort(sr->assigns, sr->count, sizeof(GramAssign), cmp_by_ht_key);
 
     ctx->sr = sr;
 
-    // Step 4: count unique keys per bank for capacity estimation.
     int per_bank[HT_BANKS] = {0};
     for (int i = 0; i < sr->count; i++) {
         if (i > 0 && sr->assigns[i].ht_key == sr->assigns[i - 1].ht_key)
@@ -60,7 +54,12 @@ void match_init(MatchCtx *ctx, SingletonResult *sr)
         per_bank[bank_of(sr->assigns[i].ht_key)]++;
     }
 
-    // Step 5: build per-bank cuckoo hashtables. key=ht_key, val=first assign idx.
+    ctx->bloom = bloom_create_fixed(16 * 1024, 3);
+    for (int i = 0; i < sr->count; i++) {
+        if (i == 0 || sr->assigns[i].ht_key != sr->assigns[i - 1].ht_key)
+            bloom_add(ctx->bloom, sr->assigns[i].ht_key);
+    }
+
     for (int b = 0; b < HT_BANKS; b++) {
         int cap = per_bank[b] * 2;
         if (cap < 16) cap = 16;
@@ -84,6 +83,8 @@ void match_init(MatchCtx *ctx, SingletonResult *sr)
 
 void match_destroy(MatchCtx *ctx)
 {
+    bloom_destroy(ctx->bloom);
+    ctx->bloom = NULL;
     for (int b = 0; b < HT_BANKS; b++) {
         ht_destroy(ctx->banks[b]);
         ctx->banks[b] = NULL;
@@ -143,6 +144,10 @@ MatchCount match_scan(const MatchCtx *ctx,
         int      base;
 
         res.ht_total++;
+        if (!bloom_test(ctx->bloom, key)) {
+            res.bloom_reject++;
+            continue;
+        }
         res.bank_lookups[bank]++;
         if (!ht_lookup(ctx->banks[bank], key, &base))
             continue;
