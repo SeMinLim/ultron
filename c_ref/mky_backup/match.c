@@ -1,7 +1,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "match.h"
-#include "xor_filter.h"
+#include "hash.h"
 
 static int cmp_by_ht_key(const void *a, const void *b)
 {

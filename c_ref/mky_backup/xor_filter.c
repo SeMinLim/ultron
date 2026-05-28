@@ -3,19 +3,10 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include "hash.h"
 #include "xor_filter.h"
 
 #define XOR_MAX_TRIES 100
-
-uint64_t xor_murmur64(uint64_t h)
-{
-    h ^= h >> 33U;
-    h *= UINT64_C(0xff51afd7ed558ccd);
-    h ^= h >> 33U;
-    h *= UINT64_C(0xc4ceb9fe1a85ec53);
-    h ^= h >> 33U;
-    return h;
-}
 
 static inline uint64_t xor_mix(uint64_t key, uint64_t seed)
 {

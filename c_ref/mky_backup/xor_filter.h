@@ -4,17 +4,15 @@
 #ifndef XOR_FILTER_H
 #define XOR_FILTER_H
 
-#include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include "hash.h"
 
 typedef struct {
     uint64_t seed;
     uint32_t block_len;
     uint8_t *fp;
 } XorFilter8;
-
-uint64_t xor_murmur64(uint64_t h);
 
 bool xor8_build(XorFilter8 *f, uint64_t *keys, uint32_t n);
 bool xor8_contain(const XorFilter8 *f, uint64_t key);
