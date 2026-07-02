@@ -73,20 +73,7 @@ module mkDataLoaderCore#(
     Reg#(Bit#(32)) bloomWord <- mkReg(0);
     Reg#(Bit#(3))  bloomSub  <- mkReg(0);
 
-    // GHT entry bit layout (128 bits per entry, 4 entries per 512-bit word):
-    //   [31: 0]   gram32 key (18-bit key zero-padded to 32)
-    //   [47:32]   ruleId
-    //   [55:48]   pre (signed)
-    //   [63:56]   post (signed)
-    //   [71:64]   len
-    //   [72]      stage2 flag
-    //   [90:73]   nextGramKey (18 bits, valid when stage2=1)
-    //   [114:91]  anchorGram (folded full 3-byte anchor)
-    //   [119:115] padding
-    //   [120]     is_first (cuckoo insert gate; matches gen.c sort grouping)
-    //   [121]     is_last  (chain follow terminator)
-    //   [127:122] padding
-    function RuleInfo unpackRuleInfo(Bit#(128) raw);
+   function RuleInfo unpackRuleInfo(Bit#(128) raw);
         return RuleInfo {
             ruleId:      raw[47:32],
             pre:         unpack(raw[55:48]),
@@ -277,7 +264,6 @@ module mkDataLoaderCore#(
     endrule
 
     // Bloom section: 512 lines x 64B = 32KB.  Each 512-bit line carries 8
-    // consecutive 64-bit bloom words -> BRAM addrs [8*line .. 8*line+7].
     rule doBloomFetch(state == DLBloomFetch && wordQ.notEmpty);
         let w = wordQ.first; wordQ.deq;
         curWord  <= w;
@@ -324,7 +310,6 @@ module mkDataLoaderCore#(
 
 endmodule
 
-// AXI4-read adapter: wraps DataLoaderCore, converts relative offsets to absolute (+ dbBase).
 interface DataLoaderIfc;
     method Action startLoad(Bit#(64) dbBase, Bit#(32) dbBytes);
     method Bool   loadDone;

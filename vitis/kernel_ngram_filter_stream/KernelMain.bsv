@@ -22,8 +22,6 @@ import ResultStreamWriter::*;
 import PacketStreamReader::*;
 
 interface KernelMainIfc;
-    // Free-running (ap_ctrl_none): no start/done handshake. The kernel boots,
-    // loads the rule DB off s_axis_db, then processes packets forever.
     interface AxiStreamSlavePinsIfc#(512) s_axis_db;
     interface AxiStreamSlaveUserPinsIfc#(512, 128) s_axis_pkt;
     interface AxiStreamMasterPinsIfc#(32) m_axis_result;
@@ -44,7 +42,7 @@ typedef struct {
     Bit#(32) pktIdx;
     Bool     hit;
     Bit#(16) ruleId;
-    Bit#(15) latency;   // E2E: admit->retire cycles (15-bit saturated)
+    Bit#(15) latency;
 } RetireResult deriving (Bits, Eq, FShow);
 
 module mkKernelMain(KernelMainIfc);
@@ -59,16 +57,10 @@ module mkKernelMain(KernelMainIfc);
     ExactMatchIfc         exactMatch   <- mkExactMatchParallel(patternTable);
     PortOffsetMatcherIfc  portMatch    <- mkPortOffsetMatcher;
     PriorityIfc           prioStage    <- mkPriority;
-    // DB Master->Slave (Req 1): rules are PUSHED in over s_axis_db; DataLoaderCore
-    // (via DbStreamLoader) loads the matcher tables exactly as the AXI4 path did.
     AxiStreamSlaveIfc#(512) dbStream <- mkAxiStreamSlave_512;
     DbStreamLoaderIfc     dataLoader   <- mkDbStreamLoader(bm0_s1, bm0_s2, bm1, gram, patternTable, portMatch, prioStage, dbStream);
-    // Packet input -> AXI Stream (Req 2/3): payload beats on s_axis_pkt with the
-    // 5-tuple in tuser on the tlast beat (final-beat metadata model).
     AxiStreamSlaveUserIfc#(512, 128) pktStream <- mkAxiStreamSlaveUser_512_128;
     PacketStreamReaderIfc pktReader <- mkPacketStreamReader(pktStream);
-    // Result -> AXI Stream (Req 3/4): ordered {match,ruleId} emitted on
-    // m_axis_result, one beat per packet with tlast=1 (tlast && tvalid sync).
     AxiStreamMasterIfc#(32) resStream <- mkAxiStreamMaster_32;
     ResultStreamWriterIfc resultWriter <- mkResultStreamWriter(resStream);
 
@@ -86,17 +78,13 @@ module mkKernelMain(KernelMainIfc);
 
     Vector#(NEpoch, Reg#(Bool))     epochInUse    <- replicateM(mkReg(False));
     Vector#(NEpoch, Reg#(Bit#(32))) epochPktIdx    <- replicateM(mkReg(0));
-    // E2E telemetry: cycle each epoch's packet was admitted (latchMeta).
     Vector#(NEpoch, Reg#(Bit#(32))) admitCyc       <- replicateM(mkReg(0));
     Reg#(Bit#(32)) wdLast <- mkReg(0);  // DEBUG watchdog last-dump cycle
-    // Total process-cycle measurement (no per-packet overlap): span from the
-    // first packet admitted to the last packet retired, emitted as a footer beat.
     Reg#(Bool)     procStarted  <- mkReg(False);
     Reg#(Bit#(32)) firstAdmitCyc <- mkReg(0);
     Reg#(Bit#(32)) lastRetireCyc <- mkReg(0);
     Reg#(Bit#(32)) idleCnt       <- mkReg(0);
     Reg#(Bool)     footerDone    <- mkReg(False);
-    // admit->now latency for epoch e, saturated to 15 bits.
     function Bit#(15) e2eLatency(Epoch e);
         Bit#(32) d = timerTotal.value - admitCyc[e];
         return (d[31:15] == 0) ? truncate(d) : 15'h7FFF;
@@ -120,17 +108,12 @@ module mkKernelMain(KernelMainIfc);
     RWire#(Epoch) bitmapDecr <- mkRWire;
     RWire#(Epoch) scanIncr   <- mkRWire;
     RWire#(Epoch) scanDecr   <- mkRWire;
-    // Gram in-flight is count-based: a 4-wide batch increments by lane count,
-    // bloom rejects decrement by lane count, chain completions decrement by 1.
+    
     RWire#(Tuple2#(Epoch, Bit#(3))) gramIncBatch <- mkRWire;
     RWire#(Tuple2#(Epoch, Bit#(3))) gramDecRej   <- mkRWire;
     RWire#(Epoch)                   gramDecChain <- mkRWire;
     RWire#(Epoch) pomIncr    <- mkRWire;
     RWire#(Epoch) pomDecr    <- mkRWire;
-    // Route/Exact in-flight via RWire+combined-update (lossless, conflict-free):
-    // direct two-rule Reg writes made collectGramHits/routeGramResult/drainExact
-    // mutually exclude per cycle -> routeGramResult starved under big-packet gram
-    // burst -> gramRouteQ backs up -> exact starves -> deadlock. RWire fixes it.
     RWire#(Epoch) routeIncr  <- mkRWire;
     RWire#(Epoch) routeDecr  <- mkRWire;
     RWire#(Epoch) exactIncr  <- mkRWire;
@@ -425,7 +408,8 @@ module mkKernelMain(KernelMainIfc);
         end
     endrule
 
-    // No resultWriter read -> no scheduling cycle.
+    // feedBeat: stream the armed packet's beats into ngram/exact; capture the
+    // 5-tuple + final length on the last beat. No resultWriter read -> no cycle.
     rule feedBeat(state == KProcess && metaReady && pktReader.beatAvailable);
         let bt = pktReader.beat;
         pktReader.advanceBeat;
@@ -687,7 +671,13 @@ module mkKernelMain(KernelMainIfc);
     rule drainExact(state == KProcess && exactMatch.notEmpty);
         let r <- exactMatch.getResult;
         exactDecr.wset(r.epoch);
-        if (r.hit) begin
+        // Deferred end-of-payload check: the true packet length is known only at the
+        // tlast beat (conformant final-beat-metadata model), and by the time a result
+        // drains here the packet has been fully fed, so payTotalLen[epoch] is final.
+        // A pattern whose end extends past the real payload (would have read stale
+        // bytes from the reused epoch buffer) is rejected here instead of up-stream.
+        Bool endOk = (r.endOff <= payTotalLen[r.epoch]);
+        if (r.hit && endOk) begin
             exactHits <= exactHits + 1;
             pomChecks  <= pomChecks + 1;
             pomIncr.wset(r.epoch);
@@ -702,7 +692,7 @@ module mkKernelMain(KernelMainIfc);
                 isUdp:      pktMeta.isUdp(r.epoch),
                 isIcmp:     pktMeta.isIcmp(r.epoch),
                 matchPos:   r.matchPos,
-                payloadLen: r.payLen
+                payloadLen: payTotalLen[r.epoch]
             }));
         end else begin
             exactMisses <= exactMisses + 1;
@@ -962,6 +952,8 @@ module mkKernelMain(KernelMainIfc);
     // Free-running: no process-done / write / done phases. Once DB is loaded the
     // kernel stays in KProcess and matches packets forever.
 
+    // Boot once out of reset: kick the DB section loader (it self-terminates at
+    // DLDone after the bloom section) and reset the result reorder buffer.
     rule selfBoot(!booted && state == KIdle);
         booted <= True;
         resultWriter.configure;

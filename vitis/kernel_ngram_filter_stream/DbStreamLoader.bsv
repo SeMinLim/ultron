@@ -37,13 +37,12 @@ module mkDbStreamLoader#(
     DataLoaderCoreIfc core <- mkDataLoaderCore(bm0_s1, bm0_s2, bm1,
                                                gram, patTable, portMatcher, prioStage);
 
+    // Push each DB stream beat into the section-loading FSM.
     rule feedDbWord(core.canAcceptWord);
         let beat <- dbStream.get;
         core.putWord(tpl_1(beat));
     endrule
 
-    // Pull model emits relative section read requests; in push mode no fetch
-    // happens, so drain them to keep the FSM from blocking on a full request FIFO.
     rule drainReadReq;
         let r <- core.readReqRel;
     endrule

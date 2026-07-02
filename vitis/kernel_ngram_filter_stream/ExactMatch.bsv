@@ -11,6 +11,7 @@ typedef struct {
     Bit#(16) ruleId;
     Bit#(32) matchPos;
     Bit#(32) payLen;
+    Bit#(32) endOff;
     Bit#(3)  epoch;
 } ExMatchResult deriving (Bits, Eq, FShow);
 
@@ -52,7 +53,6 @@ module mkExactMatch#(PatReadPortIfc patPort)(ExactMatchIfc);
     cfgPayload.memorySize = payloadLines;
     cfgPayload.latency    = 1;
 
-    // Eight 16KB epoch slots. Port A writes packet payload; port B verifies.
     BRAM2Port#(Bit#(11), Bit#(512)) payloadTbl <- mkBRAM2Server(cfgPayload);
 
     FIFOF#(ExactRequest)  inQ  <- mkSizedFIFOF(64);
@@ -62,6 +62,7 @@ module mkExactMatch#(PatReadPortIfc patPort)(ExactMatchIfc);
     Reg#(Bit#(8))      payWrLine  <- mkReg(0);
     Reg#(ExactRequest) curReq     <- mkRegU;
     Reg#(Int#(32))     curStart   <- mkReg(0);
+    Reg#(Int#(32))     curEnd     <- mkReg(0);
     Reg#(Bit#(32))     cmpPos     <- mkReg(0);
     Reg#(Bit#(6))      cmpByteOff <- mkReg(0);
     Reg#(Bit#(512))    patReg     <- mkRegU;
@@ -72,23 +73,23 @@ module mkExactMatch#(PatReadPortIfc patPort)(ExactMatchIfc);
         Int#(32) startI  = unpack(r.req.anchor) + signExtend(r.req.pre);
         Int#(32) endI    = unpack(r.req.anchor) + 3 + signExtend(r.req.post);
         Int#(32) patLenI = unpack(zeroExtend(r.req.len));
-        Int#(32) payLenI = unpack(r.payload_len);
         Bool anchorMismatch = (r.req.anchorGram != r.req.pktAnchorGram);
         Bool nextGramMismatch = r.req.stage2 &&
                                 (r.req.nextGramKey != r.req.pktNextGramKey);
 
         Bool bad = (r.req.len == 0 || startI < 0 || endI < 0 ||
-                    startI > endI  || endI > payLenI ||
+                    startI > endI  ||
                     (endI - startI) != patLenI ||
                     anchorMismatch || nextGramMismatch);
         if (bad) begin
             outQ.enq(ExMatchResult { hit: False, ruleId: 0,
                                      matchPos: 0, payLen: r.payload_len,
-                                     epoch: r.epoch });
+                                     endOff: pack(endI), epoch: r.epoch });
         end else begin
             patPort.readPattern(r.req.ruleId);
             curReq   <= r;
             curStart <= startI;
+            curEnd   <= endI;
             st       <= EXPatRsp;
         end
     endrule
@@ -123,7 +124,7 @@ module mkExactMatch#(PatReadPortIfc patPort)(ExactMatchIfc);
             if (cmpPos + 1 >= zeroExtend(curReq.req.len)) begin
                 outQ.enq(ExMatchResult { hit: True,  ruleId: curReq.req.ruleId,
                                          matchPos: pack(curStart), payLen: curReq.payload_len,
-                                         epoch: curReq.epoch });
+                                         endOff: pack(curEnd), epoch: curReq.epoch });
                 st <= EXReady;
             end else begin
                 cmpPos <= cmpPos + 1;
@@ -169,7 +170,7 @@ module mkExactMatch#(PatReadPortIfc patPort)(ExactMatchIfc);
                                      ruleId: hit ? curReq.req.ruleId : 0,
                                      matchPos: hit ? pack(curStart) : 0,
                                      payLen: curReq.payload_len,
-                                     epoch: curReq.epoch });
+                                     endOff: pack(curEnd), epoch: curReq.epoch });
             st <= EXReady;
         end else begin
             Bit#(9) paySh = zeroExtend(cmpByteOff) << 3;
@@ -181,12 +182,12 @@ module mkExactMatch#(PatReadPortIfc patPort)(ExactMatchIfc);
             if (patB != foldCase(payB)) begin
                 outQ.enq(ExMatchResult { hit: False, ruleId: 0,
                                          matchPos: 0, payLen: curReq.payload_len,
-                                         epoch: curReq.epoch });
+                                         endOff: pack(curEnd), epoch: curReq.epoch });
                 st <= EXReady;
             end else if (cmpPos + 1 >= zeroExtend(curReq.req.len)) begin
                 outQ.enq(ExMatchResult { hit: True,  ruleId: curReq.req.ruleId,
                                          matchPos: pack(curStart), payLen: curReq.payload_len,
-                                         epoch: curReq.epoch });
+                                         endOff: pack(curEnd), epoch: curReq.epoch });
                 st <= EXReady;
             end else begin
                 cmpPos <= cmpPos + 1;

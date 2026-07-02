@@ -7,13 +7,9 @@ import FIFO::*;
 import FIFOF::*;
 import Vector::*;
 
-// Banked gram matcher for bitmap candidates.
-// Cuckoo values point into AssignsTable chains; isLast terminates each chain.
 typedef 64 NHtBanks;
 
 // 30b subkey = 12b of mix18(gidx0) + 18b gidx1.  Matches c_ref/mky_backup
-// match.c ht_key = (gidx0 << 18) | gidx1, with bank still selected from gidx0
-// alone so cuckoo bucket distribution is unchanged.
 typedef 30 SubKeyBits;
 
 typedef 16 ChainIdxBits;
@@ -67,12 +63,9 @@ typedef struct {
     Bit#(6)   pay_off;
     Bool      viable2;
     Bool      lastInChain;
-    Bool      bloomReject;   // True only for results killed by the bloom pre-filter
+    Bool      bloomReject;   
 } GramResult deriving (Bits);
 
-// --- Bloom pre-filter: 131072-bit (16KB) / k=3, mirrors c_ref/mky_backup.
-// Tested before the cuckoo lookup; a reject is a guaranteed miss so we emit a
-// lastInChain result directly (no false negatives by construction).
 typedef 12 BloomWordBits;   // 4096 × 64b words = 262144 bits (32KB)
 typedef 4  NBloomLanes;     // 4-wide bloom front-end (12 BRAM copies = 4×k3)
 
@@ -87,8 +80,6 @@ typedef struct {
     Bool     viable2;
 } BloomCtx deriving (Bits);
 
-// Bloom hash carriers.  Multiply-shift (Fibonacci) double hash → one 64-bit
-// multiply deep, so a single pipeline stage; matches the DB generator.
 typedef struct { Bit#(64) key; BloomCtx ctx; } BloomReq deriving (Bits);
 typedef struct { Bit#(6) b0; Bit#(6) b1; Bit#(6) b2; BloomCtx ctx; } BloomProbe deriving (Bits);
 
@@ -97,23 +88,18 @@ typedef Vector#(NBloomLanes, Maybe#(BloomProbe)) BloomProbe4;
 typedef struct { Bit#(3) epoch; Bit#(3) count; } BloomRejectInfo deriving (Bits);
 
 interface GramMatcherIfc;
-    // isFirst gates cuckoo insertion; isLast marks AssignsTable chain end.
     method Action loadEntry(Bit#(32) gram, Bit#(ChainIdxBits) idx,
                             RuleInfo info, Bool isFirst, Bool isLast);
     method ActionValue#(Bool) insertAck;
-    // Up to NBloomLanes keys/cycle, all same epoch.  ready gates the caller.
     method Bool lookupReady;
     method Action lookupReq4(BloomReq4 reqs);
     method ActionValue#(GramResult) lookupResp;
-    // Reject retirements (epoch + lane count), bypassing lookupResp.
     method ActionValue#(BloomRejectInfo) getReject;
     method Action writeBloom(Bit#(12) addr, Bit#(64) data);
     method Bool bloomBusy;
     method Bool idle;
 endinterface
 
-// Build a single-lane BloomReq from the scan-side fields (key = composite HT
-// key (gram18<<18)|nextGramKey, matching the DB generator's bloom_probe).
 function BloomReq mkBloomReq(Bit#(32) gram, Bit#(24) pktAnchorGram,
                              Bit#(18) pktNextGramKey, Bit#(32) anchor,
                              Bit#(32) payLen, Bit#(3) epoch, Bit#(6) pay_off,
@@ -128,9 +114,6 @@ endfunction
 
 (* synthesize *)
 module mkGramMatcher(GramMatcherIfc);
-    // logSz=10 → 1024 slots/table × 2 tables × 64 banks = 131,072 cuckoo slots.
-    // With SubKeyBits=30 each slot stores ~47 bits; expect ~2 RAMB36 per RegFile
-    // (Vivado packs 47b across two BRAMs above the 36b native width).
     Vector#(NHtBanks, CuckooHashIfc#(SubKeyBits, ChainIdxBits, 10)) banks
         <- replicateM(mkCuckooHash);
 
@@ -140,10 +123,6 @@ module mkGramMatcher(GramMatcherIfc);
     BRAM2Port#(Bit#(ChainIdxBits), Bit#(96)) assignsTbl <- mkBRAM2Server(cfgAssigns);
 
     // 4 lanes × 3 probe copies = 12 bloom BRAMs.  Each 4096×64b = 262144 bits
-    // (32KB) = one URAM-sized block; all 4 lanes read their k=3 probes in one
-    // cycle.  portA = probe read (response FIFO keeps reads in order under
-    // backpressure), portB = loader write (broadcast to all 4 lanes so every
-    // lane holds an identical copy of the filter).
     BRAM_Configure cfgBloom = defaultValue;
     cfgBloom.memorySize = 4096;
     cfgBloom.latency    = 1;
@@ -154,18 +133,14 @@ module mkGramMatcher(GramMatcherIfc);
     FIFOF#(GramCtx)    ctxQ      <- mkSizedFIFOF(64);
     FIFOF#(GramResult) outQ      <- mkSizedFIFOF(64);
 
-    // Bloom 4-wide lockstep pipeline.
     FIFOF#(BloomReq4)   bloomReqQ  <- mkSizedFIFOF(4);  // 4 raw keys, before multiply
     FIFOF#(BloomProbe4) bloomPrQ   <- mkSizedFIFOF(4);  // 4 probe sets, awaiting BRAM
-    // Passing lanes (rare) funnel here, then drain 1/cycle to the cuckoo backend.
     FIFOF#(Vector#(NBloomLanes, Maybe#(BloomCtx))) passVecQ <- mkSizedFIFOF(4);
     Reg#(Bit#(3)) passUnpackIdx <- mkReg(0);
     Reg#(Bool)    passUnpacking <- mkReg(False);
     Reg#(Vector#(NBloomLanes, Maybe#(BloomCtx))) passCur <- mkRegU;
-    // Reject reports (epoch + lane count) delivered via FIFO (lossless).
     FIFOF#(BloomRejectInfo) rejectQ <- mkSizedFIFOF(8);
 
-    // pendInsertQ preserves load-side ack ordering across banked and non-first entries.
     FIFOF#(Maybe#(Bit#(6))) pendInsertQ <- mkSizedFIFOF(8);
     FIFOF#(Bool)            ackQ        <- mkSizedFIFOF(8);
 
@@ -184,13 +159,9 @@ module mkGramMatcher(GramMatcherIfc);
         return { mix18(g0[17:0])[17:6], g1 };
     endfunction
 
-    // Multiply-shift (Fibonacci) double hash — same constants as the DB
-    // generator's bloom_probe().  Top 32 bits of each 64-bit product are the
-    // well-mixed half; Kirsch-Mitzenmacher derives the k=3 positions.
     Bit#(64) bloomC1 = 64'h9E3779B97F4A7C15;
     Bit#(64) bloomC2 = 64'hC2B2AE3D27D4EB4F;
 
-    // Stage A: hash all valid lanes, issue k=3 BRAM reads per lane.
     rule bloomHash4 (bloomReqQ.notEmpty && bloomPrQ.notFull);
         let rs = bloomReqQ.first; bloomReqQ.deq;
         Vector#(NBloomLanes, Maybe#(BloomProbe)) outv = replicate(tagged Invalid);
@@ -200,7 +171,6 @@ module mkGramMatcher(GramMatcherIfc);
                 Bit#(64) b = r.key * bloomC2;
                 Bit#(32) h1 = a[63:32];
                 Bit#(32) h2 = b[63:32] | 32'h1;
-                // n_bits = 262144 = 2^18 → low 18 bits.
                 Bit#(18) p0 = truncate(h1);
                 Bit#(18) p1 = truncate(h1 + h2);
                 Bit#(18) p2 = truncate(h1 + h2 + h2);
@@ -217,9 +187,6 @@ module mkGramMatcher(GramMatcherIfc);
         bloomPrQ.enq(outv);
     endrule
 
-    // Stage B: read all lanes' probes, classify pass/reject in one cycle.
-    // Passes → passVecQ (drained 1/cycle by the cuckoo backend); rejects are
-    // counted and reported (epoch + count) without touching the 1-wide path.
     rule bloomResp4 (bloomPrQ.notEmpty);
         let pv = bloomPrQ.first; bloomPrQ.deq;
         Vector#(NBloomLanes, Maybe#(BloomCtx)) passes = replicate(tagged Invalid);
@@ -245,7 +212,6 @@ module mkGramMatcher(GramMatcherIfc);
         if (rejCount != 0)  rejectQ.enq(BloomRejectInfo { epoch: rejEpoch, count: rejCount });
     endrule
 
-    // Drain one pass-vector across cycles into the 1-wide cuckoo backend.
     rule passLoad (!passUnpacking && passVecQ.notEmpty);
         passCur       <= passVecQ.first; passVecQ.deq;
         passUnpackIdx <= 0;
@@ -373,7 +339,6 @@ module mkGramMatcher(GramMatcherIfc);
         let r = rejectQ.first; rejectQ.deq; return r;
     endmethod
 
-    // Broadcast loader write to all 4 lanes × 3 copies (identical filters).
     method Action writeBloom(Bit#(12) addr, Bit#(64) data);
         for (Integer ln = 0; ln < valueOf(NBloomLanes); ln = ln + 1)
             for (Integer i = 0; i < 3; i = i + 1)
@@ -381,8 +346,6 @@ module mkGramMatcher(GramMatcherIfc);
                     write: True, responseOnWrite: False, address: addr, datain: data });
     endmethod
 
-    // Bloom sub-pipeline has work in flight (keys awaiting multiply/probe, or
-    // passes awaiting cuckoo dispatch).  Counted as its own stage in KernelMain.
     method Bool bloomBusy = bloomReqQ.notEmpty || bloomPrQ.notEmpty
                          || passVecQ.notEmpty || passUnpacking || rejectQ.notEmpty;
 
