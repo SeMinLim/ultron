@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <malloc.h>
+#include <limits.h>
 #include "rule_loader.h"
 #include "ngram_extract.h"
 #include "singleton.h"
@@ -37,18 +38,39 @@ static size_t allocation_usable_bytes(void *ptr)
     return ptr ? malloc_usable_size(ptr) : 0;
 }
 
-static void print_hash_table_usage(const HashTable *ht)
+static void print_hash_table_usage(const MatchCtx *ctx)
 {
-    int total_slots = ht_total_slots(ht);
-    double load = total_slots ? (double)ht->count / (double)total_slots : 0.0;
-
-    printf("hash inserted      : %d entries\n", ht->count);
-    printf("hash capacity      : %d slots/table, %d total slots\n",
-           ht->capacity, total_slots);
+    int total_entries = 0, total_slots = 0;
+    size_t total_occ = 0, total_req = 0, total_run = 0;
+    int min_e = INT_MAX, max_e = 0, used_banks = 0;
+    int min_s = INT_MAX, max_s = 0;
+    for (int b = 0; b < HT_BANKS; b++) {
+        const HashTable *ht = ctx->banks[b];
+        int slots = ht_total_slots(ht);
+        total_entries += ht->count;
+        total_slots   += slots;
+        total_occ     += ht_occupied_entry_bytes(ht);
+        total_req     += ht_memory_usage_bytes(ht);
+        total_run     += ht_runtime_memory_usage_bytes(ht);
+        if (ht->count > 0) used_banks++;
+        if (ht->count < min_e) min_e = ht->count;
+        if (ht->count > max_e) max_e = ht->count;
+        if (slots < min_s) min_s = slots;
+        if (slots > max_s) max_s = slots;
+    }
+    double load = total_slots ? (double)total_entries / (double)total_slots : 0.0;
+    double avg_e = (double)total_entries / HT_BANKS;
+    printf("hash banks         : %d (%d non-empty)\n", HT_BANKS, used_banks);
+    printf("hash entries/bank  : min=%d  max=%d  avg=%.1f\n",
+           min_e == INT_MAX ? 0 : min_e, max_e, avg_e);
+    printf("hash slots/bank    : min=%d  max=%d\n",
+           min_s == INT_MAX ? 0 : min_s, max_s);
+    printf("hash inserted      : %d entries\n", total_entries);
+    printf("hash capacity      : %d total slots\n", total_slots);
     printf("hash load factor   : %.2f%%\n", load * 100.0);
-    print_memory_usage("hash occupied", ht_occupied_entry_bytes(ht));
-    print_memory_usage("hash requested", ht_memory_usage_bytes(ht));
-    print_memory_usage("hash runtime usable", ht_runtime_memory_usage_bytes(ht));
+    print_memory_usage("hash occupied", total_occ);
+    print_memory_usage("hash requested", total_req);
+    print_memory_usage("hash runtime usable", total_run);
 }
 
 static MatchCount collect_candidates(const MatchCtx *mctx,
@@ -176,14 +198,26 @@ int main(int argc, char *argv[])
     for (int i=0; i < max_stage; i ++)
         bitmap_clear(bm_arr + i);
 
+    uint8_t *min_stage_at_gram = malloc(BITMAP_BITS);
+    memset(min_stage_at_gram, 0xff, BITMAP_BITS);
+    for (int i = 0; i < sr->count; i++) {
+        uint32_t gidx = bitmap_idx(sr->assigns[i].gram);
+        int s = sr->assigns[i].stage;
+        if (s < min_stage_at_gram[gidx])
+            min_stage_at_gram[gidx] = (uint8_t)(s > 255 ? 255 : s);
+    }
+
     for (int i = 0; i < sr->count; i++) {
         uint8_t* gram = sr->assigns[i].gram;
         int stage = sr->assigns[i].stage;
+        uint32_t gidx = bitmap_idx(gram);
         bitmap_set_gram(bm_arr, gram);
 
         for (int cur_stage = 1; cur_stage < stage; cur_stage++) {
-            Bitmap* current_verifier = bm_verifier_arr + (cur_stage-1);
-            bitmap_set_gram(current_verifier, gram);
+            if (min_stage_at_gram[gidx] > cur_stage) {
+                Bitmap* current_verifier = bm_verifier_arr + (cur_stage-1);
+                bitmap_set_gram(current_verifier, gram);
+            }
 
             uint8_t next_gram[N];
             memcpy(
@@ -195,6 +229,7 @@ int main(int argc, char *argv[])
             bitmap_set_gram(current_stage, next_gram);
         }
     }
+    free(min_stage_at_gram);
 
 
     int verify_ok = 1;
@@ -222,7 +257,7 @@ int main(int argc, char *argv[])
     for (int i = 0; i < max_stage - 1; i++)
         printf("verify-%d grams      : %d\n", i + 1, bitmap_count_bits(bm_verifier_arr + i));
     printf("bitmap grams total  : %d\n", stage_bits_total + verifier_bits_total);
-    printf("bitmap size         : %d bytes per bitmap (256KB)\n", (int)BITMAP_BYTES);
+    printf("bitmap size         : %d bytes per bitmap (32KB)\n", (int)BITMAP_BYTES);
     printf("bitmap size total   : %zu bytes total\n",
            ((size_t)max_stage + (size_t)(max_stage - 1)) * sizeof(Bitmap));
     printf("verify              : %s\n", verify_ok ? "OK" : "FAIL");
@@ -241,8 +276,11 @@ int main(int argc, char *argv[])
     size_t stage_bitmap_runtime_bytes = allocation_usable_bytes(bm_arr);
     size_t verifier_bitmap_runtime_bytes = allocation_usable_bytes(bm_verifier_arr);
     size_t bitmap_runtime_bytes = stage_bitmap_runtime_bytes + verifier_bitmap_runtime_bytes;
-    size_t hash_table_bytes = ht_memory_usage_bytes(mctx.ht);
-    size_t hash_table_runtime_bytes = ht_runtime_memory_usage_bytes(mctx.ht);
+    size_t hash_table_bytes = 0, hash_table_runtime_bytes = 0;
+    for (int b = 0; b < HT_BANKS; b++) {
+        hash_table_bytes         += ht_memory_usage_bytes(mctx.banks[b]);
+        hash_table_runtime_bytes += ht_runtime_memory_usage_bytes(mctx.banks[b]);
+    }
 
     printf("\n=== memory usage ===\n");
     print_memory_usage("stage requested", stage_bitmap_bytes);
@@ -251,7 +289,7 @@ int main(int argc, char *argv[])
     print_memory_usage("verifier runtime usable", verifier_bitmap_runtime_bytes);
     print_memory_usage("bitmap requested", bitmap_bytes);
     print_memory_usage("bitmap runtime usable", bitmap_runtime_bytes);
-    print_hash_table_usage(mctx.ht);
+    print_hash_table_usage(&mctx);
     print_memory_usage("requested total", bitmap_bytes + hash_table_bytes);
     print_memory_usage("runtime usable total", bitmap_runtime_bytes + hash_table_runtime_bytes);
     printf("runtime usable uses malloc_usable_size(); allocator metadata/RSS is not included\n");
@@ -267,6 +305,9 @@ int main(int argc, char *argv[])
             int n_bm_pkts = 0;
             int n_exact_pkts = 0;
             int bitmap_hits_gram_cnt = 0, total_ngram_cnt = 0;
+            StageStat agg_stage[MATCH_MAX_STAGES] = {0};
+            int agg_bank_lookups[HT_BANKS] = {0}, agg_bank_hits[HT_BANKS] = {0};
+        StageStat agg_ht = {0}, agg_cand = {0}, agg_exact = {0}, agg_pom = {0};
 
             typedef struct { int frame; int ids[256]; int n; } PmRecord;
             PmRecord *pm_log = malloc(16384 * sizeof(PmRecord));
@@ -296,14 +337,30 @@ int main(int argc, char *argv[])
                                             &candidates, &candidate_cap, max_stage);
                 if (mc.nc > 0) n_bm_pkts++;
                 if (mc.ngram_hit > 0) bitmap_hits_gram_cnt += mc.ngram_hit;
+                for (int si = 0; si < mc.n_stages; si++) {
+                    agg_stage[si].total += mc.stage[si].total;
+                    agg_stage[si].hit   += mc.stage[si].hit;
+                }
+                agg_ht.total   += mc.ht_total;
+                agg_ht.hit     += mc.ht_hit;
+                agg_cand.total += mc.cand_total;
+                agg_cand.hit   += mc.cand_hit;
+                for (int bi = 0; bi < HT_BANKS; bi++) {
+                    agg_bank_lookups[bi] += mc.bank_lookups[bi];
+                    agg_bank_hits[bi]    += mc.bank_hits[bi];
+                }
 
                 int nm = exact_match(folded, (int)flen,
                                      candidates, mc.nc,
                                      rs, matches, 256);
                 if (nm > 0) n_exact_pkts++;
+                agg_exact.total += mc.nc;
+                agg_exact.hit   += nm;
 
                 MatchResult filtered[256];
                 int nf = port_offset_match(matches, nm, rs, &pkt, filtered, 256);
+                agg_pom.total += nm;
+                agg_pom.hit   += nf;
                 priority_sort(filtered, nf, rs);
                 if (nf > 0) {
                     n_matched_pkts++;
@@ -341,6 +398,45 @@ int main(int argc, char *argv[])
                    n_matched_pkts, n_parsed,
                    n_parsed ? 100.0 * n_matched_pkts / n_parsed : 0.0);
 
+            printf("\n=== per-stage gram filter ===\n");
+            printf("%-10s  %12s  %12s  %12s  %7s\n",
+                   "stage", "total", "hit", "miss", "pass%");
+            for (int si = 0; si < max_stage && si < MATCH_MAX_STAGES; si++) {
+                int t = agg_stage[si].total;
+                int h = agg_stage[si].hit;
+                printf("bitmap-%-3d  %12d  %12d  %12d  %6.2f%%\n",
+                       si + 1, t, h, t - h, t ? 100.0 * h / t : 0.0);
+            }
+            printf("%-10s  %12d  %12d  %12d  %6.2f%%\n",
+                   "hashtable", agg_ht.total, agg_ht.hit, agg_ht.total - agg_ht.hit,
+                   agg_ht.total ? 100.0 * agg_ht.hit / agg_ht.total : 0.0);
+            printf("%-10s  %12d  %12d  %12d  %6.2f%%\n",
+                   "candidate", agg_cand.total, agg_cand.hit, agg_cand.total - agg_cand.hit,
+                   agg_cand.total ? 100.0 * agg_cand.hit / agg_cand.total : 0.0);
+            printf("%-10s  %12d  %12d  %12d  %6.2f%%\n",
+                   "exact", agg_exact.total, agg_exact.hit, agg_exact.total - agg_exact.hit,
+                   agg_exact.total ? 100.0 * agg_exact.hit / agg_exact.total : 0.0);
+            printf("%-10s  %12d  %12d  %12d  %6.2f%%\n",
+                   "pom", agg_pom.total, agg_pom.hit, agg_pom.total - agg_pom.hit,
+                   agg_pom.total ? 100.0 * agg_pom.hit / agg_pom.total : 0.0);
+
+            {
+                int min_l = INT_MAX, max_l = 0, used = 0, hot_b = 0;
+                for (int bi = 0; bi < HT_BANKS; bi++) {
+                    int l = agg_bank_lookups[bi];
+                    if (l > 0) used++;
+                    if (l < min_l) min_l = l;
+                    if (l > max_l) { max_l = l; hot_b = bi; }
+                }
+                double avg_l = (double)agg_ht.total / HT_BANKS;
+                double ideal = avg_l > 0 ? (double)max_l / avg_l : 0.0;
+                printf("\n=== hashtable bank traffic ===\n");
+                printf("banks active : %d / %d\n", used, HT_BANKS);
+                printf("lookups/bank : min=%d  max=%d (bank %d)  avg=%.1f\n",
+                       min_l == INT_MAX ? 0 : min_l, max_l, hot_b, avg_l);
+                printf("skew (max/avg): %.2fx  (1.00 = perfect, >2.0 = hot bank)\n", ideal);
+            }
+
             if (verbose > 1) {
                 printf("\n=== pm output ===\n");
                 printf("%-8s  %s\n", "frame", "rule ids");
@@ -356,6 +452,9 @@ int main(int argc, char *argv[])
         }
     } else {
         int fn = 0, total_bm = 0, total_exact = 0;
+        StageStat agg_stage[MATCH_MAX_STAGES] = {0};
+        int agg_bank_lookups[HT_BANKS] = {0}, agg_bank_hits[HT_BANKS] = {0};
+        StageStat agg_ht = {0}, agg_cand = {0}, agg_exact = {0};
         for (int i = 0; i < rs->count; i++) {
             const Rule *r = &rs->rules[i];
             if (r->pat_len < 3) continue;
@@ -364,11 +463,25 @@ int main(int argc, char *argv[])
                                         bm_arr, bm_verifier_arr,
                                         &candidates, &candidate_cap, max_stage);
             total_bm += mc.nc;
+            for (int si = 0; si < mc.n_stages; si++) {
+                agg_stage[si].total += mc.stage[si].total;
+                agg_stage[si].hit   += mc.stage[si].hit;
+            }
+            agg_ht.total   += mc.ht_total;
+            agg_ht.hit     += mc.ht_hit;
+            agg_cand.total += mc.cand_total;
+            agg_cand.hit   += mc.cand_hit;
+            for (int bi = 0; bi < HT_BANKS; bi++) {
+                agg_bank_lookups[bi] += mc.bank_lookups[bi];
+                agg_bank_hits[bi]    += mc.bank_hits[bi];
+            }
 
             int nm = exact_match((const uint8_t *)r->pattern, r->pat_len,
                                  candidates, mc.nc,
                                  rs, matches, 256);
             total_exact += nm;
+            agg_exact.total += mc.nc;
+            agg_exact.hit   += nm;
 
             int found = 0;
             for (int j = 0; j < nm; j++)
@@ -379,6 +492,42 @@ int main(int argc, char *argv[])
         printf("bitmap hits     : %d  (potential match candidates)\n", total_bm);
         printf("exact matches   : %d\n", total_exact);
         printf("false negatives : %d\n", fn);
+
+        printf("\n=== per-stage gram filter ===\n");
+        printf("%-10s  %12s  %12s  %12s  %7s\n",
+               "stage", "total", "hit", "miss", "pass%");
+        for (int si = 0; si < max_stage && si < MATCH_MAX_STAGES; si++) {
+            int t = agg_stage[si].total;
+            int h = agg_stage[si].hit;
+            printf("bitmap-%-3d  %12d  %12d  %12d  %6.2f%%\n",
+                   si + 1, t, h, t - h, t ? 100.0 * h / t : 0.0);
+        }
+        printf("%-10s  %12d  %12d  %12d  %6.2f%%\n",
+               "hashtable", agg_ht.total, agg_ht.hit, agg_ht.total - agg_ht.hit,
+               agg_ht.total ? 100.0 * agg_ht.hit / agg_ht.total : 0.0);
+        printf("%-10s  %12d  %12d  %12d  %6.2f%%\n",
+               "candidate", agg_cand.total, agg_cand.hit, agg_cand.total - agg_cand.hit,
+               agg_cand.total ? 100.0 * agg_cand.hit / agg_cand.total : 0.0);
+        printf("%-10s  %12d  %12d  %12d  %6.2f%%\n",
+               "exact", agg_exact.total, agg_exact.hit, agg_exact.total - agg_exact.hit,
+               agg_exact.total ? 100.0 * agg_exact.hit / agg_exact.total : 0.0);
+
+        {
+            int min_l = INT_MAX, max_l = 0, used = 0, hot_b = 0;
+            for (int bi = 0; bi < HT_BANKS; bi++) {
+                int l = agg_bank_lookups[bi];
+                if (l > 0) used++;
+                if (l < min_l) min_l = l;
+                if (l > max_l) { max_l = l; hot_b = bi; }
+            }
+            double avg_l = (double)agg_ht.total / HT_BANKS;
+            double ideal = avg_l > 0 ? (double)max_l / avg_l : 0.0;
+            printf("\n=== hashtable bank traffic ===\n");
+            printf("banks active : %d / %d\n", used, HT_BANKS);
+            printf("lookups/bank : min=%d  max=%d (bank %d)  avg=%.1f\n",
+                   min_l == INT_MAX ? 0 : min_l, max_l, hot_b, avg_l);
+            printf("skew (max/avg): %.2fx  (1.00 = perfect, >2.0 = hot bank)\n", ideal);
+        }
 
         printf("\nSample self-matches (first 5 eligible rules):\n");
         printf("  %-6s  %-6s  %-8s  %s\n", "ruleid", "anchor", "gram", "pattern (first 20 bytes)");

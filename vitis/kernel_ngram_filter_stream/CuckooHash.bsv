@@ -1,0 +1,199 @@
+package CuckooHash;
+
+// Cuckoo hash bank, URAM-backed (was RegFile/LUTRAM).
+//
+// WHY: RegFile.sub() is a combinational (async) read, which Vivado can only
+// implement as distributed LUTRAM + a 1024:1 read mux per table. Across 64
+// banks × 2 tables that was ~303k LUTs (51% of the kernel) and the source of
+// the systemic routing congestion (WNS -8ns). A synchronous (registered) RAM
+// hardens the read mux into the memory's address decoder, so it maps to URAM
+// (separate silicon from the platform's heavily-used BRAM).
+//
+// Layout: one 4096-deep dual-port BRAM2Server per bank => one URAM.
+//   table0 lives at addresses [0 .. 1023]      accessed via portA
+//   table1 lives at addresses [1024 .. 2047]   accessed via portB
+// so a lookup reads both tables in the same cycle (h0 on A, h1 on B).
+//
+// Capacity unchanged: logSz=10 => 1024 slots/table × 2 × 64 banks = 131072
+// slots (supports up to 64k rules). Bank count unchanged (64 = bitmap lanes).
+//
+// Read is now 1-cycle: lookup is issue->complete (2 phase); insert eviction is
+// likewise 2 phase (insert happens only at DB-load time, so latency is free).
+
+import BRAM::*;
+import FIFO::*;
+import FIFOF::*;
+
+typedef struct {
+	Bool        valid;
+	Bit#(keySz) key;
+	Bit#(valSz) val;
+} CuckooEntry#(numeric type keySz, numeric type valSz) deriving (Bits, Eq);
+
+interface CuckooHashIfc#(numeric type keySz, numeric type valSz, numeric type logSz);
+	method Action clear;
+	method Action insert(Bit#(keySz) key, Bit#(valSz) val);
+	method ActionValue#(Bool) insertAck;
+	method Action lookupReq(Bit#(keySz) key);
+	method ActionValue#(Maybe#(Bit#(valSz))) lookupResp;
+	method Bool notBusy;
+endinterface
+
+typedef enum { HT_CLEAR, HT_IDLE, HT_INS_REQ, HT_INS_RESP } HtState deriving (Bits, Eq);
+typedef 16 MaxEvictions;
+
+module mkCuckooHash(CuckooHashIfc#(keySz, valSz, logSz))
+	provisos(
+		Add#(logSz, a__, keySz),
+		Add#(logSz, b__, 12),                 // tables fit in a 4096-deep core
+		Bits#(CuckooEntry#(keySz, valSz), entrySz)
+	);
+
+	// One 4096-deep dual-port RAM per bank -> URAM. table0 @ [0..1023] (portA),
+	// table1 @ [1024..2047] (portB).
+	BRAM_Configure cfg = defaultValue;
+	cfg.memorySize = 4096;
+	cfg.latency    = 1;
+	BRAM2Port#(Bit#(12), CuckooEntry#(keySz, valSz)) ram <- mkBRAM2Server(cfg);
+
+	Reg#(HtState)     htState  <- mkReg(HT_CLEAR);
+	Reg#(Bit#(keySz)) pendKey  <- mkReg(0);
+	Reg#(Bit#(valSz)) pendVal  <- mkReg(0);
+	Reg#(Bool)        useAlt   <- mkReg(False);
+	Reg#(UInt#(5))    evictCnt <- mkReg(0);
+	Reg#(Bit#(12))    insAddr  <- mkRegU;       // address being read/written this evict step
+
+	Reg#(Bit#(logSz)) clearIdx <- mkReg(0);
+	Reg#(Bool)        clearAlt <- mkReg(False);
+
+	FIFOF#(Bool)                 insertAckQ  <- mkFIFOF;
+	FIFOF#(Bit#(keySz))         lookupReqQ  <- mkSizedFIFOF(8);
+	FIFOF#(Bit#(keySz))         lkKeyPipe   <- mkSizedFIFOF(4);  // keys awaiting RAM resp
+	FIFOF#(Maybe#(Bit#(valSz))) lookupRespQ <- mkSizedFIFOF(8);
+
+	function Bit#(logSz) h0(Bit#(keySz) k);
+		Bit#(keySz) x = k ^ (k >> fromInteger(valueOf(logSz)));
+		x = x ^ (x >> 7);
+		x = x ^ (x << 11);
+		return truncate(x);
+	endfunction
+	function Bit#(logSz) h1(Bit#(keySz) k);
+		Bit#(keySz) x = k ^ (k << 5) ^ (k >> 13);
+		x = x ^ (x << 9);
+		x = x ^ (x >> 17);
+		return truncate(x);
+	endfunction
+	// table0 address = h0 (0..1023); table1 address = 1024 + h1.
+	function Bit#(12) a0(Bit#(keySz) k) = zeroExtend(h0(k));
+	function Bit#(12) a1(Bit#(keySz) k) = 12'd1024 + zeroExtend(h1(k));
+
+	CuckooEntry#(keySz, valSz) emptyEntry = CuckooEntry { valid: False, key: 0, val: 0 };
+
+	function BRAMRequest#(Bit#(12), CuckooEntry#(keySz, valSz))
+	         rd(Bit#(12) a) = BRAMRequest { write: False, responseOnWrite: False,
+	                                        address: a, datain: ? };
+	function BRAMRequest#(Bit#(12), CuckooEntry#(keySz, valSz))
+	         wr(Bit#(12) a, CuckooEntry#(keySz, valSz) e) =
+	             BRAMRequest { write: True, responseOnWrite: False, address: a, datain: e };
+
+	// Clear both tables (portA: table0 region, portB: table1 region) in lockstep.
+	rule doClear (htState == HT_CLEAR);
+		ram.portA.request.put(wr(zeroExtend(clearIdx), emptyEntry));
+		ram.portB.request.put(wr(12'd1024 + zeroExtend(clearIdx), emptyEntry));
+		if (clearIdx == maxBound) begin
+			htState  <= HT_IDLE;
+			clearIdx <= 0;
+		end else
+			clearIdx <= clearIdx + 1;
+	endrule
+
+	// ---- Lookup: issue (read both tables) -> complete (compare) ----
+	rule lkIssue (htState == HT_IDLE && lookupReqQ.notEmpty && lkKeyPipe.notFull);
+		let key = lookupReqQ.first; lookupReqQ.deq;
+		ram.portA.request.put(rd(a0(key)));   // table0 @ h0
+		ram.portB.request.put(rd(a1(key)));   // table1 @ h1
+		lkKeyPipe.enq(key);
+	endrule
+
+	rule lkComplete (lkKeyPipe.notEmpty);
+		let key = lkKeyPipe.first; lkKeyPipe.deq;
+		let e0 <- ram.portA.response.get;
+		let e1 <- ram.portB.response.get;
+		if      (e0.valid && e0.key == key) lookupRespQ.enq(tagged Valid e0.val);
+		else if (e1.valid && e1.key == key) lookupRespQ.enq(tagged Valid e1.val);
+		else                                lookupRespQ.enq(tagged Invalid);
+	endrule
+
+	// ---- Insert (DB load only): issue read of target slot -> decide/write ----
+	rule insReq (htState == HT_INS_REQ);
+		Bit#(12) a = useAlt ? a1(pendKey) : a0(pendKey);
+		insAddr <= a;
+		if (useAlt) ram.portB.request.put(rd(a));
+		else        ram.portA.request.put(rd(a));
+		htState <= HT_INS_RESP;
+	endrule
+
+	rule insResp (htState == HT_INS_RESP);
+		CuckooEntry#(keySz, valSz) existing;
+		if (useAlt) existing <- ram.portB.response.get;
+		else        existing <- ram.portA.response.get;
+
+		CuckooEntry#(keySz, valSz) newEntry = CuckooEntry { valid: True,
+		                                                     key:   pendKey,
+		                                                     val:   pendVal };
+		function Action writeSlot(CuckooEntry#(keySz, valSz) e);
+			action
+				if (useAlt) ram.portB.request.put(wr(insAddr, e));
+				else        ram.portA.request.put(wr(insAddr, e));
+			endaction
+		endfunction
+
+		if (!existing.valid || existing.key == pendKey) begin
+			writeSlot(newEntry);
+			insertAckQ.enq(True);
+			htState  <= HT_IDLE;
+			evictCnt <= 0;
+		end else if (evictCnt < fromInteger(valueOf(MaxEvictions))) begin
+			writeSlot(newEntry);            // displace, then re-home the evicted key
+			pendKey  <= existing.key;
+			pendVal  <= existing.val;
+			useAlt   <= !useAlt;
+			evictCnt <= evictCnt + 1;
+			htState  <= HT_INS_REQ;
+		end else begin
+			insertAckQ.enq(False);
+			htState  <= HT_IDLE;
+			evictCnt <= 0;
+		end
+	endrule
+
+	method Action clear if (htState == HT_IDLE);
+		htState <= HT_CLEAR;
+	endmethod
+
+	method Action insert(Bit#(keySz) key, Bit#(valSz) val)
+	       if (htState == HT_IDLE && !lkKeyPipe.notEmpty);
+		pendKey <= key;
+		pendVal <= val;
+		useAlt  <= False;
+		htState <= HT_INS_REQ;
+	endmethod
+
+	method ActionValue#(Bool) insertAck;
+		let v = insertAckQ.first; insertAckQ.deq; return v;
+	endmethod
+
+	method Action lookupReq(Bit#(keySz) key);
+		lookupReqQ.enq(key);
+	endmethod
+
+	method ActionValue#(Maybe#(Bit#(valSz))) lookupResp;
+		let v = lookupRespQ.first; lookupRespQ.deq; return v;
+	endmethod
+
+	method Bool notBusy;
+		return htState == HT_IDLE && !lkKeyPipe.notEmpty;
+	endmethod
+endmodule
+
+endpackage

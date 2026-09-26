@@ -20,8 +20,8 @@ rule.txt
 [singleton]     ── 룰별 대표 3-gram 선정 (greedy, 최소 degree 우선)
    │             ── multi-stage: 연속 3-gram 체이닝 지원
    ▼
-[bitmap]        ── 대표 gram → 256KB Bitmap (2^21 bit) 등록
-                ── 7-bit 폴딩: idx = g[0][6:0]<<14 | g[1][6:0]<<7 | g[2][6:0]
+[bitmap]        ── 대표 gram → 32KiB Bitmap (2^18 bit) 등록
+                ── 6-bit 폴딩: idx = g[0][5:0]<<12 | g[1][5:0]<<6 | g[2][5:0]
    │
    ▼
 pcap_file
@@ -38,7 +38,7 @@ pcap_file
    ▼
 [match_scan]    ── payload를 1 byte씩 슬라이딩
                 ── Stage-1 Bitmap hit? → Stage-N verifier bitmap 체크
-                ── HashTable(Cuckoo)로 gram_idx → assign 조회
+                ── 64-bank HashTable(Cuckoo)로 gram_idx → assign_idx 조회
                 ── 후보 목록(MatchCandidate[]) 수집
    │
    ▼
@@ -63,10 +63,10 @@ pcap_file
 | `rule_loader.c/h` | 룰 파일 파싱. URL 디코딩 + 소문자 정규화 후 `RuleSet` 구성 |
 | `ngram_extract.c/h` | 패턴 문자열에서 N-gram(기본 N=3) 추출 |
 | `singleton.c/h` | 각 룰의 대표 3-gram 선정. degree=1(고유 gram)을 최우선 처리하는 greedy 알고리즘 |
-| `bitmap.c/h` | 256KB(2^21 bit) Bitmap. 3-gram을 21-bit 인덱스로 압축하여 O(1) 존재 확인 |
-| `hashtable.c/h` | Cuckoo hashing 기반 `gram_idx → assigns[]` 인덱스 테이블 |
+| `bitmap.c/h` | 32KiB(2^18 bit) Bitmap. 3-gram을 18-bit 인덱스로 압축하여 O(1) 존재 확인 |
+| `hashtable.c/h` | 64-bank Cuckoo hashing 기반 `gram_idx → assign_idx` 인덱스 테이블 |
 | `cuckoo_hash.c/h` | Cuckoo hash 저수준 구현 (2-테이블, 최대 64회 loop) |
-| `match.c/h` | Bitmap hit + multi-stage verifier + HashTable 조회로 후보 수집 |
+| `match.c/h` | Bitmap hit + multi-stage verifier + HashTable 조회로 후보 수집 (최대 8 stage) |
 | `exact_match.c/h` | 후보 위치에서 패턴 전체 exact 비교 |
 | `port_offset_matcher.c/h` | proto/port/direction/offset 메타 조건 필터링 |
 | `priority.c/h` | 최종 매치 결과를 priority 기준으로 정렬 |
@@ -92,14 +92,23 @@ pcap_file
 ## Bitmap 구조
 
 ```
-bit index = (gram[0] & 0x7F) << 14
-          | (gram[1] & 0x7F) <<  7
-          | (gram[2] & 0x7F)
+bit index = (gram[0] & 0x3F) << 12
+          | (gram[1] & 0x3F) <<  6
+          | (gram[2] & 0x3F)
 ```
 
-- 크기: 2^21 bit = 256 KiB per Bitmap
-- Stage Bitmap(N개) + Verifier Bitmap(N-1개)로 false positive 감소
-- `--max_stage` 파라미터로 단계 수 조절
+- 크기: 2^18 bit = 32 KiB per Bitmap
+- Stage Bitmap(`max_stage`개) + Verifier Bitmap(`max_stage - 1`개)로 false positive 감소
+- `--max_stage` 파라미터로 단계 수 조절 (기본값 3, 최대 `MATCH_MAX_STAGES = 8`)
+
+---
+
+## HashTable 구조
+
+- 64-bank 분산 구조 (`HT_BANKS = 64`)
+- 각 bank: Cuckoo hash 2-테이블, 최대 64회 eviction loop
+- key: `gram_idx` (18-bit), value: `assign_idx` (int)
+- `gram_idx & HT_BANK_MASK`로 bank 선택 (bank skew 통계 런타임 출력)
 
 ---
 
@@ -110,7 +119,22 @@ bit index = (gram[0] & 0x7F) << 14
 make
 
 # 실행 (룰파일 pcap파일 최대스테이지 verbosity)
-make run RULE=<rule 파일> PCAP=<pcap 파일> 
+# verbosity: 0=통계만, 1=기본(default), 2=ALERT 상세+pm_log
+make run RULE=<rule 파일> PCAP=<pcap 파일> MAX_STAGE=3 VERBOSE=1
 
+# 직접 실행
+./main <rule.txt> [pcap_file] [max_stage] [verbose]
+
+# 단위 테스트
+make run-test-bm        # bitmap 테스트
+make run-test-unit      # rule_loader / singleton / bitmap 통합 테스트
 ```
 
+### Makefile 기본값
+
+| 변수 | 기본값 |
+|---|---|
+| `RULE` | `rule.txt` |
+| `PCAP` | `full.pcap` |
+| `MAX_STAGE` | `3` |
+| `VERBOSE` | `1` |

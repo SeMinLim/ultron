@@ -1,7 +1,7 @@
 CC      = gcc
 CFLAGS  = -Wall -O2
 TARGET  = main
-SRCS    = main.c rule_loader.c ngram_extract.c cuckoo_hash.c hashtable.c bitmap.c singleton.c match.c exact_match.c port_offset_matcher.c priority.c pm_output.c pcap_reader.c packet_parser.c
+SRCS    = main.c rule_loader.c ngram_extract.c cuckoo_hash.c hashtable.c bitmap.c singleton.c match.c exact_match.c port_offset_matcher.c priority.c pm_output.c pcap_reader.c packet_parser.c xor_filter.c
 OBJS    = $(SRCS:.c=.o)
 
 TEST_BM      = test_bitmap
