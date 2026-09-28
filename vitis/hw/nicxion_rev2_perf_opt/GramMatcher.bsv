@@ -152,6 +152,9 @@ module mkGramMatcher(GramMatcherIfc);
     FIFOF#(Tuple2#(Maybe#(Bit#(CuckooValBits)), GramCtx)) lkRespQ <- mkFIFOF;
     // Chain entries, registered before they are formatted into outQ.
     FIFOF#(Tuple2#(ChainEntry, GramCtx)) chainOutQ <- mkFIFOF;
+    // Cuckoo misses, merged into outQ behind chain entries (outQ has one writer
+    // per cycle, so the lookup rule itself never enqueues it).
+    FIFOF#(Epoch)                        missQ     <- mkFIFOF;
 
     // Chain walk: the first read issues with the cuckoo response, the rest one
     // per cycle from chainIssue; each read's context waits in chainCtxQ for its
@@ -265,12 +268,7 @@ module mkGramMatcher(GramMatcherIfc);
                 end
                 if (sat) longSet <= !longSet;
             end
-            tagged Invalid: begin
-                outQ.enq(GramResult {
-                    hit: False, vreq: unpack(0),
-                    epoch: ctx.epoch,
-                    lastInChain: True });
-            end
+            tagged Invalid: missQ.enq(ctx.epoch);
         endcase
     endrule
 
@@ -304,9 +302,13 @@ module mkGramMatcher(GramMatcherIfc);
         end
     endrule
 
-    // cuckooLookupResp (misses) and emitChain (chain entries) share outQ.
-    // A miss is one beat and never stalls the chain for more than a cycle.
-    (* descending_urgency = "cuckooLookupResp, emitChain" *)
+    // emitChain (chain entries) and emitMiss share outQ; chain entries go first.
+    (* descending_urgency = "emitChain, emitMiss" *)
+    rule emitMiss;
+        let e = missQ.first; missQ.deq;
+        outQ.enq(GramResult { hit: False, vreq: unpack(0), epoch: e, lastInChain: True });
+    endrule
+
     rule emitChain;
         match { .ce, .cc } = chainOutQ.first; chainOutQ.deq;
         outQ.enq(GramResult {

@@ -55,6 +55,17 @@ typedef struct {
     Vector#(NBitmapLanes, Bit#(18))         keyA;
 } ScanJob deriving (Bits);
 
+// One scan pass, set up by startScan and drained 4 need-lanes/cycle by doScan.
+typedef struct {
+    Epoch                              epoch;
+    Bool                               last;    // this pass retires the entry
+    Vector#(NBitmapLanes, Bool)        sel;     // lane is a real need-lane
+    Vector#(NBitmapLanes, Bit#(7))     rank;    // exclusive prefix rank
+    Vector#(NBitmapLanes, NgramOut)    gram;    // unwrapped gram per lane
+    Vector#(NBitmapLanes, Bit#(18))    bm1K;
+    Bit#(7)                            count;   // number of need-lanes
+} ScanPass deriving (Bits);
+
 // An exact-match hit on its way to the port/offset stage.
 typedef struct {
     Epoch    epoch;
@@ -151,7 +162,8 @@ module mkKernelMain(KernelMainIfc);
     RWire#(Epoch) bitmapIncr <- mkRWire;
     RWire#(Epoch) bitmapDecr <- mkRWire;
     RWire#(Epoch) scanIncr   <- mkRWire;
-    RWire#(Epoch) scanDecr   <- mkRWire;
+    RWire#(Epoch) scanDecr   <- mkRWire;   // startScan: pass with no need-lanes
+    RWire#(Epoch) scanDecr2  <- mkRWire;   // doScan: last pass drained
     // Gram in-flight is count-based: a 4-wide batch increments by lane count,
     // bloom rejects decrement by lane count, chain completions decrement by 1.
     RWire#(Tuple2#(Epoch, Bit#(3))) gramIncBatch <- mkRWire;
@@ -243,7 +255,16 @@ module mkKernelMain(KernelMainIfc);
     addRules(mkCounterUpdate(inFlightNgram,  ngramIncr,  ngramDecr));
     addRules(mkCounterUpdate(inFlightPom,    pomIncr,    pomDecr));
     addRules(mkCounterUpdate(inFlightBitmap, bitmapIncr, bitmapDecr));
-    addRules(mkCounterUpdate(inFlightScan,   scanIncr,   scanDecr));
+    for (Integer i = 0; i < valueOf(NEpoch); i = i + 1) begin
+        rule updateInFlightScan (state == KProcess);
+            Epoch    e   = fromInteger(i);
+            Bit#(16) cur = inFlightScan[i];
+            if (maybeEpochEq(scanIncr.wget,  e)) cur = cur + 1;
+            if (maybeEpochEq(scanDecr.wget,  e)) cur = cur - 1;
+            if (maybeEpochEq(scanDecr2.wget, e)) cur = cur - 1;
+            inFlightScan[i] <= cur;
+        endrule
+    end
     addRules(mkCounterUpdate(inFlightRoute,  routeIncr,  routeDecr));
     addRules(mkCounterUpdate(inFlightExact,  exactIncr,  exactDecr));
 
@@ -478,19 +499,13 @@ module mkKernelMain(KernelMainIfc);
         hitPairQ.enq(ScanJob { epoch: e, needA: needCuckoo, needB: needS1Too, grams: grams, keyA: keyA });
     endrule
 
-    Reg#(Bool)                                 scanBusy    <- mkReg(False);
+    // startScan sets up the next pass while doScan drains the current one.
     Reg#(Bool)                                 scanPhaseB  <- mkReg(False);   // running the key-0 pass
-    Reg#(Bool)                                 scanLast    <- mkRegU;         // this pass retires the entry
-    Reg#(Epoch)                                scanEpoch   <- mkReg(0);
     Reg#(Bit#(7))                              scanIdx     <- mkReg(0);   // rank cursor
-    Reg#(Vector#(NBitmapLanes, Bool))          scanSel     <- mkRegU;     // lane is a real need-lane
-    Reg#(Vector#(NBitmapLanes, Bit#(7)))       scanRank    <- mkRegU;     // exclusive prefix rank
-    Reg#(Vector#(NBitmapLanes, NgramOut))      scanGram    <- mkRegU;     // unwrapped gram per lane
-    Reg#(Vector#(NBitmapLanes, Bit#(18)))      scanBm1K    <- mkRegU;
-    Reg#(Bit#(7))                              packedCount <- mkRegU;     // number of need-lanes
+    FIFOF#(ScanPass)                           scanPassQ   <- mkFIFOF;
     FIFOF#(BloomReq4)                          bloomFeedQ  <- mkFIFOF;
 
-    rule startScan(!scanBusy);
+    rule startScan;
         let job = hitPairQ.first;
         let e = job.epoch; let needA = job.needA; let needB = job.needB; let grams = job.grams; let keyA = job.keyA;
         Bool hasB = pack(needB) != 0;
@@ -502,11 +517,8 @@ module mkKernelMain(KernelMainIfc);
         if (lastPass) begin
             hitPairQ.deq;
             scanPhaseB <= False;
-            scanLast   <= True;
-        end else begin
+        end else
             scanPhaseB <= True;
-            scanLast   <= False;
-        end
 
         // effective select = bitmap-need AND a real gram on that lane
         Vector#(NBitmapLanes, Bool)     sel = newVector;
@@ -525,21 +537,16 @@ module mkKernelMain(KernelMainIfc);
             rankV[i] = zeroExtend(pack(countOnes(below)));
         end
 
-        scanSel     <= sel;
-        scanRank    <= rankV;
-        scanGram    <= gUn;
-        scanBm1K    <= bm1K;
-        packedCount <= zeroExtend(pack(countOnes(selBits)));
-        scanEpoch   <= e;
-        scanIdx     <= 0;
         if (selBits == 0) begin
             if (lastPass) scanDecr.wset(e);
         end else
-            scanBusy <= True;
+            scanPassQ.enq(ScanPass { epoch: e, last: lastPass, sel: sel, rank: rankV, gram: gUn,
+                                     bm1K: bm1K, count: zeroExtend(pack(countOnes(selBits))) });
     endrule
 
-    rule doScan(scanBusy);
-        Bit#(7) n = packedCount;
+    rule doScan;
+        let sp = scanPassQ.first;
+        Bit#(7) n = sp.count;
         // The next 4 need-lanes are the lanes whose exclusive rank == scanIdx..+3.
         // These are FOUR INDEPENDENT rank-match selects (not chained) -> shallow.
         // scanIdx only ever steps by 4, so rank == scanIdx + k is exactly
@@ -550,14 +557,14 @@ module mkKernelMain(KernelMainIfc);
             Bit#(18) kk = 0;
             Bool found  = False;
             for (Integer i = 0; i < valueOf(NBitmapLanes); i = i + 1)
-                if (scanSel[i] && scanRank[i][6:2] == scanIdx[6:2]
-                               && scanRank[i][1:0] == fromInteger(k)) begin
-                    g     = scanGram[i];
-                    kk    = scanBm1K[i];
+                if (sp.sel[i] && sp.rank[i][6:2] == scanIdx[6:2]
+                              && sp.rank[i][1:0] == fromInteger(k)) begin
+                    g     = sp.gram[i];
+                    kk    = sp.bm1K[i];
                     found = True;
                 end
             Bit#(32) key18 = zeroExtend(makeKey18(g));
-            let req = mkBloomReq(key18, g.gram[23:0], kk, g.anchor, scanEpoch);
+            let req = mkBloomReq(key18, g.gram[23:0], kk, g.anchor, sp.epoch);
             return found ? tagged Valid req : tagged Invalid;
         endfunction
 
@@ -568,11 +575,12 @@ module mkKernelMain(KernelMainIfc);
 
         if (cnt != 0) begin
             bloomFeedQ.enq(reqs);
-            gramIncBatch.wset(tuple2(scanEpoch, cnt));
+            gramIncBatch.wset(tuple2(sp.epoch, cnt));
         end
         if (scanIdx + 4 >= n) begin
-            if (scanLast) scanDecr.wset(scanEpoch);
-            scanBusy <= False;
+            if (sp.last) scanDecr2.wset(sp.epoch);
+            scanPassQ.deq;
+            scanIdx <= 0;
         end else
             scanIdx <= scanIdx + 4;
     endrule
