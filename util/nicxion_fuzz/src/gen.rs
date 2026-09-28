@@ -216,9 +216,91 @@ fn pick_satisfiable<'a>(rng: &mut Rng, rules: &'a [Rule], cfg: &GenCfg) -> &'a R
     rng.pick(rules)
 }
 
+/// NX_EDGE=P: share of generation steps that use the edge strategies below.
+/// Unset = 0, so existing seeds reproduce.
+fn edge_share() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NX_EDGE").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0))
+}
+
+/// Short payload made from a rule: the whole pattern when it fits, else a prefix.
+fn short_hit(rng: &mut Rng, r: &Rule, max: usize) -> Vec<u8> {
+    let k = r.pattern.len().min(max);
+    rand_case(rng, &r.pattern[..k])
+}
+
+/// Edge strategies for the pipeline's packet-boundary and candidate paths:
+///   tiny-run       back-to-back 1..17 byte packets (one-slice packets, epoch churn)
+///   tail-len       payload length at 16/64-byte boundaries +-1, hit ending at the tail
+///   gram-flood     one 3-byte gram repeated over a full payload (same chain walked
+///                  over and over), sometimes with the real pattern inside
+///   tail-then-tiny full packet with a hit in its last bytes, then tiny hit packets
+fn edge_cases(rng: &mut Rng, rules: &[Rule], cfg: &GenCfg, out: &mut Vec<Case>) {
+    match rng.below(4) {
+        0 => {
+            for _ in 0..rng.range(16, 48) {
+                let r = rng.pick(rules);
+                let plen = rng.range(1, 17);
+                let pay = if rng.chance(0.4) { short_hit(rng, r, plen) } else { filler(rng, plen, rules) };
+                let l4 = l4_for(rng, r);
+                out.push(Case { frame: packet::build(&l4, &pay, shape(rng)), desc: format!("tiny-run r{} len{}", r.id, pay.len()) });
+            }
+        }
+        1 => {
+            let r = pick_satisfiable(rng, rules, cfg);
+            let unit = if rng.chance(0.5) { 16 } else { 64 };
+            let k = rng.range(1, (cfg.max_payload / unit).max(1));
+            let plen = ((unit * k) as i64 + rng.range(0, 2) as i64 - 1).max(r.pattern.len() as i64) as usize;
+            let plen = plen.min(cfg.max_payload.max(r.pattern.len()));
+            let pat = rand_case(rng, &r.pattern);
+            let mut pay = filler(rng, plen, rules);
+            let back = rng.range(0, 3).min(plen - pat.len());   // end 0..3 bytes before the tail
+            let at = plen - pat.len() - back;
+            pay[at..at + pat.len()].copy_from_slice(&pat);
+            let l4 = l4_for(rng, r);
+            out.push(Case { frame: packet::build(&l4, &pay, shape(rng)), desc: format!("tail-len r{} @{} len{}", r.id, at, plen) });
+        }
+        2 => {
+            let r = rng.pick(rules);
+            let a = rng.below(r.pattern.len().saturating_sub(2).max(1));
+            let gram: Vec<u8> = r.pattern[a..(a + 3).min(r.pattern.len())].to_vec();
+            let mut pay: Vec<u8> = gram.iter().cycle().take(cfg.max_payload).copied().collect();
+            let mut tag = "plain";
+            if rng.chance(0.5) && r.pattern.len() <= pay.len() {
+                let at = rng.below(pay.len() - r.pattern.len() + 1);
+                pay[at..at + r.pattern.len()].copy_from_slice(&rand_case(rng, &r.pattern));
+                tag = "hit";
+            }
+            let l4 = l4_for(rng, r);
+            out.push(Case { frame: packet::build(&l4, &pay, Shape::default()), desc: format!("gram-flood-{} r{} len{}", tag, r.id, pay.len()) });
+        }
+        _ => {
+            let r = pick_satisfiable(rng, rules, cfg);
+            let pat = rand_case(rng, &r.pattern);
+            let plen = cfg.max_payload.max(pat.len());
+            let mut pay = soup(rng, plen, rules);
+            let at = plen - pat.len();
+            pay[at..].copy_from_slice(&pat);
+            let l4 = l4_for(rng, r);
+            out.push(Case { frame: packet::build(&l4, &pay, Shape::default()), desc: format!("tail-big r{} @{} len{}", r.id, at, plen) });
+            for _ in 0..rng.range(2, 10) {
+                let t = rng.pick(rules);
+                let pay = short_hit(rng, t, 16);
+                let l4 = l4_for(rng, t);
+                out.push(Case { frame: packet::build(&l4, &pay, Shape::default()), desc: format!("tail-tiny r{} len{}", t.id, pay.len()) });
+            }
+        }
+    }
+}
+
 pub fn packets(rng: &mut Rng, rules: &[Rule], n: usize, cfg: &GenCfg) -> Vec<Case> {
     let mut out = Vec::with_capacity(n);
+    let edge = edge_share();
     while out.len() < n {
+        if edge > 0.0 && rng.chance(edge) {
+            edge_cases(rng, rules, cfg, &mut out);
+            continue;
+        }
         let kind = rng.weighted(&[30, 16, 10, 12, 8, 6, 3, 3, 3]);
         match kind {
             // hit: rule pattern placed at a boundary-stressing position

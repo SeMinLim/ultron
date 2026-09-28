@@ -32,6 +32,9 @@ cargo build --release
 환경변수: `NX_KERNEL_DIR` `NX_HOST_DIR` `NX_XCLBIN` `NX_ORACLE` `NX_ORACLE_ARGS` `NX_RULES` `NX_BDF`(기본 `0000:01:00.1`).
 `NX_ORACLE_ARGS` 기본값은 `--parser host6`(현재 IPv6 호스트). IPv4 전용인 예전 호스트(`nicxion_downgrade`, `nicxion_downscale_refined`, `nicxion_downscale_rev2`)는 `--parser host`.
 `NX_V6=P`: 모양을 쓰는 패킷 중 비율 P를 IPv6로(예: 0.8 → 전체의 약 절반). 미설정이면 기존 시드 그대로 재현.
+`NX_EDGE=P`: 생성 단계 중 비율 P를 경계 전략으로 — 1..17바이트 패킷 연속(tiny-run), 16/64바이트 경계 ±1 길이에
+끝에서 끝나는 매치(tail-len), 한 gram을 반복한 최대 길이 payload(gram-flood), 끝 매치 큰 패킷 직후 작은 매치 패킷(tail-then-tiny).
+미설정이면 기존 시드 그대로 재현.
 기본 대상은 이 저장소의 `vitis/hw/nicxion_rev2_perf_opt` + `vitis/sw/nicxion_rev2_perf_opt`(xclbin은 `<커널 dir>/hw/kernel.xclbin`, 호스트는 `make host`로 먼저 빌드).
 
 **카드 사용 중에는 돌리지 마십시오** — 반복마다 `xrt-smi reset`을 합니다

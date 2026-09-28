@@ -103,13 +103,16 @@ fn hw_round(env: &hw::Env, db: &Path, rules: &Path, pcap: &Path, timeout: u64)
 }
 
 fn main() {
-    let a = parse_args();
+    let mut a = parse_args();
     if !a.rules.exists() {
         eprintln!("rules file not found: {} (use --rules FILE or NX_RULES)", a.rules.display());
         std::process::exit(2);
     }
     let env = hw::Env::from_env();
     fs::create_dir_all(&a.out).expect("create out dir");
+    // The host binary runs in its own directory, so every path it gets must be absolute.
+    a.out = fs::canonicalize(&a.out).expect("resolve out dir");
+    a.rules = fs::canonicalize(&a.rules).expect("resolve rules file");
     let mut rng = rng::Rng::new(a.seed);
     let cfg = gen::GenCfg { max_payload: a.max_payload };
 
