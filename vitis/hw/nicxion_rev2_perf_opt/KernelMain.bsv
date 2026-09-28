@@ -557,8 +557,7 @@ module mkKernelMain(KernelMainIfc);
                     found = True;
                 end
             Bit#(32) key18 = zeroExtend(makeKey18(g));
-            let req = mkBloomReq(key18, g.gram[23:0], kk, g.anchor,
-                                 0, scanEpoch, True);
+            let req = mkBloomReq(key18, g.gram[23:0], kk, g.anchor, scanEpoch);
             return found ? tagged Valid req : tagged Invalid;
         endfunction
 
@@ -603,7 +602,7 @@ module mkKernelMain(KernelMainIfc);
         let gr = gramRouteQ.first; gramRouteQ.deq;
         routeDecr.wset(gr.epoch);
         exactIncr.wset(gr.epoch);
-        exactMatch.putRequest(gr.vreq, gr.payLen, gr.epoch);
+        exactMatch.putRequest(gr.vreq, gr.epoch);
 `ifdef NX_TRACE
         $display("TR %0d ROUTE e=%0d rule=%0d", timerTotal.value, gr.epoch, gr.vreq.ruleId);
 `endif

@@ -15,9 +15,7 @@ typedef struct {
     Bit#(24) pktAnchorGram;
     Bit#(18) pktNextGramKey;
     Bit#(32) anchor;
-    Bit#(32) payLen;
     Epoch    epoch;
-    Bool     viable2;
 } BloomCtx deriving (Bits);
 
 typedef struct { Bit#(64) key; BloomCtx ctx; } BloomReq deriving (Bits);
@@ -35,14 +33,13 @@ typedef struct { Epoch epoch; Bit#(3) count; } BloomRejectInfo deriving (Bits);
 // key (gram18<<18)|nextGramKey, matching the DB generator's bloom_probe).
 function BloomReq mkBloomReq(Bit#(32) gram, Bit#(24) pktAnchorGram,
                              Bit#(18) pktNextGramKey, Bit#(32) anchor,
-                             Bit#(32) payLen, Epoch epoch,
-                             Bool viable2);
+                             Epoch epoch);
     return BloomReq {
         key: zeroExtend({gram[17:0], pktNextGramKey}),
         ctx: BloomCtx {
             gram: gram, pktAnchorGram: pktAnchorGram,
             pktNextGramKey: pktNextGramKey, anchor: anchor,
-            payLen: payLen, epoch: epoch, viable2: viable2 } };
+            epoch: epoch } };
 endfunction
 
 // Hash pipeline stages (see bloomHashAdvance).

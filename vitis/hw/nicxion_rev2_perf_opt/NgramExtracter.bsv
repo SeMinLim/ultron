@@ -40,8 +40,6 @@ interface NgramExtracterIfc;
     method Bool   accumulating;
 endinterface
 
-function Bit#(8) foldCase(Bit#(8) b) =
-    ((b >= 8'h41) && (b <= 8'h5A)) ? (b | 8'h20) : b;
 
 (* synthesize *)
 module mkNgramExtracter(NgramExtracterIfc);

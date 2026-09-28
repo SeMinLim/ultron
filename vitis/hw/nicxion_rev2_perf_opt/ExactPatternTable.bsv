@@ -6,11 +6,14 @@ import SpecialFIFOs::*;
 import Vector::*;
 
 // 8K x 512b pattern store as 16 tiles indexed by ruleId[3:0] (5k-rule build).
-// NReadPorts independent read ports run in parallel: port g owns the tiles
-// whose index has low 2 bits == g, so no tile is shared between ports and
-// pattern data is never duplicated.
+// NReadPorts independent read ports run in parallel (one per ExactMatch engine):
+// port g owns the tiles whose index has low log2(NReadPorts) bits == g, so no
+// tile is shared between ports and pattern data is never duplicated.  More
+// ports only split the same 16 tiles further (8 ports: 2 tiles each).
 typedef 16 NTiles;
 typedef  4 NReadPorts;
+typedef TLog#(NReadPorts)                  PortBits;   // tile index low bits = port
+typedef TLog#(TDiv#(NTiles, NReadPorts))   HiBits;     // tile index high bits = tile within port
 
 interface PatReadPortIfc;
     method Action readPattern(Bit#(16) ruleId);
@@ -34,8 +37,8 @@ module mkExactPatternTable(ExactPatternTableIfc);
     Vector#(NReadPorts, Vector#(TDiv#(NTiles, NReadPorts), BRAM_DUAL_PORT#(Bit#(9), Bit#(512))))
         own = genWith(portTiles);
 
-    Vector#(NReadPorts, FIFOF#(Bit#(2)))   pend1 <- replicateM(mkPipelineFIFOF);
-    Vector#(NReadPorts, FIFOF#(Bit#(2)))   pend2 <- replicateM(mkPipelineFIFOF);
+    Vector#(NReadPorts, FIFOF#(Bit#(HiBits))) pend1 <- replicateM(mkPipelineFIFOF);
+    Vector#(NReadPorts, FIFOF#(Bit#(HiBits))) pend2 <- replicateM(mkPipelineFIFOF);
     Vector#(NReadPorts, FIFOF#(Bit#(512))) outQ  <- replicateM(mkSizedFIFOF(4));
 
     for (Integer g = 0; g < valueOf(NReadPorts); g = g + 1) begin
@@ -43,7 +46,7 @@ module mkExactPatternTable(ExactPatternTableIfc);
             pend2[g].enq(pend1[g].first); pend1[g].deq;
         endrule
         rule capture;
-            Bit#(2) hi = pend2[g].first; pend2[g].deq;
+            Bit#(HiBits) hi = pend2[g].first; pend2[g].deq;
             outQ[g].enq(own[g][hi].b.read);
         endrule
     end
@@ -71,7 +74,9 @@ module mkExactPatternTable(ExactPatternTableIfc);
         rdPorts[g] =
             interface PatReadPortIfc;
                 method Action readPattern(Bit#(16) ruleId);
-                    Bit#(2) hi   = ruleId[3:2];   // ruleId[1:0] == g (engine routing)
+                    // ruleId[PortBits-1:0] == g (engine routing); the rest of the tile index picks the tile
+                    Bit#(4)      tile = ruleId[3:0];
+                    Bit#(HiBits) hi   = truncate(tile >> valueOf(PortBits));
                     Bit#(9) addr = ruleId[12:4];
                     own[g][hi].b.put(False, addr, ?);
                     pend1[g].enq(hi);

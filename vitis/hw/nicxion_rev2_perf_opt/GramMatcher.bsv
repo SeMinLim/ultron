@@ -16,6 +16,8 @@ typedef 64 NHtBanks;
 typedef 30 SubKeyBits;
 
 typedef 13 ChainIdxBits;
+typedef 10 ChainLenBits;
+typedef TAdd#(ChainLenBits, ChainIdxBits) CuckooValBits;
 typedef 8192 NChainEntries;
 
 typedef struct {
@@ -50,21 +52,16 @@ typedef struct {
 
 typedef struct {
     Bit#(32) anchor;
-    Bit#(32) payLen;
     Epoch epoch;
     Bit#(24) pktAnchorGram;
     Bit#(18) pktNextGramKey;
-    Bool     viable2;
 } GramCtx deriving (Bits);
 
 typedef struct {
     Bool      hit;
     VerifyReq vreq;
-    Bit#(32)  payLen;
     Epoch epoch;
-    Bool      viable2;
     Bool      lastInChain;
-    Bool      bloomReject;   // True only for results killed by the bloom pre-filter
 } GramResult deriving (Bits);
 
 // A DB-load entry, queued so loadEntry's ready signal is one local FIFO flag
@@ -75,14 +72,22 @@ typedef struct {
     Bit#(ChainIdxBits)  idx;
     ChainEntry          ce;
     Bool                isFirst;
+    Bool                isLast;
 } LoadReq deriving (Bits);
 
 // A cuckoo insert routed to its bank group (low 3 bits pick the bank in it).
 typedef struct {
     Bit#(3)            bankLo;
     Bit#(SubKeyBits)   subKey;
-    Bit#(ChainIdxBits) idx;
+    Bit#(CuckooValBits) val;     // {chain length, first chain index}
 } InsReq deriving (Bits);
+
+// One outstanding AssignsTable read of the chain walk.
+typedef struct {
+    GramCtx            ctx;
+    Bit#(ChainIdxBits) idx;
+    Bool               checkTail;   // its entry decides if a saturated chain continues
+} ChainRead deriving (Bits);
 
 // A cuckoo lookup whose bank is already decided, one register stage ahead of
 // the 64-way bank dispatch.
@@ -116,7 +121,7 @@ module mkGramMatcher(GramMatcherIfc);
     // only appear at large rulesets (451 rules passed, 5,000 failed).
     // Simulated key loss: logSz=7 -> 702, 8 -> 17, 9 -> 0.
     // With SubKeyBits=30 each slot stores 44 bits (1 valid + 30 key + 13 val).
-    Vector#(NHtBanks, CuckooHashIfc#(SubKeyBits, ChainIdxBits, 9)) banks
+    Vector#(NHtBanks, CuckooHashIfc#(SubKeyBits, CuckooValBits, 9)) banks
         <- replicateM(mkCuckooHash);
 
     BRAM_Configure cfgAssigns = defaultValue;
@@ -146,13 +151,31 @@ module mkGramMatcher(GramMatcherIfc);
         lkGrpQ  <- replicateM(mkFIFOF);
     Vector#(8, FIFOF#(InsReq))  insGrpQ <- replicateM(mkFIFOF);
     // Cuckoo response, registered before the chain/miss decision.
-    FIFOF#(Tuple2#(Maybe#(Bit#(ChainIdxBits)), GramCtx)) lkRespQ <- mkFIFOF;
+    FIFOF#(Tuple2#(Maybe#(Bit#(CuckooValBits)), GramCtx)) lkRespQ <- mkFIFOF;
     // Chain entries, registered before they are formatted into outQ.
     FIFOF#(Tuple2#(ChainEntry, GramCtx)) chainOutQ <- mkFIFOF;
 
-    Reg#(Bool)               chainBusy <- mkReg(False);
-    Reg#(Bit#(ChainIdxBits)) chainIdx  <- mkRegU;
-    Reg#(GramCtx)            chainCtx  <- mkRegU;
+    // Chain walk: the first read issues with the cuckoo response, the rest one
+    // per cycle from chainIssue; each read's context waits in chainCtxQ for its
+    // response (in order).
+    Reg#(Bool)                walking  <- mkReg(False);
+    Reg#(Bit#(ChainIdxBits))  walkIdx  <- mkRegU;
+    Reg#(Bit#(ChainLenBits))  walkLeft <- mkRegU;
+    Reg#(GramCtx)             walkCtx  <- mkRegU;
+    Reg#(Bool)                walkSat  <- mkRegU;   // chain length saturated (>= 1023)
+    FIFOF#(ChainRead)         chainCtxQ <- mkSizedFIFOF(4);
+    FIFOF#(ChainRead)         tailQ    <- mkFIFOF;
+    Reg#(Bool)                longSet  <- mkReg(False);
+    Reg#(Bool)                longClr  <- mkReg(False);
+    Bool longActive = longSet != longClr;
+
+    // DB load: a chain's cuckoo entry is inserted at its last entry, when the
+    // length is known (entries of one chain arrive consecutively, idx in order).
+    Reg#(Bit#(6))             headBank   <- mkRegU;
+    Reg#(Bit#(SubKeyBits))    headSubKey <- mkRegU;
+    Reg#(Bit#(ChainIdxBits))  headIdx    <- mkRegU;
+    Reg#(Bit#(ChainLenBits))  headLen    <- mkRegU;
+    Bit#(ChainLenBits)        maxLen     = maxBound;
 
     function Bit#(18) mix18(Bit#(18) k);
         Bit#(18) x = k ^ (k >> 6);
@@ -181,11 +204,10 @@ module mkGramMatcher(GramMatcherIfc);
                 bank:   bankOf(ctxv.gram),
                 subKey: subKeyOf(ctxv.gram, ctxv.pktNextGramKey),
                 ctx: GramCtx {
-                    anchor: ctxv.anchor, payLen: ctxv.payLen,
+                    anchor: ctxv.anchor,
                     epoch: ctxv.epoch,
                     pktAnchorGram: ctxv.pktAnchorGram,
-                    pktNextGramKey: ctxv.pktNextGramKey,
-                    viable2: ctxv.viable2 } });
+                    pktNextGramKey: ctxv.pktNextGramKey } });
         if (last) passUnpacking <= False;
         else      passUnpackIdx <= i + 1;
     endrule
@@ -215,41 +237,69 @@ module mkGramMatcher(GramMatcherIfc);
         lkRespQ.enq(tuple2(v, ctx));
     endrule
 
-    rule cuckooLookupResp (!chainBusy);
+    // checkTail marks the read whose entry decides whether a saturated chain
+    // continues (its 1023rd entry, then each tail entry).
+    function Action readChain(Bit#(ChainIdxBits) idx, GramCtx ctx, Bool checkTail);
+        action
+            assignsTbl.portB.request.put(BRAMRequest {
+                write: False, responseOnWrite: False, address: idx, datain: ? });
+            chainCtxQ.enq(ChainRead { ctx: ctx, idx: idx, checkTail: checkTail });
+        endaction
+    endfunction
+
+    rule cuckooLookupResp (!walking && !longActive);
         match { .v, .ctx } = lkRespQ.first; lkRespQ.deq;
         case (v) matches
             tagged Valid .b: begin
-                Bit#(ChainIdxBits) idx = unpack(b);
-                assignsTbl.portB.request.put(BRAMRequest {
-                    write: False, responseOnWrite: False,
-                    address: idx, datain: ? });
-                chainIdx  <= idx;
-                chainCtx  <= ctx;
-                chainBusy <= True;
+                Bit#(ChainLenBits) len = truncateLSB(b);
+                Bit#(ChainIdxBits) idx = truncate(b);
+                Bool sat = (len == maxLen);
+                readChain(idx, ctx, False);          // len >= 1; saturated means len > 1
+                if (len > 1) begin
+                    walking  <= True;
+                    walkIdx  <= idx + 1;
+                    walkLeft <= len - 1;
+                    walkCtx  <= ctx;
+                    walkSat  <= sat;
+                end
+                if (sat) longSet <= !longSet;
             end
             tagged Invalid: begin
                 outQ.enq(GramResult {
                     hit: False, vreq: unpack(0),
-                    payLen:  ctx.payLen, epoch: ctx.epoch,
-                    viable2: ctx.viable2,
-                    lastInChain: True, bloomReject: False });
+                    epoch: ctx.epoch,
+                    lastInChain: True });
             end
         endcase
     endrule
 
-    // Only the isLast bit feeds the next-request decision; the entry itself is
-    // registered in chainOutQ and formatted into outQ one cycle later.
-    rule chainFollow (chainBusy);
+    // Remaining entries of a chain, back to back (no wait on each response).
+    rule chainIssue (walking);
+        readChain(walkIdx, walkCtx, walkSat && walkLeft == 1);
+        walkIdx  <= walkIdx + 1;
+        walkLeft <= walkLeft - 1;
+        if (walkLeft == 1) walking <= False;
+    endrule
+
+    // Tail of a saturated chain: one read per entry until isLast.  Only runs
+    // while longActive, when no other chain is issuing.
+    (* descending_urgency = "tailIssue, chainIssue, cuckooLookupResp" *)
+    rule tailIssue;
+        let r = tailQ.first; tailQ.deq;
+        readChain(r.idx, r.ctx, True);
+    endrule
+
+    // Responses come back in issue order; the entry is registered in chainOutQ
+    // and formatted into outQ one cycle later.  lastInChain is still the
+    // entry's own isLast (the length only schedules the reads).
+    rule chainCollect;
         let raw <- assignsTbl.portB.response.get;
+        let r = chainCtxQ.first; chainCtxQ.deq;
         ChainEntry ce = unpack(raw);
-        chainOutQ.enq(tuple2(ce, chainCtx));
-        if (ce.isLast) begin
-            chainBusy <= False;
-        end else begin
-            assignsTbl.portB.request.put(BRAMRequest {
-                write: False, responseOnWrite: False,
-                address: chainIdx + 1, datain: ? });
-            chainIdx <= chainIdx + 1;
+        chainOutQ.enq(tuple2(ce, r.ctx));
+        if (r.checkTail) begin
+            if (ce.isLast) longClr <= !longClr;
+            else           tailQ.enq(ChainRead { ctx: r.ctx, idx: r.idx + 1, checkTail: True });
         end
     endrule
 
@@ -271,10 +321,8 @@ module mkGramMatcher(GramMatcherIfc);
                 pktNextGramKey: cc.pktNextGramKey,
                 anchorGram:    ce.info.anchorGram,
                 pktAnchorGram: cc.pktAnchorGram },
-            payLen:  cc.payLen,
             epoch:   cc.epoch,
-            viable2: cc.viable2,
-            lastInChain: ce.isLast, bloomReject: False });
+            lastInChain: ce.isLast });
     endrule
 
     rule doLoad;
@@ -282,12 +330,21 @@ module mkGramMatcher(GramMatcherIfc);
         assignsTbl.portA.request.put(BRAMRequest {
             write: True, responseOnWrite: False,
             address: l.idx, datain: pack(l.ce) });
-        if (l.isFirst) begin
+        // Head of the chain this entry belongs to, and its length so far.
+        Bit#(6)            hb  = l.isFirst ? l.bank   : headBank;
+        Bit#(SubKeyBits)   hk  = l.isFirst ? l.subKey : headSubKey;
+        Bit#(ChainIdxBits) hi  = l.isFirst ? l.idx    : headIdx;
+        Bit#(ChainLenBits) len = l.isFirst ? 1        : (headLen == maxLen ? maxLen : headLen + 1);
+        if (l.isLast) begin
             for (Integer g = 0; g < 8; g = g + 1)
-                if (l.bank[5:3] == fromInteger(g))
-                    insGrpQ[g].enq(InsReq { bankLo: l.bank[2:0], subKey: l.subKey, idx: l.idx });
-            pendInsertQ.enq(tagged Valid l.bank);
+                if (hb[5:3] == fromInteger(g))
+                    insGrpQ[g].enq(InsReq { bankLo: hb[2:0], subKey: hk, val: {len, hi} });
+            pendInsertQ.enq(tagged Valid hb);
         end else begin
+            headBank   <= hb;
+            headSubKey <= hk;
+            headIdx    <= hi;
+            headLen    <= len;
             pendInsertQ.enq(tagged Invalid);
         end
     endrule
@@ -296,7 +353,7 @@ module mkGramMatcher(GramMatcherIfc);
         rule insertBank;
             let r = insGrpQ[g].first; insGrpQ[g].deq;
             for (Integer j = 0; j < 8; j = j + 1)
-                if (r.bankLo == fromInteger(j)) banks[g * 8 + j].insert(r.subKey, r.idx);
+                if (r.bankLo == fromInteger(j)) banks[g * 8 + j].insert(r.subKey, r.val);
         endrule
 
     rule emitInsertAck (pendInsertQ.notEmpty);
@@ -317,7 +374,7 @@ module mkGramMatcher(GramMatcherIfc);
                             RuleInfo info, Bool isFirst, Bool isLast);
         loadQ.enq(LoadReq {
             bank: bankOf(gram), subKey: subKeyOf(gram, info.nextGramKey), idx: idx,
-            ce: ChainEntry { info: info, isLast: isLast, pad: 0 }, isFirst: isFirst });
+            ce: ChainEntry { info: info, isLast: isLast, pad: 0 }, isFirst: isFirst, isLast: isLast });
     endmethod
 
     method ActionValue#(Bool) insertAck;

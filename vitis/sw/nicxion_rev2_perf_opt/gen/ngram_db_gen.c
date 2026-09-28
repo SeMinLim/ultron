@@ -181,6 +181,11 @@ static void build_ght_from_singleton(const SingletonResult *sr)
             unique_grams, shared_grams,
             shared_grams ? (double)shared_rules / shared_grams : 0.0,
             max_chain);
+    /* The kernel stores each chain's length with its cuckoo entry in
+     * GramMatcher::ChainLenBits (10) bits, saturating: a longer chain still works,
+     * its entries past 1023 are just walked one at a time. */
+    if (max_chain > 1023)
+        fprintf(stderr, "note: chain of %d entries > 1023; its tail is walked at the slower rate\n", max_chain);
 }
 
 /* rule_loader already case-folded; just copy into the indexed slot. */
