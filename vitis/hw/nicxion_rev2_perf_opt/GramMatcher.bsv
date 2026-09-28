@@ -133,12 +133,10 @@ module mkGramMatcher(GramMatcherIfc);
     FIFOF#(GramCtx)    ctxQ      <- mkSizedFIFOF(64);
     FIFOF#(GramResult) outQ      <- mkSizedFIFOF(64);
 
-    // Bloom pre-filter (BloomFilter.bsv).  Passing lanes (rare) are unpacked
-    // here 1/cycle into the cuckoo backend; rejects go straight to getReject.
+    // Bloom pre-filter (BloomFilter.bsv).  Passing lanes are drained here, one
+    // per cycle, into the 1-wide cuckoo backend; rejects go straight to getReject.
     BloomFilterIfc bloomF <- mkBloomFilter;
-    Reg#(Bit#(3))    passUnpackIdx <- mkReg(0);
-    Reg#(Bool)       passUnpacking <- mkReg(False);
-    Reg#(BloomPass4) passCur       <- mkRegU;
+    Reg#(BloomPass4) passCur <- mkReg(replicate(tagged Invalid));   // lanes still to send
 
     // pendInsertQ preserves load-side ack ordering across banked and non-first entries.
     FIFOF#(Maybe#(Bit#(6))) pendInsertQ <- mkSizedFIFOF(8);
@@ -188,18 +186,15 @@ module mkGramMatcher(GramMatcherIfc);
         return { mix18(g0[17:0])[17:6], g1 };
     endfunction
 
-    // Drain one pass-vector across cycles into the 1-wide cuckoo backend.
-    rule passLoad (!passUnpacking);
-        let pv <- bloomF.pass;
-        passCur       <= pv;
-        passUnpackIdx <= 0;
-        passUnpacking <= True;
-    endrule
-
-    rule passUnpack (passUnpacking);
-        Bit#(3) i = passUnpackIdx;
-        Bool last = (i == fromInteger(valueOf(NBloomLanes) - 1));
-        if (passCur[i] matches tagged Valid .ctxv)
+    rule passDrain;
+        BloomPass4       rest = passCur;
+        Maybe#(BloomCtx) sel  = tagged Invalid;
+        for (Integer ln = valueOf(NBloomLanes) - 1; ln >= 0; ln = ln - 1)
+            if (isValid(passCur[ln])) sel = passCur[ln];
+        Bool found = False;
+        for (Integer ln = 0; ln < valueOf(NBloomLanes); ln = ln + 1)
+            if (!found && isValid(passCur[ln])) begin rest[ln] = tagged Invalid; found = True; end
+        if (sel matches tagged Valid .ctxv)
             dispQ.enq(DispReq {
                 bank:   bankOf(ctxv.gram),
                 subKey: subKeyOf(ctxv.gram, ctxv.pktNextGramKey),
@@ -208,8 +203,14 @@ module mkGramMatcher(GramMatcherIfc);
                     epoch: ctxv.epoch,
                     pktAnchorGram: ctxv.pktAnchorGram,
                     pktNextGramKey: ctxv.pktNextGramKey } });
-        if (last) passUnpacking <= False;
-        else      passUnpackIdx <= i + 1;
+        Bool restEmpty = True;
+        for (Integer ln = 0; ln < valueOf(NBloomLanes); ln = ln + 1)
+            if (isValid(rest[ln])) restEmpty = False;
+        if (restEmpty && bloomF.passReady) begin
+            let pv <- bloomF.pass;
+            passCur <= pv;
+        end else
+            passCur <= rest;
     endrule
 
     // Bank index is registered here, so the 64-way ready select is shallow.

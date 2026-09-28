@@ -73,6 +73,7 @@ interface BloomFilterIfc;
     method Action req(BloomReq4 reqs);
     // Lanes that passed (at least one valid), in request order.
     method ActionValue#(BloomPass4)      pass;
+    method Bool                          passReady;   // a pass vector is waiting
     // Rejected lanes of one request: epoch + count.
     method ActionValue#(BloomRejectInfo) reject;
     // DB load: broadcast to every lane's copies.
@@ -228,6 +229,8 @@ module mkBloomFilter(BloomFilterIfc);
     method Action req(BloomReq4 reqs);
         bloomReqQ.enq(reqs);
     endmethod
+
+    method Bool passReady = passVecQ.notEmpty;
 
     method ActionValue#(BloomPass4) pass;
         let v = passVecQ.first; passVecQ.deq; return v;
