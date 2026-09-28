@@ -4,5 +4,7 @@
 **/*.log
 **/*/hw_emu
 **/*/hw
+# vitis/hw holds kernel sources (vitis/hw/<name>); each kernel's own hw/ build dir stays ignored
+!vitis/hw
 **/*.codex
 **/*.txt
