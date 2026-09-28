@@ -3,6 +3,7 @@ package KernelMain;
 import FIFO::*;
 import FIFOF::*;
 import ConfigReg::*;
+import DReg::*;
 import Vector::*;
 
 import BitmapUram::*;
@@ -119,10 +120,15 @@ module mkKernelMain(KernelMainIfc);
     Reg#(Bool)   booted <- mkReg(False);
 
     Reg#(Epoch)     curEpoch     <- mkReg(0);
-    Reg#(PktIdx)    curPktIdx    <- mkRegU;   // set in startPacket
     Reg#(Bool)      metaReady    <- mkReg(False);
 
-    Vector#(NEpoch, Reg#(Bool))     epochInUse    <- replicateM(mkReg(False));
+    // Epoch allocation: set toggled at admission (feedBeat), clr at retire, so
+    // each register has one writer.  ConfigReg: precomputeAdmit reads them after
+    // feedBeat in the schedule (old value plus admitNow).
+    Vector#(NEpoch, Reg#(Bool))     epochUseSet   <- replicateM(mkConfigReg(False));
+    Vector#(NEpoch, Reg#(Bool))     epochUseClr   <- replicateM(mkConfigReg(False));
+    function Bool useDiffers(Reg#(Bool) a, Reg#(Bool) b) = a != b;
+    Vector#(NEpoch, Bool)           epochInUse    = zipWith(useDiffers, epochUseSet, epochUseClr);
     Vector#(NEpoch, Reg#(PktIdx))   epochPktIdx    <- replicateM(mkRegU);
     Vector#(NEpoch, Reg#(Bit#(32))) admitCyc       <- replicateM(mkRegU);
 `ifdef NX_DEBUG
@@ -184,29 +190,14 @@ module mkKernelMain(KernelMainIfc);
 
     // Inter-stage elastic queues: bitmap->scan (gramSideQ, hitPairQ), gram->route.
     FIFOF#(GramSide)   gramSideQ  <- mkSizedFIFOF(16);
-    FIFOF#(ScanJob)    hitPairQ   <- mkSizedFIFOF(16);
+    FIFOF#(ScanJob)    hitPairQ   <- mkSizedFIFOF(32);
     FIFOF#(GramResult)                                      gramRouteQ <- mkSizedFIFOF(16);
-
-
-
 
     function Bool anyFreeEpoch();
         Bool any = False;
         for (Integer i = 0; i < valueOf(NEpoch); i = i + 1)
             any = any || !epochInUse[i];
         return any;
-    endfunction
-
-    function Epoch chooseFreeEpoch();
-        Epoch chosen = 0;
-        Bool found = False;
-        for (Integer i = 0; i < valueOf(NEpoch); i = i + 1) begin
-            if (!found && !epochInUse[i]) begin
-                chosen = fromInteger(i);
-                found = True;
-            end
-        end
-        return chosen;
     endfunction
 
     function Bool anyEpochInUse();
@@ -283,40 +274,38 @@ module mkKernelMain(KernelMainIfc);
         endrule
     end
 
+    // Admission is decided from registers computed the cycle before, so the
+    // first slice of a packet is fed in the cycle it is admitted:
+    //   admitIdx  - pktIdx of the next packet to admit (packets arrive in order),
+    //   admitOkR  - that packet is inside the result reorder window,
+    //   freeOkR / freeEpR - a free epoch, not counting the one allocated this cycle.
+    // Both flags only turn stale in the safe direction (a retire or a window
+    // advance shows up one cycle later).
+    Reg#(PktIdx)  admitIdx  <- mkConfigReg(0);
     Reg#(Bool)    admitOkR  <- mkConfigReg(False);
-    Reg#(Bit#(8)) admitTagR <- mkConfigReg(0);
+    Reg#(Bool)    freeOkR   <- mkConfigReg(False);
+    Reg#(Epoch)   freeEpR   <- mkConfigReg(0);
+    RWire#(Epoch) admitNow  <- mkRWire;
+    Reg#(Maybe#(Epoch)) admitPrev <- mkDReg(tagged Invalid);   // admitted last cycle
+
     (* fire_when_enabled, no_implicit_conditions *)
     rule precomputeAdmit;
-        admitOkR  <= resultWriter.canAdmit(pktReader.headPktIdx);
-        admitTagR <= pktReader.headPktIdx[7:0];
+        PktIdx nextIdx = isValid(admitNow.wget) ? admitIdx + 1 : admitIdx;
+        admitOkR <= resultWriter.canAdmit(nextIdx);
+        Bool  found = False;
+        Epoch chosen = 0;
+        for (Integer i = 0; i < valueOf(NEpoch); i = i + 1)
+            if (!found && !epochInUse[i] && admitNow.wget != tagged Valid fromInteger(i)) begin
+                chosen = fromInteger(i);
+                found  = True;
+            end
+        freeOkR <= found;
+        freeEpR <= chosen;
     endrule
 
-    rule startPacket(state == KProcess && !metaReady && pktReader.beatAvailable
-                     && pktReader.beat.first && anyFreeEpoch
-                     && admitOkR && admitTagR == pktReader.headPktIdx[7:0]);
-        Epoch e = chooseFreeEpoch;
-        epochInUse[e]  <= True;
-        epochPktIdx[e] <= pktReader.beat.pktIdx;
-        // The reader only exposes complete packets, so the 5-tuple and final
-        // length are known here, before any byte of this packet is fed.
-        pktMeta.put(e, pktReader.beat.meta);
-        payTotalLen[e] <= pktReader.beat.payloadLen;
-        admitCyc[e]    <= timerTotal.value;
-        curEpoch       <= e;
-        curPktIdx      <= pktReader.beat.pktIdx;
-        metaReady      <= True;     // "packet in progress"
-`ifdef NX_TRACE
-        $display("TR %0d START e=%0d pkt=%0d len=%0d", timerTotal.value, e, pktReader.beat.pktIdx, pktReader.beat.payloadLen);
-`endif
-        feedDone[e]    <= False;
-        if (!procStarted) begin     // first packet admitted -> start proc clock
-            procStarted   <= True;
-            firstAdmitCyc <= timerTotal.value;
-        end
-    endrule
-
-    // feedBeat: stream the armed packet's beats into ngram/exact; capture the
-    // 5-tuple + final length on the last beat. No resultWriter read -> no cycle.
+    // feedBeat: stream the armed packet's beats into ngram/exact.  On a packet's
+    // first slice it also admits the packet (epoch allocation, 5-tuple and final
+    // length; the reader only exposes complete packets, so both are known here).
     // The n-gram front end is NBitmapLanes bytes wide, which is narrower than a
     // 512-bit beat, so each beat is fed as ChunksPerBeat consecutive slices.
     // The beat is retired (advanceBeat) and its end-of-packet side effects are
@@ -325,10 +314,11 @@ module mkKernelMain(KernelMainIfc);
     Integer chunksPerBeat = 64 / valueOf(NBitmapLanes);
     Reg#(Bit#(3)) feedChunk <- mkReg(0);
 
-    rule feedBeat(state == KProcess && metaReady && pktReader.beatAvailable);
-        let bt = pktReader.beat;
-
-        Epoch e = curEpoch;
+    rule feedBeat(state == KProcess && pktReader.beatAvailable &&
+                  (metaReady || (pktReader.beat.first && freeOkR && admitOkR)));
+        let  bt    = pktReader.beat;
+        Bool admit = !metaReady;
+        Epoch e    = admit ? freeEpR : curEpoch;
 
         Bit#(7) laneW  = fromInteger(valueOf(NBitmapLanes));
         Bit#(7) start  = zeroExtend(feedChunk) * laneW;
@@ -336,28 +326,49 @@ module mkKernelMain(KernelMainIfc);
         Bit#(7) cnt    = (remain > laneW) ? laneW : remain;
         Bool lastChunk = ((start + cnt) >= bt.validBytes)
                          || (feedChunk == fromInteger(chunksPerBeat - 1));
+        Bool pktEnd    = lastChunk && bt.last;
+
+        if (admit) begin
+            admitNow.wset(e);
+            admitPrev      <= tagged Valid e;
+            admitIdx       <= admitIdx + 1;
+            epochUseSet[e] <= !epochUseSet[e];
+            epochPktIdx[e] <= bt.pktIdx;
+            pktMeta.put(e, bt.meta);
+            payTotalLen[e] <= bt.payloadLen;
+            admitCyc[e]    <= timerTotal.value;
+            curEpoch       <= e;
+`ifdef NX_TRACE
+            $display("TR %0d START e=%0d pkt=%0d len=%0d", timerTotal.value, e, bt.pktIdx, bt.payloadLen);
+`endif
+            if (!procStarted) begin     // first packet admitted -> start proc clock
+                procStarted   <= True;
+                firstAdmitCyc <= timerTotal.value;
+            end
+        end
 
         // tlast rides the final slice so the extracter flushes its carry there.
-        ngram.putBytes(bt.word, start, cnt, bt.last && lastChunk, e);
+        ngram.putBytes(bt.word, start, cnt, pktEnd, e);
         ngramIncr.wset(e);
 
         if (feedChunk == 0)
             exactMatch.putPayloadWord(bt.word, bt.last, e);
 
+        // feedDone / metaReady: cleared at admission, set at the packet's end
+        // (both in one cycle for a single-slice packet).
+        if (admit || pktEnd) begin
+            feedDone[e] <= pktEnd;
+            metaReady   <= !pktEnd;
+        end
+`ifdef NX_TRACE
+        if (pktEnd) $display("TR %0d FEEDDONE e=%0d", timerTotal.value, e);
+`endif
+
         if (lastChunk) begin
             pktReader.advanceBeat;
-            feedChunk      <= 0;
-
-            if (bt.last) begin
-                feedDone[e] <= True;
-`ifdef NX_TRACE
-                $display("TR %0d FEEDDONE e=%0d", timerTotal.value, e);
-`endif
-                metaReady   <= False;
-            end
-        end else begin
+            feedChunk <= 0;
+        end else
             feedChunk <= feedChunk + 1;
-        end
     endrule
 
     // bm1 needs anchor+3 lookahead for lanes 61..63.
@@ -384,7 +395,10 @@ module mkKernelMain(KernelMainIfc);
         for (Integer i = 0; i < valueOf(NEpoch); i = i + 1)
             pipeDoneR[i] <= epochPipeDone(fromInteger(i));
     endrule
-    function Bool epochDoneR(Epoch e) = pipeDoneR[e] && feedDone[e];
+    // pipeDoneR lags a cycle: for an epoch admitted last cycle (admitPrev) it
+    // still holds the previous packet's value, and a one-slice packet already
+    // has feedDone set.
+    function Bool epochDoneR(Epoch e) = pipeDoneR[e] && feedDone[e] && admitPrev != tagged Valid e;
 
     function Bool anyTailReady();
         Bool any = False;
@@ -435,25 +449,44 @@ module mkKernelMain(KernelMainIfc);
         return tuple3(bm0K, bm1K, bm1V);
     endfunction
 
-    rule absorbNgramBatch(state == KProcess && ngram.gramsReady);
-        let b <- ngram.getGrams;
-        Epoch e = b.epoch;
-        ngramDecr.wset(e);
-        if (!hasPrev[e]) begin
-            prevBatch[e] <= b.grams;
-            hasPrev[e]   <= True;
-            tailReady[e] <= b.last;
-        end else begin
-            let prev = prevBatch[e];
-            match { .bm0K, .bm1K, .bm1V } = buildKeys(prev, b.grams, True);
+    // A finished packet's last batch (tailReady) has no lookahead and is looked
+    // up on its own.  A packet's first batch is only stored, which leaves the
+    // bitmap ports free in that cycle, so a pending tail goes there; flushTail
+    // covers the case where no new packet follows.
+    function Action lookupBatch(Epoch e, Vector#(NBitmapLanes, Maybe#(NgramOut)) grams,
+                                Vector#(NBitmapLanes, Maybe#(NgramOut)) lookahead,
+                                Bool hasLookahead);
+        action
+            match { .bm0K, .bm1K, .bm1V } = buildKeys(grams, lookahead, hasLookahead);
             bm0_s1.lookup(bm0K);
             bm0_s2.lookup(bm0K);
             bm1.lookup(bm1K);
-            gramSideQ.enq(GramSide { epoch: e, grams: prev, nextValid: bm1V, nextKey: bm1K });
+            gramSideQ.enq(GramSide { epoch: e, grams: grams, nextValid: bm1V, nextKey: bm1K });
             bitmapIncr.wset(e);
-            prevBatch[e] <= b.grams;
-            tailReady[e] <= b.last;
-        end
+        endaction
+    endfunction
+
+    rule absorbNgramBatch(state == KProcess && ngram.gramsReady);
+        let b <- ngram.getGrams;
+        Epoch e = b.epoch;
+        Epoch t = chooseTailReady;
+        ngramDecr.wset(e);
+        Vector#(NEpoch, Bool) hp = readVReg(hasPrev);
+        Vector#(NEpoch, Bool) tr = readVReg(tailReady);
+        if (!hasPrev[e]) begin
+            // t != e: a tail-ready epoch still holds its last batch (hasPrev).
+            if (anyTailReady) begin
+                lookupBatch(t, prevBatch[t], prevBatch[t], False);
+                hp[t] = False;
+                tr[t] = False;
+            end
+            hp[e] = True;
+        end else
+            lookupBatch(e, prevBatch[e], b.grams, True);
+        prevBatch[e] <= b.grams;
+        tr[e] = b.last;
+        writeVReg(hasPrev, hp);
+        writeVReg(tailReady, tr);
     endrule
 
     // Both rules drive the same bitmap lookup ports and gramSideQ.  The steady
@@ -463,13 +496,7 @@ module mkKernelMain(KernelMainIfc);
     (* descending_urgency = "absorbNgramBatch, flushTail" *)
     rule flushTail(state == KProcess && anyTailReady);
         Epoch e = chooseTailReady;
-        let prev = prevBatch[e];
-        match { .bm0K, .bm1K, .bm1V } = buildKeys(prev, prev, False);
-        bm0_s1.lookup(bm0K);
-        bm0_s2.lookup(bm0K);
-        bm1.lookup(bm1K);
-        gramSideQ.enq(GramSide { epoch: e, grams: prev, nextValid: bm1V, nextKey: bm1K });
-        bitmapIncr.wset(e);
+        lookupBatch(e, prevBatch[e], prevBatch[e], False);
         hasPrev[e] <= False;
         tailReady[e] <= False;
     endrule
@@ -718,15 +745,12 @@ module mkKernelMain(KernelMainIfc);
     endrule
 
     // Retiring only releases the epoch's control flags.  Its data registers
-    // are rewritten (startPacket, collectPriorityResult) before being read again.
+    // are rewritten (feedBeat, collectPriorityResult) before being read again.
     // Latencies are computed per epoch from registers and then selected, so the
     // arbiter's choice does not sit in front of the 32-bit subtract.
     Vector#(NEpoch, Bit#(15)) latencyNow = map(e2eLatency, genWith(fromInteger));
 
-    // startPacket allocates an epoch (epochInUse write) and retireEpoch frees one;
-    // they cannot share a cycle.  Admission goes first: a retire only waits a
-    // cycle, and the next packet's admission is what the front end is waiting on.
-    (* descending_urgency = "startPacket, retireEpoch" *)
+    // feedBeat allocates an epoch (epochUseSet) and retireEpoch frees one (epochUseClr).
     rule retireEpoch(state == KProcess &&& lowestReady(genWith(canRetire)) matches tagged Valid .e);
 `ifdef NX_TRACE
         $display("TR %0d RETIRE e=%0d pkt=%0d hit=%0d rule=%0d", timerTotal.value, e, epochPktIdx[e], priorityResultHit[e], priorityResultRule[e]);
@@ -735,7 +759,7 @@ module mkKernelMain(KernelMainIfc);
                                    hit:     priorityResultHit[e],
                                    ruleId:  priorityResultHit[e] ? priorityResultRule[e] : 0,
                                    latency: latencyNow[e] });
-        epochInUse[e]         <= False;
+        epochUseClr[e] <= !epochUseClr[e];
         finSentClr[e]  <= !finSentClr[e];
         prioDoneClr[e] <= !prioDoneClr[e];
     endrule
