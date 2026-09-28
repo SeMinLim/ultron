@@ -1,0 +1,10 @@
+[package]
+name = "nicxion_fuzz"
+version = "0.1.0"
+edition = "2021"
+description = "Differential fuzzer: nicxion PM kernel on the U50 vs the C reference oracle"
+
+[dependencies]
+
+[profile.release]
+debug = 1
