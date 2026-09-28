@@ -22,7 +22,9 @@ endinterface
 (* synthesize *)
 (* default_reset="ap_rst_n", default_clock_osc="ap_clk" *)
 module kernel (KernelTopIfc);
-	KernelMainIfc kernelMain <- mkKernelMain;
+	Clock clk     <- exposeCurrentClock;
+	Reset rstPipe <- mkSyncResetFromCR(2, clk);
+	KernelMainIfc kernelMain <- mkKernelMain(reset_by rstPipe);
 
 	interface s_axis_db     = kernelMain.s_axis_db;
 	interface s_axis_pkt    = kernelMain.s_axis_pkt;

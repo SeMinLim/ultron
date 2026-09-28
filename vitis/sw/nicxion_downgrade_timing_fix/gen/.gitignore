@@ -1,4 +1,0 @@
-**/*.pcap
-*.o
-main
-main_asan

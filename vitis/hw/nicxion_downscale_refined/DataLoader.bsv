@@ -50,6 +50,7 @@ module mkDataLoaderCore#(
     // readReqQ carries (relativeOffset, byteCount); both Bit#(32).
     FIFOF#(Tuple2#(Bit#(32), Bit#(32))) readReqQ <- mkFIFOF;
     FIFOF#(Bit#(512))                   wordQ    <- mkSizedFIFOF(4);
+    FIFOF#(Bit#(512))                   wordQ2   <- mkFIFOF;
 
     Reg#(DLState)  state      <- mkReg(DLIdle);
     Reg#(Bit#(32)) patCount   <- mkReg(0);
@@ -99,8 +100,12 @@ module mkDataLoaderCore#(
         };
     endfunction
 
+    rule stageWord;
+        wordQ2.enq(wordQ.first); wordQ.deq;
+    endrule
+
     rule doHeader(state == DLHeader);
-        let w = wordQ.first; wordQ.deq;
+        let w = wordQ2.first; wordQ2.deq;
         ghtCount   <= w[127:96];
         patCount   <= w[159:128];
         ruledbOff  <= w[191:160];
@@ -115,7 +120,7 @@ module mkDataLoaderCore#(
     endrule
 
     rule doBm0S1(state == DLBm0S1);
-        let w = wordQ.first; wordQ.deq;
+        let w = wordQ2.first; wordQ2.deq;
         bm0_s1.writeWord(truncate(wordIdx), w);
         if (wordIdx == 511) begin
             $display("DL bm0_s1 done");
@@ -128,7 +133,7 @@ module mkDataLoaderCore#(
     endrule
 
     rule doBm0S2(state == DLBm0S2);
-        let w = wordQ.first; wordQ.deq;
+        let w = wordQ2.first; wordQ2.deq;
         bm0_s2.writeWord(truncate(wordIdx), w);
         if (wordIdx == 511) begin
             $display("DL bm0_s2 done");
@@ -141,7 +146,7 @@ module mkDataLoaderCore#(
     endrule
 
     rule doBm1(state == DLBm1);
-        let w = wordQ.first; wordQ.deq;
+        let w = wordQ2.first; wordQ2.deq;
         bm1.writeWord(truncate(wordIdx), w);
         if (wordIdx == 511) begin
             $display("DL bm1 done");
@@ -157,7 +162,7 @@ module mkDataLoaderCore#(
     endrule
 
     rule doGhtFetch(state == DLGhtFetch && ghtDone < ghtCount);
-        let w = wordQ.first; wordQ.deq;
+        let w = wordQ2.first; wordQ2.deq;
         curWord <= w;
         subIdx  <= 0;
         state   <= DLGhtUnpack;
@@ -198,7 +203,7 @@ module mkDataLoaderCore#(
     endrule
 
     rule doPattern(state == DLPattern);
-        let w = wordQ.first; wordQ.deq;
+        let w = wordQ2.first; wordQ2.deq;
         patTable.writePattern(truncate(wordIdx), w);
         wordIdx <= wordIdx + 1;
         if (wordIdx + 1 >= patCount) begin
@@ -212,7 +217,7 @@ module mkDataLoaderCore#(
     endrule
 
     rule doConstraintFetch(state == DLConstraintFetch);
-        let w = wordQ.first; wordQ.deq;
+        let w = wordQ2.first; wordQ2.deq;
         curWord    <= w;
         portSubIdx <= 0;
         state      <= DLConstraintUnpack;
@@ -248,7 +253,7 @@ module mkDataLoaderCore#(
     endrule
 
     rule doPriorityFetch(state == DLPriorityFetch && prioDone < patCount);
-        let w = wordQ.first; wordQ.deq;
+        let w = wordQ2.first; wordQ2.deq;
         curWord    <= w;
         prioSubIdx <= 0;
         state      <= DLPriorityUnpack;
@@ -279,7 +284,7 @@ module mkDataLoaderCore#(
     // Bloom section: 512 lines x 64B = 32KB.  Each 512-bit line carries 8
     // consecutive 64-bit bloom words -> BRAM addrs [8*line .. 8*line+7].
     rule doBloomFetch(state == DLBloomFetch);
-        let w = wordQ.first; wordQ.deq;
+        let w = wordQ2.first; wordQ2.deq;
         curWord  <= w;
         bloomSub <= 0;
         state    <= DLBloomUnpack;

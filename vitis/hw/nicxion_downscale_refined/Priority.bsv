@@ -137,7 +137,8 @@ module mkPriority(PriorityIfc);
         let p <- priorityTable.portA.response.get();
 
         decrEpoch.wset(c.epoch);
-        if (c.hit && ((!bestHit[c.epoch]) || (p > bestPriority[c.epoch]))) begin
+        if (c.hit && ((!bestHit[c.epoch]) || (p > bestPriority[c.epoch])
+                      || (p == bestPriority[c.epoch] && c.ruleId < bestRuleId[c.epoch]))) begin
             bestHit[c.epoch]      <= True;
             bestRuleId[c.epoch]   <= c.ruleId;
             bestPriority[c.epoch] <= p;

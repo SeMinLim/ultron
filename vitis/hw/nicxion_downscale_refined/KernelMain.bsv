@@ -137,7 +137,9 @@ module mkKernelMain(KernelMainIfc);
                    Vector#(NBitmapLanes, Maybe#(NgramOut)),
                    Vector#(NBitmapLanes, Bool),
                    Vector#(NBitmapLanes, Bit#(18))))        gramSideQ  <- mkSizedFIFOF(16);
-    FIFOF#(Tuple4#(Epoch,
+    // (epoch, lanes for phase A, lanes for phase B, grams, phase-A next-gram keys)
+    FIFOF#(Tuple5#(Epoch,
+                   Vector#(NBitmapLanes, Bool),
                    Vector#(NBitmapLanes, Bool),
                    Vector#(NBitmapLanes, Maybe#(NgramOut)),
                    Vector#(NBitmapLanes, Bit#(18))))        hitPairQ   <- mkSizedFIFOF(16);
@@ -264,12 +266,24 @@ module mkKernelMain(KernelMainIfc);
         endrule
     end
 
+    Reg#(Bool)    admitOkR  <- mkConfigReg(False);
+    Reg#(Bit#(8)) admitTagR <- mkConfigReg(0);
+    (* fire_when_enabled, no_implicit_conditions *)
+    rule precomputeAdmit;
+        admitOkR  <= resultWriter.canAdmit(pktReader.headPktIdx);
+        admitTagR <= pktReader.headPktIdx[7:0];
+    endrule
+
     rule startPacket(state == KProcess && !metaReady && pktReader.beatAvailable
                      && pktReader.beat.first && anyFreeEpoch
-                     && resultWriter.canAdmit(pktReader.beat.pktIdx));
+                     && admitOkR && admitTagR == pktReader.headPktIdx[7:0]);
         Epoch e = chooseFreeEpoch;
         epochInUse[e]  <= True;
         epochPktIdx[e] <= pktReader.beat.pktIdx;
+        // The reader only exposes complete packets, so the 5-tuple and final
+        // length are known here, before any byte of this packet is fed.
+        pktMeta.put(e, pktReader.beat.meta);
+        payTotalLen[e] <= pktReader.beat.payloadLen;
         admitCyc[e]    <= timerTotal.value;
         curEpoch       <= e;
         curPktIdx      <= pktReader.beat.pktIdx;
@@ -313,10 +327,8 @@ module mkKernelMain(KernelMainIfc);
         if (lastChunk) begin
             pktReader.advanceBeat;
             feedChunk      <= 0;
-            payTotalLen[e] <= bt.payloadLen;   // running length; final on last beat
 
             if (bt.last) begin
-                pktMeta.put(e, bt.meta);
                 feedDone[e] <= True;
                 metaReady   <= False;
             end
@@ -440,7 +452,9 @@ module mkKernelMain(KernelMainIfc);
         let hits_b1 <- bm1.result;
         match { .e, .grams, .bm1V, .bm1K } = gramSideQ.first; gramSideQ.deq;
 
-        Vector#(NBitmapLanes, Bool) needCuckoo = newVector;
+        Vector#(NBitmapLanes, Bool)     needCuckoo = newVector;
+        Vector#(NBitmapLanes, Bool)     needS1Too  = newVector;
+        Vector#(NBitmapLanes, Bit#(18)) keyA       = newVector;
         Bit#(32) bm0Hits     = 0;
         Bit#(32) bm0S2Hits   = 0;
         Bit#(32) bm0S2AndBm1 = 0;
@@ -452,6 +466,8 @@ module mkKernelMain(KernelMainIfc);
             Bool s2ok  = s2 && bm1V[i] && hits_b1[i];
             Bool need  = s1 || s2ok;
             needCuckoo[i] = need;
+            needS1Too[i]  = s1 && s2ok;
+            keyA[i]       = s2ok ? bm1K[i] : 0;
             if (s1 || s2) bm0Hits     = bm0Hits     + 1;
             if (s2)       bm0S2Hits   = bm0S2Hits   + 1;
             if (s2ok)     bm0S2AndBm1 = bm0S2AndBm1 + 1;
@@ -461,10 +477,12 @@ module mkKernelMain(KernelMainIfc);
         stage2Passed  <= stage2Passed  + bm0S2AndBm1;
         bitmapDecr.wset(e);
         scanIncr.wset(e);
-        hitPairQ.enq(tuple4(e, needCuckoo, grams, bm1K));
+        hitPairQ.enq(tuple5(e, needCuckoo, needS1Too, grams, keyA));
     endrule
 
     Reg#(Bool)                                 scanBusy    <- mkReg(False);
+    Reg#(Bool)                                 scanPhaseB  <- mkReg(False);   // running the key-0 pass
+    Reg#(Bool)                                 scanLast    <- mkRegU;         // this pass retires the entry
     Reg#(Epoch)                                scanEpoch   <- mkReg(0);
     Reg#(Bit#(7))                              scanIdx     <- mkReg(0);   // rank cursor
     Reg#(Vector#(NBitmapLanes, Bool))          scanSel     <- mkRegU;     // lane is a real need-lane
@@ -475,7 +493,20 @@ module mkKernelMain(KernelMainIfc);
     FIFOF#(BloomReq4)                          bloomFeedQ  <- mkFIFOF;
 
     rule startScan(!scanBusy && hitPairQ.notEmpty);
-        match { .e, .need, .grams, .bm1K } = hitPairQ.first; hitPairQ.deq;
+        match { .e, .needA, .needB, .grams, .keyA } = hitPairQ.first;
+        Bool hasB = pack(needB) != 0;
+        let  need = scanPhaseB ? needB : needA;
+        Vector#(NBitmapLanes, Bit#(18)) bm1K = scanPhaseB ? replicate(0) : keyA;
+        // The entry stays at the head until its last pass has been set up;
+        // inFlightScan is decremented once, when that last pass finishes.
+        if (scanPhaseB || !hasB) begin
+            hitPairQ.deq;
+            scanPhaseB <= False;
+            scanLast   <= True;
+        end else begin
+            scanPhaseB <= True;
+            scanLast   <= False;
+        end
 
         // effective select = bitmap-need AND a real gram on that lane
         Vector#(NBitmapLanes, Bool)     sel = newVector;
@@ -538,7 +569,7 @@ module mkKernelMain(KernelMainIfc);
             gramIncBatch.wset(tuple2(scanEpoch, cnt));
         end
         if (scanIdx + 4 >= n) begin
-            scanDecr.wset(scanEpoch);
+            if (scanLast) scanDecr.wset(scanEpoch);
             scanBusy <= False;
         end else
             scanIdx <= scanIdx + 4;
@@ -593,7 +624,7 @@ module mkKernelMain(KernelMainIfc);
 
     FIFOF#(Tuple3#(Epoch, Bit#(32), PomPktMeta)) pomRelQ <- mkFIFOF;
 
-    rule releasePomCandidate(state == KProcess && feedDone[tpl_1(pomHoldQ.first)]);
+    rule releasePomCandidate(state == KProcess);
         match { .e, .rid, .mpos, .eoff } = pomHoldQ.first; pomHoldQ.deq;
         pomRelQ.enq(tuple3(e, eoff, PomPktMeta {
                 ruleId:     rid,

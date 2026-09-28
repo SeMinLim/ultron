@@ -20,6 +20,7 @@ VFILES="
 	ResetEither.v
 	MakeReset.v
 	SyncReset0.v
+	SyncReset.v
 	BRAM2.v
 	RevertReg.v
 	SyncWire.v

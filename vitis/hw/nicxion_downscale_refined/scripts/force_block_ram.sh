@@ -3,10 +3,10 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../obj/verilog"
 
-EXPECTED=81   # 4 payload + 12 bloom (4 lanes x k=3) + 64 cuckoo banks + 1 assigns table
+EXPECTED=82   # 4 payload + 12 bloom (4 lanes x k=3) + 64 cuckoo banks + 1 assigns table + 1 packet buffer
 
 perl -0777 -i -pe \
-  's/BRAM2(\s*\#\((?:[^()]|\([^()]*\))*\)\s*)(kernelMain_exactMatch_eng\d+_payloadTbl_memory|bloom_\d+_\d+_memory|banks_\d+_ram_memory|assignsTbl_memory)\(/BRAM2Block$1$2(/g' \
+  's/BRAM2(\s*\#\((?:[^()]|\([^()]*\))*\)\s*)(kernelMain_exactMatch_eng\d+_payloadTbl_memory|bloom_\d+_\d+_memory|banks_\d+_ram_memory|assignsTbl_memory|kernelMain_pktReader_dataQ_memory)\(/BRAM2Block$1$2(/g' \
   kernel.v mkGramMatcher.v
 
 n=$(grep -ch 'BRAM2Block #' kernel.v mkGramMatcher.v | awk '{s+=$1} END{print s+0}')
@@ -18,4 +18,4 @@ if [ "$n" -ne "$EXPECTED" ]; then
     exit 1
 fi
 
-echo "INFO [force_block_ram]: $n memories moved to BRAM2Block (payload + bloom + cuckoo + assigns)"
+echo "INFO [force_block_ram]: $n memories moved to BRAM2Block (payload + bloom + cuckoo + assigns + pkt buffer)"
