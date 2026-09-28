@@ -1,4 +1,4 @@
-ROOT_DIR = ../../
+ROOT_DIR = ../../../
 PLATFORM ?= xilinx_u50_gen3x16_xdma_5_202210_1
 BSCFLAGS = -show-schedule -aggressive-conditions 
 BSCFLAGS_SYNTH = -bdir ./obj -vdir ./obj/verilog -simdir ./obj -info-dir ./obj -fdir ./obj 

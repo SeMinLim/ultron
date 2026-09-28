@@ -1,4 +1,4 @@
-LIBPATH=../../../
+LIBPATH=../../../../
 
 BDBMPCIEINCLUDE= -I$(LIBPATH)/cpp/
 BDBMPCIECPP= $(LIBPATH)/cpp/bdbmpcie.cpp $(LIBPATH)/cpp/ShmFifo.cpp 

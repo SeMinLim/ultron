@@ -4,8 +4,8 @@ SHELL := /bin/bash
 #----------------------------------------------------------------------------------------
 BUILD_DIR := ./$(TARGET)
 OBJ_DIR := ./obj
-HOSTDIR := ../../sw/host_$(PROJECT)
-BLIB_DIR := ../../../bluelibrary
+HOSTDIR := ../../../sw/host_$(PROJECT)
+BLIB_DIR := ../../../../bluelibrary
 PLRAM_URAM_TCL := ./scripts/plram_uram.tcl
 #----------------------------------------------------------------------------------------
 # 2. Host C++ Global Settings
@@ -46,7 +46,7 @@ $(BUILD_DIR)/kernel.xo: ./kernel.xml ./scripts/package_kernel.tcl ./scripts/gen_
 	$(VIVADO) -mode batch -tempDir $(OBJ_DIR) -source scripts/gen_xo.tcl -tclargs $@ kernel $(TARGET) $(PLATFORM)
 $(BUILD_DIR)/kernel.xclbin: $(BUILD_DIR)/kernel.xo
 	mkdir -p $(BUILD_DIR)
-	v++ -l -t $(TARGET) --platform $(PLATFORM) --config u50.cfg $(VPPFLAGS) $< -o $@
+	v++ -l -t $(TARGET) --platform $(PLATFORM) --config $(if $(filter hw_emu,$(TARGET)),u50_emu.cfg,u50.cfg) $(VPPFLAGS) $< -o $@
 	@if [ "$(TARGET)" = "hw" ]; then \
 		vivado -mode batch -source ./scripts/report_hierarchical_utilization.tcl -tclargs $(BUILD_DIR); \
 	fi
@@ -74,7 +74,7 @@ XCLBIN_ABS_PATH := $(CURDIR)/$(BUILD_DIR)/kernel.xclbin
 DB_BLOB  ?= $(HOSTDIR)/db.bin
 PCAP     ?= $(HOSTDIR)/full.pcap
 
-$(DB_BLOB):
+$(DB_BLOB): $(HOSTDIR)/gen/ngram_db_gen.c $(HOSTDIR)/rule.txt
 	cd $(HOSTDIR)/gen && cc -O2 -std=c17 -o ngram_db_gen ngram_db_gen.c
 	$(HOSTDIR)/gen/ngram_db_gen $(HOSTDIR)/rule.txt $(DB_BLOB)
 

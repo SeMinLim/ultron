@@ -22,7 +22,7 @@ static void writeReg(uint32_t offset, uint32_t data) {
     g_cfgCmds.push_back({offset, data});
 }
 
-#include "../../../bluespecpcie/proj/prefilter_sim_full/pattern_loader.h"
+#include "../../../../bluespecpcie/proj/prefilter_sim_full/pattern_loader.h"
 
 #define PAGE_SIZE       1024
 #define PCAP_GLB_HDR    24
@@ -125,9 +125,9 @@ static PrefilterResult parseResult(const uint8_t* outBuf) {
 
 int main(int argc, char** argv)
 {
-    string xclbinPath = "../../hw/hw/kernel.xclbin";
+    string xclbinPath = "../../../hw/hw/kernel.xclbin";
     const char* pcapPath = (argc > 1) ? argv[1]
-        : "../../../bluespecpcie/proj/prefilter_sim_full/test.pcap";
+        : "../../../../bluespecpcie/proj/prefilter_sim_full/test.pcap";
 
     printf("Building config command list...\n");
     g_cfgCmds.clear();
