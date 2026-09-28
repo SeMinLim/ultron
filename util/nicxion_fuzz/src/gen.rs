@@ -235,8 +235,127 @@ fn short_hit(rng: &mut Rng, r: &Rule, max: usize) -> Vec<u8> {
 ///   gram-flood     one 3-byte gram repeated over a full payload (same chain walked
 ///                  over and over), sometimes with the real pattern inside
 ///   tail-then-tiny full packet with a hit in its last bytes, then tiny hit packets
+///   skip-mix       empty payloads, non-IP frames and later fragments between tiny hits
+///   span-line      pattern crossing a 64-byte line (two-line exact compare) or
+///                  starting exactly on one
+///   repeat-hit     one pattern repeated back to back over the payload (many hits)
+///   offset-edge    offset rules with payload length and position at the limit +-1
+///   tie            several equal-priority rules for the same L4 in one packet
+/// NX_EDGE_ONLY=k forces strategy k.
+fn edge_only() -> Option<usize> {
+    static V: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("NX_EDGE_ONLY").ok().and_then(|v| v.parse().ok()))
+}
+
 fn edge_cases(rng: &mut Rng, rules: &[Rule], cfg: &GenCfg, out: &mut Vec<Case>) {
-    match rng.below(4) {
+    let k = match edge_only() { Some(k) => k, None => rng.below(9) };
+    match k {
+        4 => edge_skip_mix(rng, rules, out),
+        5 => edge_span_line(rng, rules, cfg, out),
+        6 => edge_repeat_hit(rng, rules, cfg, out),
+        7 => edge_offset(rng, rules, cfg, out),
+        8 => edge_tie(rng, rules, cfg, out),
+        _ => edge_basic(rng, rules, cfg, out, k),
+    }
+}
+
+fn edge_skip_mix(rng: &mut Rng, rules: &[Rule], out: &mut Vec<Case>) {
+    for _ in 0..rng.range(8, 32) {
+        let r = rng.pick(rules);
+        let l4 = l4_for(rng, r);
+        match rng.below(4) {
+            0 => out.push(Case { frame: packet::build(&l4, &[], Shape::default()), desc: "skip-empty".into() }),
+            1 => {
+                let mut f = vec![0u8; 12];
+                f.extend_from_slice(&[0x08, 0x06]);            // ARP ethertype
+                let n = rng.range(28, 60);
+                f.extend(filler(rng, n, rules));
+                out.push(Case { frame: f, desc: "skip-arp".into() });
+            }
+            2 => {
+                let pay = short_hit(rng, r, 40);
+                let sh = Shape { later_frag: true, ..Shape::default() };
+                out.push(Case { frame: packet::build(&l4, &pay, sh), desc: format!("skip-frag r{}", r.id) });
+            }
+            _ => {
+                let pay = short_hit(rng, r, 17);
+                out.push(Case { frame: packet::build(&l4, &pay, shape(rng)), desc: format!("skip-hit r{} len{}", r.id, pay.len()) });
+            }
+        }
+    }
+}
+
+fn edge_span_line(rng: &mut Rng, rules: &[Rule], cfg: &GenCfg, out: &mut Vec<Case>) {
+    let r = pick_satisfiable(rng, rules, cfg);
+    let pat = rand_case(rng, &r.pattern);
+    let l = pat.len();
+    let b = 64 * rng.range(1, (cfg.max_payload / 64).max(1));
+    let at = match rng.below(3) {
+        0 => b.saturating_sub(l - 1),                       // one byte in the next line
+        1 => b.saturating_sub(l / 2 + 1),                   // straddles the line
+        _ => b,                                             // starts on the line
+    };
+    let plen = (at + l + rng.range(0, 64)).min(cfg.max_payload.max(at + l));
+    let mut pay = filler(rng, plen, rules);
+    pay[at..at + l].copy_from_slice(&pat);
+    let l4 = l4_for(rng, r);
+    out.push(Case { frame: packet::build(&l4, &pay, shape(rng)), desc: format!("span-line r{} @{} len{}", r.id, at, plen) });
+}
+
+fn edge_repeat_hit(rng: &mut Rng, rules: &[Rule], cfg: &GenCfg, out: &mut Vec<Case>) {
+    let r = pick_satisfiable(rng, rules, cfg);
+    let pat = rand_case(rng, &r.pattern);
+    let reps = (cfg.max_payload / pat.len()).max(1).min(rng.range(2, 64));
+    let pay: Vec<u8> = pat.iter().cycle().take(pat.len() * reps).copied().collect();
+    let l4 = l4_for(rng, r);
+    out.push(Case { frame: packet::build(&l4, &pay, shape(rng)), desc: format!("repeat-hit r{} x{} len{}", r.id, reps, pay.len()) });
+}
+
+fn edge_offset(rng: &mut Rng, rules: &[Rule], cfg: &GenCfg, out: &mut Vec<Case>) {
+    let offs: Vec<&Rule> = rules.iter().filter(|r| r.offset_mode != 0 && r.offset_val >= 0).collect();
+    let r = if offs.is_empty() { rng.pick(rules) } else { *rng.pick(&offs) };
+    let pat = rand_case(rng, &r.pattern);
+    let v = r.offset_val.max(0) as usize;
+    let at = (v as i64 + rng.range(0, 2) as i64 - 1).max(0) as usize;   // val-1, val, val+1
+    let plen = at + pat.len() + rng.range(0, 2);                          // ends right after, +1, +2
+    if plen > cfg.max_payload.max(pat.len()) { return; }
+    let mut pay = filler(rng, plen, rules);
+    pay[at..at + pat.len()].copy_from_slice(&pat);
+    let l4 = l4_for(rng, r);
+    out.push(Case { frame: packet::build(&l4, &pay, shape(rng)), desc: format!("offset-edge r{} m{} v{} @{} len{}", r.id, r.offset_mode, v, at, plen) });
+}
+
+fn edge_tie(rng: &mut Rng, rules: &[Rule], cfg: &GenCfg, out: &mut Vec<Case>) {
+    let same = |a: &Rule, b: &Rule| a.proto == b.proto && a.port == b.port && a.is_request == b.is_request
+                                    && a.icmp == b.icmp && a.priority == b.priority && b.offset_mode == 0;
+    let mut found = None;
+    for _ in 0..16 {
+        let r0 = rng.pick(rules);
+        let peers: Vec<&Rule> = rules.iter().filter(|r| same(r0, r)).collect();
+        if peers.len() >= 2 { found = Some((r0, peers)); break; }
+    }
+    // Rulesets without an equal-priority pair: fall back so the caller always progresses.
+    let Some((r0, peers)) = found else { return edge_span_line(rng, rules, cfg, out) };
+    let k = rng.range(2, 5).min(peers.len());
+    let chosen: Vec<&Rule> = (0..k).map(|_| *rng.pick(&peers)).collect();
+    let total: usize = chosen.iter().map(|r| r.pattern.len()).sum();
+    let plen = rng.range(total, cfg.max_payload.max(total));
+    let mut pay = filler(rng, plen, rules);
+    let (mut at, mut left) = (0usize, total);
+    let mut ids = Vec::new();
+    for r in &chosen {                                       // disjoint, in order
+        at += rng.below((plen - at - left) / 2 + 1);
+        pay[at..at + r.pattern.len()].copy_from_slice(&rand_case(rng, &r.pattern));
+        ids.push(format!("r{}@{}", r.id, at));
+        at += r.pattern.len();
+        left -= r.pattern.len();
+    }
+    let l4 = l4_for(rng, r0);
+    out.push(Case { frame: packet::build(&l4, &pay, shape(rng)), desc: format!("tie {} len{}", ids.join(","), plen) });
+}
+
+fn edge_basic(rng: &mut Rng, rules: &[Rule], cfg: &GenCfg, out: &mut Vec<Case>, k: usize) {
+    match k {
         0 => {
             for _ in 0..rng.range(16, 48) {
                 let r = rng.pick(rules);
