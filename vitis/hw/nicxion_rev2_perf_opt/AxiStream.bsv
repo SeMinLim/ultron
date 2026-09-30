@@ -131,8 +131,6 @@ module mkAxiStreamSlave (AxiStreamSlaveIfc#(dataSz));
     endmethod
 endmodule
 
-// AXI4-Stream slave with TUSER sideband (valid on the TLAST beat, per the
-// Nixion interface diagram: tdata streams, tuser/tkeep carry final-beat metadata).
 typedef struct {
     Bit#(dataSz)        data;
     Bit#(TDiv#(dataSz,8)) keep;

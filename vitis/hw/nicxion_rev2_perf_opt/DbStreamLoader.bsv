@@ -30,7 +30,6 @@ module mkDbStreamLoader#(
     DataLoaderCoreIfc core <- mkDataLoaderCore(bm0_s1, bm0_s2, bm1,
                                                gram, patTable, portMatcher, prioStage);
 
-    // Push each DB stream beat into the section-loading FSM.
     rule feedDbWord;   // putWord carries wordQ's notFull implicitly
         let beat <- dbStream.get;
         core.putWord(tpl_1(beat));

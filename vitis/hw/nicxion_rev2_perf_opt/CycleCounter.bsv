@@ -15,7 +15,7 @@ module mkCycleCounter(CycleCounterIfc);
     Reg#(Bit#(32)) cycleStart <- mkReg(0);
     Reg#(Bit#(32)) cycleDone  <- mkReg(0);
 
-    rule tick;
+    rule countCycle;
         counter <= counter + 1;
     endrule
 

@@ -6,10 +6,6 @@ import SpecialFIFOs::*;
 import Vector::*;
 import Types::*;
 
-// Front-end width, in bytes per cycle.  Sized by the bitmap lane budget: each
-// lane costs one URAM per bitmap instance (3 instances), so 16 lanes = 48 URAM.
-// A 512-bit packet beat is therefore fed as 64/NBitmapLanes consecutive slices
-// (see KernelMain feedBeat).
 typedef 16 NGramLanes;
 typedef 16 NBitmapLanes;
 
@@ -52,7 +48,6 @@ module mkNgramExtracter(NgramExtracterIfc);
     Reg#(Bool)     hasCarry <- mkReg(False);
     Reg#(Bit#(32)) basePos  <- mkReg(0);
 
-    // Carry gates lanes 0 and 1 on the first batch to avoid anchor underflow.
     rule processBatch(outQ.notFull);
         let b    = inQ.first;
         let ibuf = b.bytes;

@@ -95,13 +95,8 @@ module mkPriority(PriorityIfc);
         end
     endrule
 
-    // collectLookup updates one epoch's best-so-far; emitFinished reads and
-    // clears another's.  bsc sees the shared bestHit vector and keeps them
-    // apart.  They never touch the same epoch in one cycle (emitFinished waits
-    // for inFlight == 0), so the order only decides who waits a cycle:
-    // finishing first frees the epoch sooner.
+    // Only decides who waits a cycle; finishing first frees the epoch sooner.
     (* descending_urgency = "emitFinished, collectLookup" *)
-    // Legal once every candidate for this epoch has been looked up.
     rule emitFinished(inFlight[finishQ.first.epoch] == 0);
         let f = finishQ.first; finishQ.deq;
         let e = f.epoch;
@@ -112,7 +107,7 @@ module mkPriority(PriorityIfc);
             ruleId:   bestHit[e] ? bestRuleId[e] : 0,
             prio:     bestHit[e] ? bestPriority[e] : 0
         });
-        bestHit[e]      <= False;   // bestRuleId/bestPriority are only read while bestHit
+        bestHit[e]      <= False;
     endrule
 
     method Action putCandidate(PriorityCandidate candidate);

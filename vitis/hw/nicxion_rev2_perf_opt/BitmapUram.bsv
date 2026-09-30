@@ -4,16 +4,13 @@ import BRAMCore::*;
 import FIFOF::*;
 import SpecialFIFOs::*;
 import Vector::*;
+import Types::*;
 
-// Must equal NgramExtracter::NBitmapLanes.
-// Each lane holds a full replica of the 2^18-bit gram bitmap (4096x64 = 1 URAM),
-// so URAM cost is NLanes per instance and there are 3 instances.
 typedef 16 NLanes;
 
-// 18-bit gram bitmap: one 4096x64 URAM-backed table per lane.
 interface BitmapUramIfc;
     method Action writeWord(Bit#(9) lineAddr, Bit#(512) data);
-    method Action lookup(Vector#(NLanes, Bit#(18)) keys);
+    method Action lookup(Vector#(NLanes, GramKey) keys);
     method ActionValue#(Vector#(NLanes, Bool)) result;
 endinterface
 
@@ -61,7 +58,7 @@ module mkBitmapUram(BitmapUramIfc);
         wrCnt  <= 1;
     endmethod
 
-    method Action lookup(Vector#(NLanes, Bit#(18)) keys);
+    method Action lookup(Vector#(NLanes, GramKey) keys);
         Vector#(NLanes, Bit#(6)) bitIdxs = newVector;
         for (Integer i = 0; i < valueOf(NLanes); i = i + 1) begin
             Bit#(12) lineAddr = keys[i][17:6];

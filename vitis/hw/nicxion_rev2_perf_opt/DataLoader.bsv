@@ -26,8 +26,6 @@ typedef enum {
     DLDone
 } DLState deriving (Bits, Eq, FShow);
 
-// Core interface: word-push model, no knowledge of word source (AXI4 / slave / stream).
-// All read requests are relative byte offsets from the DB base supplied by the caller.
 interface DataLoaderCoreIfc;
     method Action startLoad(Bit#(32) dbBytes);
     method Bool   canAcceptWord;
@@ -70,19 +68,6 @@ module mkDataLoaderCore#(
     Reg#(Bit#(32)) bloomWord <- mkRegU;
     Reg#(Bit#(3))  bloomSub  <- mkRegU;
 
-    // GHT entry bit layout (128 bits per entry, 4 entries per 512-bit word):
-    //   [31: 0]   gram32 key (18-bit key zero-padded to 32)
-    //   [47:32]   ruleId
-    //   [55:48]   pre (signed)
-    //   [63:56]   post (signed)
-    //   [71:64]   len
-    //   [72]      stage2 flag
-    //   [90:73]   nextGramKey (18 bits, valid when stage2=1)
-    //   [114:91]  anchorGram (folded full 3-byte anchor)
-    //   [119:115] padding
-    //   [120]     is_first (cuckoo insert gate; matches gen.c sort grouping)
-    //   [121]     is_last  (chain follow terminator)
-    //   [127:122] padding
     function RuleInfo unpackRuleInfo(Bit#(128) raw);
         return RuleInfo {
             ruleId:      raw[47:32],
@@ -100,7 +85,7 @@ module mkDataLoaderCore#(
         wordQ2.enq(wordQ.first); wordQ.deq;
     endrule
 
-    rule doHeader(state == DLHeader);
+    rule loadHeader(state == DLHeader);
         let w = wordQ2.first; wordQ2.deq;
         ghtCount   <= w[127:96];
         patCount   <= w[159:128];
@@ -114,7 +99,7 @@ module mkDataLoaderCore#(
         state   <= DLBm0S1;
     endrule
 
-    rule doBm0S1(state == DLBm0S1);
+    rule loadBm0S1(state == DLBm0S1);
         let w = wordQ2.first; wordQ2.deq;
         bm0_s1.writeWord(truncate(wordIdx), w);
         if (wordIdx == 511) begin
@@ -126,7 +111,7 @@ module mkDataLoaderCore#(
         end
     endrule
 
-    rule doBm0S2(state == DLBm0S2);
+    rule loadBm0S2(state == DLBm0S2);
         let w = wordQ2.first; wordQ2.deq;
         bm0_s2.writeWord(truncate(wordIdx), w);
         if (wordIdx == 511) begin
@@ -138,7 +123,7 @@ module mkDataLoaderCore#(
         end
     endrule
 
-    rule doBm1(state == DLBm1);
+    rule loadBm1(state == DLBm1);
         let w = wordQ2.first; wordQ2.deq;
         bm1.writeWord(truncate(wordIdx), w);
         if (wordIdx == 511) begin
@@ -152,14 +137,14 @@ module mkDataLoaderCore#(
         end
     endrule
 
-    rule doGhtFetch(state == DLGhtFetch && ghtDone < ghtCount);
+    rule loadGhtFetch(state == DLGhtFetch && ghtDone < ghtCount);
         let w = wordQ2.first; wordQ2.deq;
         curWord <= w;
         subIdx  <= 0;
         state   <= DLGhtUnpack;
     endrule
 
-    rule doGhtUnpack(state == DLGhtUnpack);
+    rule loadGhtUnpack(state == DLGhtUnpack);
         if (ghtDone < ghtCount) begin
             RuleInfo info    = unpackRuleInfo(curWord[127:0]);
             Bit#(32) gram32  = curWord[31:0];
@@ -173,7 +158,7 @@ module mkDataLoaderCore#(
         end
     endrule
 
-    rule doGhtAck(state == DLGhtAck);
+    rule loadGhtAck(state == DLGhtAck);
         let ok <- gram.insertAck;
         ghtDone <= ghtDone + 1;
         curWord <= curWord >> 128;
@@ -191,7 +176,7 @@ module mkDataLoaderCore#(
         end
     endrule
 
-    rule doPattern(state == DLPattern);
+    rule loadPattern(state == DLPattern);
         let w = wordQ2.first; wordQ2.deq;
         patTable.writePattern(truncate(wordIdx), w);
         wordIdx <= wordIdx + 1;
@@ -203,15 +188,14 @@ module mkDataLoaderCore#(
         end
     endrule
 
-    rule doConstraintFetch(state == DLConstraintFetch);
+    rule loadConstraintFetch(state == DLConstraintFetch);
         let w = wordQ2.first; wordQ2.deq;
         curWord    <= w;
         portSubIdx <= 0;
         state      <= DLConstraintUnpack;
     endrule
 
-    // 8 x 64-bit constraint entries per 512-bit line, indexed by ruleId.
-    rule doConstraintUnpack(state == DLConstraintUnpack);
+    rule loadConstraintUnpack(state == DLConstraintUnpack);
         portMatcher.writeConstraint(truncate(portWord), curWord[63:0]);
         curWord <= curWord >> 64;
         if (portSubIdx == 7) begin
@@ -236,14 +220,14 @@ module mkDataLoaderCore#(
         end
     endrule
 
-    rule doPriorityFetch(state == DLPriorityFetch && prioDone < patCount);
+    rule loadPriorityFetch(state == DLPriorityFetch && prioDone < patCount);
         let w = wordQ2.first; wordQ2.deq;
         curWord    <= w;
         prioSubIdx <= 0;
         state      <= DLPriorityUnpack;
     endrule
 
-    rule doPriorityUnpack(state == DLPriorityUnpack);
+    rule loadPriorityUnpack(state == DLPriorityUnpack);
         Bit#(2) prio = curWord[1:0];
         prioStage.writePriority(truncate(prioDone), prio);
         curWord <= curWord >> 8;
@@ -264,16 +248,14 @@ module mkDataLoaderCore#(
         end
     endrule
 
-    // Bloom section: 512 lines x 64B = 32KB.  Each 512-bit line carries 8
-    // consecutive 64-bit bloom words -> BRAM addrs [8*line .. 8*line+7].
-    rule doBloomFetch(state == DLBloomFetch);
+    rule loadBloomFetch(state == DLBloomFetch);
         let w = wordQ2.first; wordQ2.deq;
         curWord  <= w;
         bloomSub <= 0;
         state    <= DLBloomUnpack;
     endrule
 
-    rule doBloomUnpack(state == DLBloomUnpack);
+    rule loadBloomUnpack(state == DLBloomUnpack);
         Bit#(12) addr = truncate({bloomWord[8:0], bloomSub});
         gram.writeBloom(addr, curWord[63:0]);
         curWord <= curWord >> 64;

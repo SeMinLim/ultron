@@ -6,14 +6,12 @@ import Vector::*;
 import Types::*;
 
 typedef 12 BloomWordBits;   // 4096 x 64b words = 262144 bits (32KB)
-typedef 4  NBloomLanes;     // 4-wide front-end (12 BRAM copies = 4 lanes x k=3)
+typedef 4  NBloomLanes;
 
-// Everything needed to either issue the cuckoo lookup or emit a miss once the
-// bloom verdict is known.
 typedef struct {
     Bit#(32) gram;
-    Bit#(24) pktAnchorGram;
-    Bit#(18) pktNextGramKey;
+    AnchorGram pktAnchorGram;
+    GramKey pktNextGramKey;
     Bit#(32) anchor;
     Epoch    epoch;
 } BloomCtx deriving (Bits);
@@ -21,18 +19,13 @@ typedef struct {
 typedef struct { Bit#(64) key; BloomCtx ctx; } BloomReq deriving (Bits);
 typedef struct { Bit#(6) b0; Bit#(6) b1; Bit#(6) b2; BloomCtx ctx; } BloomProbe deriving (Bits);
 
-// 4-wide lockstep carriers: one entry holds up to NBloomLanes lanes, all from
-// the same doScan batch (same epoch).  Invalid lanes are padding bubbles.
 typedef Vector#(NBloomLanes, Maybe#(BloomReq))   BloomReq4;
 typedef Vector#(NBloomLanes, Maybe#(BloomProbe)) BloomProbe4;
 typedef Vector#(NBloomLanes, Maybe#(BloomCtx))   BloomPass4;
-// Reject report: epoch of the batch + how many lanes rejected this cycle.
 typedef struct { Epoch epoch; Bit#(3) count; } BloomRejectInfo deriving (Bits);
 
-// Build a single-lane BloomReq from the scan-side fields (key = composite HT
-// key (gram18<<18)|nextGramKey, matching the DB generator's bloom_probe).
-function BloomReq mkBloomReq(Bit#(32) gram, Bit#(24) pktAnchorGram,
-                             Bit#(18) pktNextGramKey, Bit#(32) anchor,
+function BloomReq mkBloomReq(Bit#(32) gram, AnchorGram pktAnchorGram,
+                             GramKey pktNextGramKey, Bit#(32) anchor,
                              Epoch epoch);
     return BloomReq {
         key: zeroExtend({gram[17:0], pktNextGramKey}),
@@ -42,12 +35,10 @@ function BloomReq mkBloomReq(Bit#(32) gram, Bit#(24) pktAnchorGram,
             epoch: epoch } };
 endfunction
 
-// Hash pipeline stages (see bloomHashAdvance).
 typedef struct {
     Vector#(NBloomLanes, Maybe#(BloomCtx)) ctx;
     Vector#(NBloomLanes, Bit#(36))         key;
 } HashIn deriving (Bits);
-// Partial products: key = kH*2^18 + kL.
 typedef struct {
     Vector#(NBloomLanes, Maybe#(BloomCtx)) ctx;
     Vector#(NBloomLanes, Bit#(50))         aL;   // kL * C1[49:0]  mod 2^50
@@ -55,37 +46,27 @@ typedef struct {
     Vector#(NBloomLanes, Bit#(50))         bL;
     Vector#(NBloomLanes, Bit#(32))         bH;
 } HashPart deriving (Bits);
-// Product bits [49:32]: the only bits the probe positions use.
 typedef struct {
     Vector#(NBloomLanes, Maybe#(BloomCtx)) ctx;
     Vector#(NBloomLanes, Bit#(18))         a;
     Vector#(NBloomLanes, Bit#(18))         b;
 } HashSum deriving (Bits);
-// Probe addresses ready to issue.
 typedef struct {
     Vector#(NBloomLanes, Maybe#(BloomProbe)) probe;
     Vector#(NBloomLanes, Vector#(3, Bit#(BloomWordBits))) addr;
 } HashOut deriving (Bits);
 
 interface BloomFilterIfc;
-    // Up to NBloomLanes keys per cycle, all from one epoch.
     method Bool   reqReady;
     method Action req(BloomReq4 reqs);
-    // Lanes that passed (at least one valid), in request order.
     method ActionValue#(BloomPass4)      pass;
     method Bool                          passReady;   // a pass vector is waiting
-    // Rejected lanes of one request: epoch + count.
     method ActionValue#(BloomRejectInfo) reject;
-    // DB load: broadcast to every lane's copies.
     method Action write(Bit#(BloomWordBits) addr, Bit#(64) data);
 endinterface
 
 (* synthesize *)
 module mkBloomFilter(BloomFilterIfc);
-    // 4 lanes x 3 probe copies = 12 BRAMs, each 4096x64b = 262144 bits, so all
-    // 4 lanes read their k=3 probes in one cycle.  portA = probe read (the
-    // response FIFO keeps reads in order under backpressure), portB = loader
-    // write (broadcast so every lane holds an identical copy of the filter).
     BRAM_Configure cfgBloom = defaultValue;
     cfgBloom.memorySize = 4096;
     cfgBloom.latency    = 2;
@@ -94,7 +75,6 @@ module mkBloomFilter(BloomFilterIfc);
 
     FIFOF#(BloomReq4)   bloomReqQ <- mkSizedFIFOF(4);  // raw keys, before multiply
     FIFOF#(BloomProbe4) bloomPrQ  <- mkSizedFIFOF(4);  // probe sets awaiting BRAM
-    // Bit-selected verdicts, registered before classification.
     FIFOF#(Vector#(NBloomLanes, Maybe#(Tuple2#(Bool, BloomCtx)))) verdictQ <- mkFIFOF;
     FIFOF#(BloomPass4)      passVecQ <- mkSizedFIFOF(4);
     FIFOF#(BloomRejectInfo) rejectQ  <- mkSizedFIFOF(8);
@@ -106,16 +86,11 @@ module mkBloomFilter(BloomFilterIfc);
     Vector#(2, Reg#(HashSum))  hashSum   <- replicateM(mkRegU);
     FIFOF#(HashOut)            hashOutQ  <- mkSizedFIFOF(4);
 
-    // Multiply-shift (Fibonacci) double hash -- same constants as the DB
-    // generator's bloom_probe().  Kirsch-Mitzenmacher derives the k=3 positions.
     Bit#(64) bloomC1 = 64'h9E3779B97F4A7C15;
     Bit#(64) bloomC2 = 64'hC2B2AE3D27D4EB4F;
 
-    // Stage A: hash pipeline.  Fires whenever the last stage can drain,
-    // shifting bubbles too, so the enable is one registered FIFO flag.
     Bool hashLastV = hashProdV[3];
     rule bloomHashAdvance (!hashLastV || hashOutQ.notFull);
-        // Drain: product bits [49:32] -> k=3 probe positions.
         if (hashLastV) begin
             HashSum hp = hashSum[1];
             HashOut o = HashOut { probe: replicate(tagged Invalid), addr: replicate(replicate(0)) };
@@ -131,12 +106,10 @@ module mkBloomFilter(BloomFilterIfc);
                 end
             hashOutQ.enq(o);
         end
-        // Shift valid bits; part1 and sum1 are plain copies.
         for (Integer i = 3; i > 0; i = i - 1)
             hashProdV[i] <= hashProdV[i - 1];
         hashPart[1] <= hashPart[0];
         hashSum[1]  <= hashSum[0];
-        // Add: partial products -> product bits [49:32].
         HashPart pp = hashPart[1];
         HashSum  ns = ?;
         ns.ctx = pp.ctx;
@@ -147,7 +120,6 @@ module mkBloomFilter(BloomFilterIfc);
             ns.b[ln] = pb[49:32];
         end
         hashSum[0] <= ns;
-        // Multiply: raw keys -> partial products.
         HashPart np = ?;
         np.ctx = hashIn.ctx;
         for (Integer ln = 0; ln < valueOf(NBloomLanes); ln = ln + 1) begin
@@ -160,7 +132,6 @@ module mkBloomFilter(BloomFilterIfc);
         end
         hashProdV[0] <= hashInV;
         hashPart[0]  <= np;
-        // Load raw keys.
         if (bloomReqQ.notEmpty) begin
             let rs = bloomReqQ.first; bloomReqQ.deq;
             HashIn hi = ?;
@@ -175,7 +146,6 @@ module mkBloomFilter(BloomFilterIfc);
             hashInV <= False;
     endrule
 
-    // Stage B: issue the registered probe addresses.
     rule bloomIssue4;
         let o = hashOutQ.first; hashOutQ.deq;
         for (Integer ln = 0; ln < valueOf(NBloomLanes); ln = ln + 1)
@@ -186,7 +156,6 @@ module mkBloomFilter(BloomFilterIfc);
         bloomPrQ.enq(o.probe);
     endrule
 
-    // Stage C: read all lanes' probes and register the per-lane verdict.
     rule bloomResp4;
         let pv = bloomPrQ.first; bloomPrQ.deq;
         Vector#(NBloomLanes, Maybe#(Tuple2#(Bool, BloomCtx))) vv = replicate(tagged Invalid);
@@ -202,8 +171,6 @@ module mkBloomFilter(BloomFilterIfc);
         verdictQ.enq(vv);
     endrule
 
-    // Stage D: passes -> passVecQ; rejects are counted and reported
-    // (epoch + count) without touching it.
     rule bloomClassify4;
         let vv = verdictQ.first; verdictQ.deq;
         BloomPass4 passes   = replicate(tagged Invalid);

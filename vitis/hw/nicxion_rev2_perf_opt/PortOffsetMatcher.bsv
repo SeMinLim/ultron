@@ -73,7 +73,6 @@ endinterface
 (* synthesize *)
 module mkPortOffsetMatcher(PortOffsetMatcherIfc);
 
-    // One slot per ruleId.  64 bits/rule × 8192 = 512 Kbit (5k-rule build).
     BRAM_Configure cfg = defaultValue;
     cfg.memorySize   = 8192;
     cfg.latency      = 2;

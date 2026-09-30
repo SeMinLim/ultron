@@ -12,8 +12,7 @@ typedef struct {
     Bool     hit;
     Bit#(16) ruleId;
     Bit#(32) matchPos;
-    Bit#(32) endOff;   // pattern end offset (anchor+3+post); KernelMain checks it
-                       // against the packet's payload length (checkPomEnd).
+    Bit#(32) endOff;
     Epoch epoch;
 } ExMatchResult deriving (Bits, Eq, FShow);
 
@@ -22,8 +21,6 @@ typedef struct {
     Epoch epoch;
 } ExactRequest deriving (Bits, Eq, FShow);
 
-// Engine pipeline carriers (see mkExactEngine).
-// Only what the issue stage needs (not the whole ~300-bit request).
 typedef struct {
     Bit#(16) ruleId;
     Bit#(8)  len;
@@ -34,7 +31,6 @@ typedef struct {
     Bool     bad;
 } ExPrep deriving (Bits);
 
-// Everything the later stages need about one candidate.
 typedef struct {
     Bool     bad;
     Bit#(16) ruleId;
@@ -46,8 +42,6 @@ typedef struct {
     Bit#(64) mask;       // bytes that must match (idx < len, not anchor)
 } ExCtx deriving (Bits);
 
-// The pattern is not carried through these stages: it waits, in candidate
-// order, in patRespQ and is taken at the compare.
 typedef struct { ExCtx c; Bit#(1024) win;  } ExWin  deriving (Bits);
 typedef struct { ExCtx c; Bit#(512)  line; } ExLine deriving (Bits);
 
@@ -65,7 +59,6 @@ function Bit#(8) anchorIndex(VerifyReq req);
     return pack(idx);
 endfunction
 
-// Bank-level interface (what KernelMain uses).
 interface ExactMatchIfc;
     method Action putPayloadWord(Bit#(512) word, Bool last, Epoch epoch);
     method Action putRequest(VerifyReq r, Epoch epoch);
@@ -73,9 +66,6 @@ interface ExactMatchIfc;
     method Bool notEmpty;
 endinterface
 
-// One engine.  The pattern-table port is outside (the bank forwards patReq /
-// patResp), so the engine takes no interface argument and is synthesized on
-// its own -- elaborated once, one line per engine in utilization reports.
 interface ExactEngineIfc;
     method Action putPayloadWord(Bit#(512) word, Bool last, Epoch epoch);
     method Action putRequest(VerifyReq r, Epoch epoch);
@@ -94,8 +84,6 @@ module mkExactEngine(ExactEngineIfc);
     cfgPayload.memorySize = payloadLines;
     cfgPayload.latency    = 2;
 
-    // Eight 4KB epoch slots, addressed as {epoch[2:0], line[5:0]}.
-    // Port A writes packet payload; port B verifies.
     BRAM2Port#(Bit#(9), Bit#(512)) payloadTbl <- mkBRAM2Server(cfgPayload);
     Reg#(Bit#(6)) payWrLine <- mkReg(0);
 
@@ -103,8 +91,6 @@ module mkExactEngine(ExactEngineIfc);
     FIFOF#(ExPrep)        prepQ    <- mkPipelineFIFOF;
     FIFOF#(ExCtx)         ctxQ     <- mkSizedFIFOF(8);    // issued, awaiting responses
     FIFOF#(Bit#(16))      patReqQ  <- mkSizedFIFOF(4);
-    // Holds each non-bad candidate's pattern until its compare: deep enough for
-    // the candidates between issue and cmp (ctxQ + the pipeline stages).
     FIFOF#(Bit#(512))     patRespQ <- mkSizedFIFOF(12);
     FIFOF#(ExWin)         winQ     <- mkPipelineFIFOF;
     FIFOF#(ExLine)        lineQ    <- mkPipelineFIFOF;
@@ -121,7 +107,7 @@ module mkExactEngine(ExactEngineIfc);
         endaction
     endfunction
 
-    rule prep;
+    rule prepareCandidate;
         let r = inQ.first; inQ.deq;
         Int#(32) startI  = unpack(r.req.anchor) + signExtend(r.req.pre);
         Int#(32) endI    = unpack(r.req.anchor) + 3 + signExtend(r.req.post);
@@ -138,7 +124,7 @@ module mkExactEngine(ExactEngineIfc);
                            startI: startI, endI: endI, bad: bad });
     endrule
 
-    rule issue (!isValid(pend2));
+    rule issuePayloadRead (!isValid(pend2));
         let a = prepQ.first; prepQ.deq;
         Bit#(8)  len     = a.len;
         Bit#(8)  aIdx    = a.aIdx;
@@ -163,12 +149,12 @@ module mkExactEngine(ExactEngineIfc);
                          oneLine: oneLine, byteOff: start[5:0], mask: mask });
     endrule
 
-    rule second (pend2 matches tagged Valid .addr);
+    rule issueSecondLine (pend2 matches tagged Valid .addr);
         readLine(addr);
         pend2 <= tagged Invalid;
     endrule
 
-    rule collect;
+    rule collectPayload;
         let c = ctxQ.first;
         if (c.bad) begin
             ctxQ.deq;
@@ -187,11 +173,7 @@ module mkExactEngine(ExactEngineIfc);
         end
     endrule
 
-    // Byte j of each stage = byte j + shift of the previous one: each stage is
-    // one static slice of the previous, chosen by two offset bits (4:1 mux per
-    // bit).  124, 112 and 64 bytes are kept.  For a one-line pattern only bytes
-    // of line L are unmasked.
-    rule rot;
+    rule alignWindow;
         let x = winQ.first; winQ.deq;
         Bit#(1024) w   = x.win;
         Bit#(6)    off = x.c.byteOff;
@@ -210,8 +192,7 @@ module mkExactEngine(ExactEngineIfc);
         lineQ.enq(ExLine { c: x.c, line: s3 });
     endrule
 
-    // The only writer of outQ.  A bad candidate never requested a pattern.
-    rule cmp;
+    rule comparePattern;
         let x = lineQ.first; lineQ.deq;
         let c = x.c;
         Bool all = True;
@@ -260,8 +241,6 @@ module mkExactEngine(ExactEngineIfc);
     endmethod
 endmodule
 
-// Banked by ruleId[PortBits-1:0]; each engine owns a pattern read port and a
-// payload copy.  NReadPorts (ExactPatternTable) sets the engine count.
 module mkExactMatchParallel#(ExactPatternTableIfc patTbl)(ExactMatchIfc);
     Vector#(NReadPorts, ExactEngineIfc) eng <- replicateM(mkExactEngine);
 
@@ -276,20 +255,14 @@ module mkExactMatchParallel#(ExactPatternTableIfc patTbl)(ExactMatchIfc);
         endrule
     end
 
-    // Round-robin over engines with a result, starting after the last one served.
     Reg#(Bit#(PortBits)) rr <- mkReg(0);
 
     function Bool engReady(Integer g) = eng[g].notEmpty;
     Vector#(NReadPorts, Bool) ready = genWith(engReady);
 
-    // Round-robin collect into one registered result queue (keeps the N-way
-    // result mux off the caller's rule).  First ready engine at or after rr:
-    // rotate the ready bits so rr is bit 0 and take the lowest set bit; each
-    // engine is dequeued under its own static select.  Results waiting here are
-    // still counted as in-flight exact work (the caller decrements at getResult).
     FIFOF#(ExMatchResult) resQ <- mkFIFOF;
 
-    rule collect (pack(ready) != 0);
+    rule collectResult (pack(ready) != 0);
         Bit#(NReadPorts)         rb   = pack(ready);
         Bit#(TAdd#(PortBits, 1)) left = fromInteger(valueOf(NReadPorts)) - zeroExtend(rr);
         Bit#(NReadPorts)         rot  = (rb >> rr) | (rb << left);

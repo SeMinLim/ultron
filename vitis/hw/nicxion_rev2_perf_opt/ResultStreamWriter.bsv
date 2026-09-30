@@ -28,17 +28,11 @@ module mkResultStreamWriter#(AxiStreamMasterIfc#(32) axisOut)
                             (ResultStreamWriterIfc);
 
     Reg#(Bit#(32)) nextOutPktIdx <- mkReg(0);
-    // Data store: one OrderedResult per slot (RegFile = LUTRAM, not FFs).
     RegFile#(Bit#(SlotW), OrderedResult) buf_ <- mkRegFileFull;
-    // Per-slot occupancy as one packed register (set on write, clear on emit).
     Reg#(Bit#(ResultOrderDepth)) validVec <- mkReg(0);
     RWire#(Bit#(SlotW)) setSlot   <- mkRWire;
     RWire#(Bit#(SlotW)) clearSlot <- mkRWire;
 
-    // One-time header beat = db-load cycles (emitted before any packet result);
-    // one-time footer beat = total packet-processing cycles (emitted after the
-    // last packet result, once the kernel goes idle). Together they give the host
-    // a proper db_load vs process split with NO per-packet overlap confusion.
     Reg#(Bool)     headerArmed <- mkReg(False);
     Reg#(Bool)     headerSent  <- mkReg(False);
     Reg#(Bit#(32)) headerVal   <- mkRegU;   // written with headerArmed
@@ -53,7 +47,6 @@ module mkResultStreamWriter#(AxiStreamMasterIfc#(32) axisOut)
         headerSent  <= True;
     endrule
 
-    // Footer goes out only after every packet result has drained (validVec==0).
     rule sendFooter(footerArmed && !footerSent && headerSent && validVec == 0);
         axisOut.put(footerVal, 4'hF, True);
         footerSent  <= True;
@@ -67,11 +60,7 @@ module mkResultStreamWriter#(AxiStreamMasterIfc#(32) axisOut)
         validVec <= v;
     endrule
 
-    // Emit the in-order head whenever present (after the header beat). One
-    // 32-bit beat, tlast=1.
-    // Both put to axisOut.  They never want the port in the same cycle
-    // (footer needs validVec == 0, drain only puts a valid head); the
-    // attribute just states the order bsc would pick.
+    // Exclusive in practice (the footer needs an empty buffer); states bsc's order.
     (* descending_urgency = "sendFooter, drainOrdered" *)
     rule drainOrdered(headerSent);
         Bit#(SlotW) hslot = truncate(nextOutPktIdx);
@@ -84,27 +73,21 @@ module mkResultStreamWriter#(AxiStreamMasterIfc#(32) axisOut)
         end
     endrule
 
-    // Arm the one-time db_load header beat (emitted before any packet result).
     method Action emitHeader(Bit#(32) val);
         headerVal   <= val;
         headerArmed <= True;
     endmethod
 
-    // Arm the one-time process-cycles footer beat (emitted after the last result).
     method Action emitFooter(Bit#(32) val);
         footerVal   <= val;
         footerArmed <= True;
     endmethod
 
-    // Defensive: slot not currently occupied (the gate makes aliasing impossible,
-    // but keep this so a stray collision can never overwrite a live result).
     method Bool canAccept(Bit#(32) pktIdx);
         Bit#(SlotW) slot = truncate(pktIdx);
         return (validVec[slot] == 0);
     endmethod
 
-    // Admission gate: pkt is within the reorder window of the output head. Pure
-    // arithmetic on nextOutPktIdx (no array read) -> no scheduling cycle.
     method Bool canAdmit(Bit#(32) pktIdx);
         return (pktIdx - nextOutPktIdx) < fromInteger(valueOf(ResultOrderDepth));
     endmethod
